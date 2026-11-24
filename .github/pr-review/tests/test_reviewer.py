@@ -140,10 +140,15 @@ def test_workspace_guard_allows_repo_files_and_blocks_outside_or_sensitive(tmp_p
         }
         return asyncio.run(guard(payload, "t1", {"signal": None}))
 
-    # 저장소 내부 일반 파일은 허용
+    # 저장소 내부 일반 파일과 Grep 내용 검색 정규식(pattern)은 허용
     assert check("Read", {"file_path": "src/ok.py"}) == {}
     assert check("Read", {"file_path": str(repo / "src" / "ok.py")}) == {}
     assert check("Grep", {"pattern": "def ", "path": "src"}) == {}
+    assert check("Grep", {"pattern": "/api/v1", "path": "src"}) == {}
+    assert check("Grep", {"pattern": "~/**", "path": "src"}) == {}
+    assert check("Grep", {"pattern": r"\.key", "path": "src"}) == {}
+    assert check("Grep", {"pattern": ".env", "path": "src"}) == {}
+    assert check("Grep", {"pattern": "secrets/", "path": "src"}) == {}
     assert check("Glob", {"pattern": "src/**/*.py"}) == {}
 
     # 저장소 외부·홈 숨김 경로·심볼릭 링크 이탈·저장소 내부 민감 경로는 모두 거부
@@ -159,6 +164,8 @@ def test_workspace_guard_allows_repo_files_and_blocks_outside_or_sensitive(tmp_p
         ("Read", {"file_path": ".git/config"}),
         ("Grep", {"pattern": "x", "path": "~/.ssh"}),
         ("Grep", {"pattern": "x", "glob": "../**/*.py"}),
+        ("Grep", {"pattern": "x", "glob": ".env*"}),
+        ("Grep", {"pattern": "x", "glob": "**/*.key"}),
         ("Glob", {"pattern": "~/.aws/**"}),
         ("Glob", {"pattern": ".env*"}),
     ):

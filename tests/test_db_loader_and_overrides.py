@@ -994,3 +994,111 @@ def test_cli_load_and_catalog_and_top_level_sdk_exports(
     rb_out = json.loads(capsys.readouterr().out)
     assert rb_out["status"] == "rolled_back"
     assert rb_out["total_deleted"] == 10
+
+
+def test_rollback_snapshot_preserves_json_nested_and_uuid_types(tmp_path: Path) -> None:
+    """스냅샷 직렬화·역직렬화 및 엔진별 복원 바인딩이 JSON/배열/구조체/UUID를 손실 없이 보존한다."""
+    import uuid
+    from datetime import date, datetime, timezone
+    from datetime import time as dt_time
+    from decimal import Decimal
+
+    import duckdb
+
+    from autoetl.core import db_loader
+
+    sample_uuid = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    # 내부 마커 키(__etl_type__)를 포함한 실제 JSON 객체도 충돌 없이 왕복해야 한다.
+    payload_values = [
+        {"active": True, "nested": [1, None, {"k": "한글"}]},
+        {"__etl_type__": "decimal", "v": "literal-not-tag"},
+        [1, {"flag": False}, Decimal("12.34")],
+        (10, date(2025, 1, 2)),
+        sample_uuid,
+        Decimal("99.95"),
+        datetime(2025, 5, 1, 12, 30, tzinfo=timezone.utc),
+        dt_time(9, 15, 0),
+        b"\x00\x01\xff",
+    ]
+    for orig in payload_values:
+        encoded = db_loader._encode_snapshot_value(orig)
+        wire = json.loads(json.dumps(encoded, ensure_ascii=False))
+        decoded = db_loader._decode_snapshot_value(wire)
+        assert decoded == orig
+        assert type(decoded) is type(orig)
+
+    # PostgreSQL JSON/JSONB 복원 바인딩: Python repr("{'active': True}")가 아닌 유효 JSON
+    pg_obj = db_loader._bind_restore_value({"active": True}, "jsonb", "postgres")
+    if isinstance(pg_obj, str):
+        assert json.loads(pg_obj) == {"active": True}
+    else:
+        assert getattr(pg_obj, "obj", None) == {"active": True}
+    pg_scalar = db_loader._bind_restore_value("hello", "json", "postgres")
+    if isinstance(pg_scalar, str):
+        assert json.loads(pg_scalar) == "hello"
+    else:
+        assert getattr(pg_scalar, "obj", None) == "hello"
+    # PostgreSQL ARRAY 컬럼의 list는 JSON 문자열로 바꾸지 않고 list 그대로 유지
+    assert db_loader._bind_restore_value([1, 2], "array", "postgres") == [1, 2]
+    assert db_loader._bind_restore_value(None, "jsonb", "postgres") is None
+    # SQLite fallback도 유효 JSON 문자열로 직렬화
+    assert json.loads(db_loader._bind_restore_value({"active": True}, "text", "sqlite")) == {
+        "active": True
+    }
+
+    # DuckDB 사전 생성 테이블(JSON · LIST · STRUCT 컬럼 포함) UPSERT 후 롤백 시 복합 값 원복 검증
+    ddb_path = tmp_path / "complex.duckdb"
+    con = duckdb.connect(str(ddb_path))
+    try:
+        con.execute(
+            'CREATE TABLE "items" ('
+            '"code" VARCHAR PRIMARY KEY, '
+            '"name" VARCHAR NOT NULL, '
+            '"meta_json" JSON, '
+            '"tags" VARCHAR[], '
+            '"spec" STRUCT(active BOOLEAN, ver INTEGER), '
+            '"_etl_batch_id" VARCHAR, '
+            '"_etl_dataset_id" VARCHAR, '
+            '"_etl_loaded_at" VARCHAR)'
+        )
+        con.execute(
+            'INSERT INTO "items" VALUES (?, ?, ?::JSON, ?, ?, ?, ?, ?)',
+            [
+                "A1",
+                "OldName",
+                json.dumps({"active": True, "score": 1}),
+                ["alpha", "beta"],
+                {"active": True, "ver": 1},
+                "seed-batch",
+                "seed-ds",
+                "2025-01-01T00:00:00Z",
+            ],
+        )
+    finally:
+        con.close()
+
+    csv_u = tmp_path / "items.csv"
+    csv_u.write_text("code,name\nA1,NewName\nA2,Added\n", encoding="utf-8")
+    _, res = load_tables([csv_u], db_path=ddb_path, engine="duckdb")
+    assert res.status == "succeeded"
+
+    rb = rollback_batch(ddb_path, res.batch_id, engine="duckdb")
+    assert rb["total_deleted"] == 1
+    assert rb["total_restored"] == 1
+
+    con = duckdb.connect(str(ddb_path))
+    try:
+        rows = con.execute(
+            'SELECT "code", "name", "meta_json", "tags", "spec", "_etl_batch_id" '
+            'FROM "items" ORDER BY "code"'
+        ).fetchall()
+    finally:
+        con.close()
+    assert len(rows) == 1
+    code, name, meta_json, tags, spec, bid = rows[0]
+    assert code == "A1"
+    assert name == "OldName"
+    assert json.loads(str(meta_json)) == {"active": True, "score": 1}
+    assert tags == ["alpha", "beta"]
+    assert spec == {"active": True, "ver": 1}
+    assert bid == "seed-batch"

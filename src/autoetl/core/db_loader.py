@@ -550,6 +550,24 @@ class _DbAdapter:
         )
         return {str(r[0]) for r in rows}
 
+    def column_data_types(self, table_name: str) -> dict[str, str]:
+        """테이블 각 컬럼의 소문자 DB 타입명을 반환한다."""
+        if not self.table_exists(table_name):
+            return {}
+        if self.engine == "sqlite":
+            rows = self.fetchall(f"PRAGMA table_info({_qi(table_name)})")
+            return {str(r[1]): str(r[2]).strip().lower() for r in rows}
+        p = self.placeholder
+        schema_clause = (
+            "table_schema='main'" if self.engine == "duckdb" else "table_schema=current_schema()"
+        )
+        rows = self.fetchall(
+            f"SELECT column_name, data_type FROM information_schema.columns "
+            f"WHERE {schema_clause} AND table_name={p}",
+            (table_name,),
+        )
+        return {str(r[0]): str(r[1]).strip().lower() for r in rows}
+
     def close(self) -> None:
         if self._conn is not None:
             self._conn.close()
@@ -984,6 +1002,23 @@ def _encode_snapshot_value(val: Any) -> Any:
             _SNAPSHOT_TYPE_KEY: "bytes",
             "v": base64.b64encode(bytes(val)).decode("ascii"),
         }
+    if isinstance(val, uuid.UUID):
+        return {_SNAPSHOT_TYPE_KEY: "uuid", "v": str(val)}
+    if isinstance(val, dict):
+        return {
+            _SNAPSHOT_TYPE_KEY: "dict",
+            "v": {str(k): _encode_snapshot_value(v) for k, v in val.items()},
+        }
+    if isinstance(val, list):
+        return {
+            _SNAPSHOT_TYPE_KEY: "list",
+            "v": [_encode_snapshot_value(item) for item in val],
+        }
+    if isinstance(val, tuple):
+        return {
+            _SNAPSHOT_TYPE_KEY: "tuple",
+            "v": [_encode_snapshot_value(item) for item in val],
+        }
     return str(val)
 
 
@@ -991,17 +1026,43 @@ def _decode_snapshot_value(val: Any) -> Any:
     """`_encode_snapshot_value`로 직렬화된 값을 원래 Python/DB 바인딩 타입으로 복원한다."""
     if isinstance(val, dict) and _SNAPSHOT_TYPE_KEY in val:
         tag = val.get(_SNAPSHOT_TYPE_KEY)
-        raw = str(val.get("v", ""))
+        raw_val = val.get("v")
         if tag == "decimal":
-            return Decimal(raw)
+            return Decimal(str(raw_val))
         if tag == "datetime":
-            return datetime.fromisoformat(raw)
+            return datetime.fromisoformat(str(raw_val))
         if tag == "date":
-            return date.fromisoformat(raw)
+            return date.fromisoformat(str(raw_val))
         if tag == "time":
-            return dt_time.fromisoformat(raw)
+            return dt_time.fromisoformat(str(raw_val))
         if tag == "bytes":
-            return base64.b64decode(raw)
+            return base64.b64decode(str(raw_val))
+        if tag == "uuid":
+            return uuid.UUID(str(raw_val))
+        if tag == "dict" and isinstance(raw_val, dict):
+            return {str(k): _decode_snapshot_value(v) for k, v in raw_val.items()}
+        if tag == "list" and isinstance(raw_val, list):
+            return [_decode_snapshot_value(item) for item in raw_val]
+        if tag == "tuple" and isinstance(raw_val, list):
+            return tuple(_decode_snapshot_value(item) for item in raw_val)
+    if isinstance(val, list):
+        return [_decode_snapshot_value(item) for item in val]
+    return val
+
+
+def _bind_restore_value(val: Any, col_type: str, engine: str) -> Any:
+    """스냅샷에서 복원한 Python 값을 DB 엔진·컬럼 타입에 맞는 바인딩 파라미터로 변환한다."""
+    if val is None:
+        return None
+    norm_type = col_type.strip().lower()
+    if engine == "postgres" and (norm_type in {"json", "jsonb"} or isinstance(val, dict)):
+        try:
+            from psycopg.types.json import Json, Jsonb  # type: ignore[import-not-found]
+        except ImportError:
+            return json.dumps(val, ensure_ascii=False)
+        return Json(val) if norm_type == "json" else Jsonb(val)
+    if engine == "sqlite" and isinstance(val, (dict, list)):
+        return json.dumps(val, ensure_ascii=False)
     return val
 
 
@@ -2368,6 +2429,7 @@ def rollback_batch(
 
                 # 실제 UPSERT 실행의 역순으로 복원해 UNIQUE 값 이동 충돌을 방지하고,
                 # 동일 컬럼 집합은 executemany로 일괄 반영한다(DB 생성 컬럼 제외).
+                col_types = adapter.column_data_types(tbl)
                 pk_set = set(pk_cols)
                 where_pk = " AND ".join(f"{_qi(c)} = {p}" for c in pk_cols)
                 reversed_snaps = list(reversed(decoded_snapshots))
@@ -2377,7 +2439,15 @@ def rollback_batch(
                     if not restore_cols:
                         continue
                     row_params = (
-                        [snap[c] for c in restore_cols] + [snap[c] for c in pk_cols] + [batch_id]
+                        [
+                            _bind_restore_value(snap[c], col_types.get(c, ""), norm_engine)
+                            for c in restore_cols
+                        ]
+                        + [
+                            _bind_restore_value(snap[c], col_types.get(c, ""), norm_engine)
+                            for c in pk_cols
+                        ]
+                        + [batch_id]
                     )
                     if runs and runs[-1][0] == restore_cols:
                         runs[-1][1].append(row_params)

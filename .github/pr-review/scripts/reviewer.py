@@ -102,9 +102,10 @@ def make_workspace_guard(cwd: Path) -> HookCallback:
             if rel and rel != "." and is_sensitive_path(rel):
                 return _deny_tool("민감 경로 파일은 읽거나 검색할 수 없습니다.")
 
-        for pat_key in ("glob", "pattern"):
+        pat_key = "glob" if tool_name == "Grep" else ("pattern" if tool_name == "Glob" else None)
+        if pat_key is not None:
             raw_pat = tool_input.get(pat_key)
-            if tool_name in {"Grep", "Glob"} and isinstance(raw_pat, str) and raw_pat.strip():
+            if isinstance(raw_pat, str) and raw_pat.strip():
                 if _has_unsafe_glob_pattern(raw_pat):
                     return _deny_tool("저장소 외부 경로를 가리키는 패턴은 허용되지 않습니다.")
                 if is_sensitive_path(raw_pat):
