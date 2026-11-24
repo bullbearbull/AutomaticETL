@@ -7,10 +7,23 @@ from enum import Enum
 from pydantic import Field, NonNegativeInt
 
 from autoetl.contracts.column_types import TypeAssignment
-from autoetl.contracts.common import CONTRACTS_VERSION, ContractModel, PhysicalType, SemanticType
+from autoetl.contracts.common import (
+    CONTRACTS_VERSION,
+    ContractModel,
+    PhysicalType,
+    Purpose,
+    SemanticType,
+)
 from autoetl.contracts.ingest import IngestManifest, SamplingPlan
+from autoetl.contracts.load import (
+    ColumnMapping,
+    DeduplicationRule,
+    IncrementMode,
+    LoadOrder,
+)
 from autoetl.contracts.profile import ColumnProfile
 from autoetl.contracts.relations import RelationGraph
+from autoetl.contracts.schema import SchemaCandidate, Scorecard
 from autoetl.contracts.stats import ColumnStats
 
 
@@ -199,3 +212,58 @@ class MultiTableRelationAnalysis(ContractModel):
     primary_keys: dict[str, PrimaryKeyRecommendation] = Field(default_factory=dict)
     foreign_keys: list[CrossTableForeignKey] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+
+
+class IndexRecommendation(ContractModel):
+    """DB 적재 후 조회·조인 성능을 위한 권고 인덱스."""
+
+    table: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    columns: list[str] = Field(min_length=1)
+    unique: bool = False
+    reason: str
+
+
+class TableLoadStrategy(ContractModel):
+    """다중 테이블 적재 계획 내 개별 대상 테이블의 적재 전략."""
+
+    source_table: str
+    target_table: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    load_order_index: NonNegativeInt
+    depends_on: list[str] = Field(default_factory=list)
+    primary_key: list[str] = Field(default_factory=list)
+    uses_surrogate_key: bool = False
+    increment_mode: IncrementMode
+    upsert_keys: list[str] = Field(default_factory=list)
+    watermark_column: str | None = None
+    deduplication: DeduplicationRule
+    column_mappings: list[ColumnMapping] = Field(default_factory=list)
+    recommended_indexes: list[IndexRecommendation] = Field(default_factory=list)
+    expected_row_count: NonNegativeInt
+    notes: list[str] = Field(default_factory=list)
+
+
+class MultiTableLoadPlan(ContractModel):
+    """Milestone E4 산출물: 다중 테이블 최적 스키마 후보·채점·위상 적재 플랜·DDL·ERD."""
+
+    contract_version: str = CONTRACTS_VERSION
+    purpose: Purpose
+    selected_candidate_id: str
+    candidates: list[SchemaCandidate] = Field(default_factory=list)
+    scorecards: list[Scorecard] = Field(default_factory=list)
+    load_order: list[LoadOrder] = Field(default_factory=list)
+    table_plans: list[TableLoadStrategy] = Field(default_factory=list)
+    ddl_sql: str = ""
+    index_ddl_sql: str = ""
+    erd_mermaid: str = ""
+    cycle_warnings: list[str] = Field(default_factory=list)
+
+
+class MultiTableAnalysisBundle(ContractModel):
+    """다중 테이블 결정론적 분석 전체 번들(E1~E4 통합 최상위 계약)."""
+
+    contract_version: str = CONTRACTS_VERSION
+    purpose: Purpose
+    tables: list[TableProfileBundle] = Field(default_factory=list)
+    relations: MultiTableRelationAnalysis
+    load_plan: MultiTableLoadPlan
+    warnings: list[str] = Field(default_factory=list)
