@@ -10,6 +10,7 @@ from autoetl.contracts.column_types import TypeAssignment
 from autoetl.contracts.common import CONTRACTS_VERSION, ContractModel, PhysicalType, SemanticType
 from autoetl.contracts.ingest import IngestManifest, SamplingPlan
 from autoetl.contracts.profile import ColumnProfile
+from autoetl.contracts.relations import RelationGraph
 from autoetl.contracts.stats import ColumnStats
 
 
@@ -142,3 +143,59 @@ class TableProfileBundle(ContractModel):
     stats: list[ColumnStats] = Field(default_factory=list)
     classifications: list[ColumnClassification] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+
+class RelationshipCardinality(str, Enum):
+    """테이블 간 참조 관계 기수성."""
+
+    ONE_TO_ONE = "1:1"
+    MANY_TO_ONE = "N:1"
+    MANY_TO_MANY = "N:M"
+
+
+class PrimaryKeyRecommendation(ContractModel):
+    """테이블 하나의 최적 Primary Key 선정 결과와 근거."""
+
+    table_name: str
+    columns: list[str] = Field(default_factory=list)
+    is_composite: bool = False
+    recommend_surrogate: bool = False
+    surrogate_column_name: str | None = None
+    score: float = Field(ge=0, le=100)
+    referenced_by_count: NonNegativeInt = 0
+    alternative_keys: list[list[str]] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)
+
+
+class CrossTableForeignKey(ContractModel):
+    """다중 테이블 간 포함 종속 기반 외래 키(FK) 관계."""
+
+    child_table: str
+    child_columns: list[str] = Field(min_length=1)
+    child_slot_name: str | None = Field(
+        default=None,
+        description="규칙성 문자열 칼럼의 가변 슬롯에서 추출된 숨은 FK일 때 슬롯 이름",
+    )
+    child_extract_sql: str | None = Field(
+        default=None,
+        description="문자열 슬롯 FK일 때 DuckDB/PostgreSQL 추출 표현식",
+    )
+    parent_table: str
+    parent_columns: list[str] = Field(min_length=1)
+    cardinality: RelationshipCardinality
+    inclusion_rate: float = Field(ge=0, le=1, description="child 비결측 값 중 parent에 포함된 비율")
+    parent_coverage: float = Field(ge=0, le=1, description="parent 고유 값 중 child가 참조한 비율")
+    matched_rows: NonNegativeInt
+    orphan_rows: NonNegativeInt = 0
+    confidence: float = Field(ge=0, le=1)
+    reasons: list[str] = Field(default_factory=list)
+
+
+class MultiTableRelationAnalysis(ContractModel):
+    """Milestone E3 산출물: 테이블 내부 관계 + 테이블 간 FK + 최적 PK 선정 통합 결과."""
+
+    contract_version: str = CONTRACTS_VERSION
+    table_relations: dict[str, RelationGraph] = Field(default_factory=dict)
+    primary_keys: dict[str, PrimaryKeyRecommendation] = Field(default_factory=dict)
+    foreign_keys: list[CrossTableForeignKey] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
