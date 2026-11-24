@@ -118,6 +118,8 @@ def test_oltp_load_plan_topological_order_slot_fk_and_ddl(tmp_path: Path) -> Non
 
     assert 'FOREIGN KEY ("branch_code") REFERENCES "branches"("branch_code")' in lp.ddl_sql
     assert 'FOREIGN KEY ("customer_id") REFERENCES "customers"("customer_id")' in lp.ddl_sql
+    assert 'CREATE UNIQUE INDEX "uq_orders_order_code"' in lp.index_ddl_sql
+    assert "uq_branches_branch_name" not in lp.index_ddl_sql
 
     # 5. 정규화 후보에서 파생 컬럼 total_amount는 order_items 물리 컬럼에서 제외됨
     oi_cols = {m.target_column for m in plan_by_table["order_items"].column_mappings}

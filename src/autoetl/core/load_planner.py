@@ -864,22 +864,37 @@ def _build_table_load_strategies(
                     )
                 )
 
-        # 대안 자연 유일 키가 있으면 UNIQUE 인덱스 권고
+        # 대안 자연 유일 키(코드·식별자·규칙 문자열만, 금액/측정량·표시명 제외)에 UNIQUE 인덱스 권고
         if pk_rec is not None:
             col_name_set = {c.name for c in target_table.columns}
             for alt_key in pk_rec.alternative_keys[:2]:
-                if len(alt_key) == 1 and alt_key[0] in col_name_set:
-                    alt_tuple = tuple(alt_key)
-                    if alt_tuple not in indexed_tuples and alt_key != pk_cols:
-                        indexed_tuples.add(alt_tuple)
-                        table_indexes.append(
-                            IndexRecommendation(
-                                table=t_name,
-                                columns=list(alt_key),
-                                unique=True,
-                                reason="대안 유일 비즈니스 키 무결성 및 단건 조회 최적화",
-                            )
+                if len(alt_key) != 1 or alt_key[0] not in col_name_set:
+                    continue
+                alt_col = alt_key[0]
+                alt_cls = cls_by_col.get(alt_col)
+                if alt_cls is None or alt_cls.category not in {
+                    ColumnRoleCategory.INDEX,
+                    ColumnRoleCategory.CODE_IDENTIFIER,
+                    ColumnRoleCategory.STRUCTURED_STRING,
+                }:
+                    continue
+                low_alt = alt_col.lower()
+                if any(
+                    low_alt == suf or low_alt.endswith(f"_{suf}")
+                    for suf in ("name", "title", "label", "desc", "memo", "note")
+                ):
+                    continue
+                alt_tuple = (alt_col,)
+                if alt_tuple not in indexed_tuples and alt_key != pk_cols:
+                    indexed_tuples.add(alt_tuple)
+                    table_indexes.append(
+                        IndexRecommendation(
+                            table=t_name,
+                            columns=[alt_col],
+                            unique=True,
+                            reason="대안 유일 비즈니스 키 무결성 및 단건 조회 최적화",
                         )
+                    )
 
         # 분석 목적일 때 범주형 필터 컬럼 인덱스 추가
         if purpose is Purpose.ANALYTICS:
