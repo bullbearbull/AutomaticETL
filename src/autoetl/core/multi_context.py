@@ -591,7 +591,9 @@ def _build_ingest_manifest(slot: TableSlotContext) -> IngestManifest:
 
 
 def profile_all_tables(mctx: MultiTableContext) -> list[TableProfileBundle]:
-    """`MultiTableContext`의 모든 테이블에 S0~S4를 실행해 정규화 뷰와 프로파일 묶음을 만든다."""
+    """`MultiTableContext`의 모든 테이블에 S0~S4 및 E2 정밀 칼럼 분류를 실행한다."""
+    from autoetl.core.column_classifier import classify_table_columns
+
     bundles: list[TableProfileBundle] = []
     for slot in mctx.slots:
         mctx.activate(slot.table_info.table_id)
@@ -603,8 +605,10 @@ def profile_all_tables(mctx: MultiTableContext) -> list[TableProfileBundle]:
         slot.stage_artifacts["s02_profile"] = profiles
         types = s03_types.run(slot, ingest, profiles)
         slot.stage_artifacts["s03_types"] = types
-        stats = s04_stats.run(slot, ingest)
+        stats = s04_stats.run(slot, ingest, types)
         slot.stage_artifacts["s04_stats"] = stats
+        classifications = classify_table_columns(slot, ingest, profiles, types, stats)
+        slot.stage_artifacts["e2_classifications"] = classifications
         bundles.append(
             TableProfileBundle(
                 source=slot.table_info,
@@ -613,6 +617,7 @@ def profile_all_tables(mctx: MultiTableContext) -> list[TableProfileBundle]:
                 profiles=profiles,
                 types=types,
                 stats=stats,
+                classifications=classifications,
                 warnings=list(ingest.warnings),
             )
         )

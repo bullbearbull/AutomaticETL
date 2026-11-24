@@ -1,4 +1,4 @@
-"""다중 테이블 결정론적 분석·관계·적재 계획 계약(E1~E4)."""
+"""다중 테이블 결정론적 분석·칼럼 정밀 분류·문자열 패턴 분해 계약(E1~E4)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from enum import Enum
 from pydantic import Field, NonNegativeInt
 
 from autoetl.contracts.column_types import TypeAssignment
-from autoetl.contracts.common import CONTRACTS_VERSION, ContractModel
+from autoetl.contracts.common import CONTRACTS_VERSION, ContractModel, PhysicalType, SemanticType
 from autoetl.contracts.ingest import IngestManifest, SamplingPlan
 from autoetl.contracts.profile import ColumnProfile
 from autoetl.contracts.stats import ColumnStats
@@ -20,6 +20,95 @@ class TableSourceKind(str, Enum):
     TSV = "tsv"
     XLSX_SHEET = "xlsx_sheet"
     EXTRACTED_TABLE = "extracted_table"
+
+
+class ColumnRoleCategory(str, Enum):
+    """데이터 분석·DB 설계 관점의 칼럼 정밀 유형."""
+
+    INDEX = "index"
+    DISCRETE_NUMERIC = "discrete_numeric"
+    CONTINUOUS_NUMERIC = "continuous_numeric"
+    CATEGORICAL_NOMINAL = "categorical_nominal"
+    CATEGORICAL_ORDINAL = "categorical_ordinal"
+    TEMPORAL = "temporal"
+    STRUCTURED_STRING = "structured_string"
+    CODE_IDENTIFIER = "code_identifier"
+    FREE_TEXT = "free_text"
+    BOOLEAN = "boolean"
+
+
+class IndexMetadata(ContractModel):
+    """정수/식별자 칼럼의 인덱스·순번 특성 지표."""
+
+    is_unique: bool
+    is_monotonic_increasing: bool
+    starts_at_zero_or_one: bool
+    contiguous_step_rate: float = Field(ge=0, le=1, description="인접 행 차분이 1인 비율")
+    likely_surrogate_index: bool = Field(
+        description="유일성 + 단조증가 + 순번 특성으로 보아 행번호/서로게이트 키일 가능성"
+    )
+
+
+class StringSegmentKind(str, Enum):
+    """규칙 문자열 분해 세그먼트 종류(공통 고정부 vs 가변 슬롯)."""
+
+    LITERAL = "literal"
+    SLOT = "slot"
+
+
+class StringSegment(ContractModel):
+    """문자열 내부 규칙 분해 결과의 개별 세그먼트(고정부 또는 가변 슬롯)."""
+
+    position: NonNegativeInt
+    kind: StringSegmentKind
+    literal_value: str | None = Field(default=None, description="고정부일 때 공통 문자열")
+    slot_name: str | None = Field(default=None, description="가변 슬롯일 때 표준 식별자")
+    slot_category: ColumnRoleCategory | None = Field(
+        default=None, description="가변 슬롯 값의 세부 데이터 유형"
+    )
+    slot_physical_type: PhysicalType | None = None
+    unique_count: NonNegativeInt = 0
+    min_length: NonNegativeInt = 0
+    max_length: NonNegativeInt = 0
+    zero_padded: bool = False
+    sample_pattern: str | None = Field(
+        default=None, description="원문 값 대신 대표 형태 마스크(예: '9999', 'AA')"
+    )
+    capture_group: NonNegativeInt | None = Field(
+        default=None, description="전체 정규식 내 1-기반 캡처 그룹 번호"
+    )
+    extract_sql_hint: str | None = Field(
+        default=None, description="DuckDB/PostgreSQL에서 해당 슬롯을 파싱하는 표현식 힌트"
+    )
+
+
+class StringPatternDecomposition(ContractModel):
+    """규칙성 문자열의 공통 고정부·가변 슬롯 분해 결과."""
+
+    strategy: str = Field(description="적용된 분해 전략('delimiter', 'char_class', 'fixed_width')")
+    delimiter: str | None = Field(default=None, description="주요 구분자(해당 시)")
+    template: str = Field(description="템플릿 표현(예: 'ORD-{year}-{slot_1}-{seq}')")
+    regex_pattern: str = Field(description="전체 문자열 매칭 + 가변 슬롯 캡처 정규식")
+    coverage: float = Field(ge=0, le=1, description="비결측 표본 중 패턴에 일치한 비율")
+    segments: list[StringSegment] = Field(default_factory=list)
+    variable_slot_count: NonNegativeInt = 0
+
+
+class ColumnClassification(ContractModel):
+    """칼럼 하나의 결측치·정밀 유형·인덱스 특성·문자열 규칙 분해 통합 요약."""
+
+    column: str
+    physical_type: PhysicalType
+    semantic_type: SemanticType
+    category: ColumnRoleCategory
+    missing_count: NonNegativeInt
+    missing_rate: float = Field(ge=0, le=1)
+    unique_count: NonNegativeInt
+    cardinality_ratio: float = Field(ge=0, le=1)
+    index_meta: IndexMetadata | None = None
+    string_pattern: StringPatternDecomposition | None = None
+    ordinal_order: list[str] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)
 
 
 class TableSourceInfo(ContractModel):
@@ -42,7 +131,7 @@ class TableSourceInfo(ContractModel):
 
 
 class TableProfileBundle(ContractModel):
-    """단일 논리 테이블의 S0~S4 결정론적 프로파일·타입·통계 묶음."""
+    """단일 논리 테이블의 S0~S4 결정론적 프로파일·타입·통계·정밀 분류 묶음."""
 
     contract_version: str = CONTRACTS_VERSION
     source: TableSourceInfo
@@ -51,4 +140,5 @@ class TableProfileBundle(ContractModel):
     profiles: list[ColumnProfile] = Field(default_factory=list)
     types: list[TypeAssignment] = Field(default_factory=list)
     stats: list[ColumnStats] = Field(default_factory=list)
+    classifications: list[ColumnClassification] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
