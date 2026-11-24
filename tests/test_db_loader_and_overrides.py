@@ -585,23 +585,78 @@ def test_upsert_rollback_fk_guard_chain_duckdb_and_legacy_safety(tmp_path: Path)
     dr1 = rollback_batch(duck_db, d1.batch_id, engine="duckdb")
     assert dr1["total_deleted"] == 2 and dr1["total_restored"] == 0
 
-    # 3. 구버전 DB(스냅샷 컬럼 NULL)에서 UPSERT 다중 배치 롤백 시 안전하게 차단된다
+    # 3. 구버전 카탈로그 스키마(스냅샷·갱신 컬럼 자체가 없는 `_etl_datasets`) 호환성 검증:
+    #    마이그레이션 전에는 UPSERT 롤백을 차단해 기존 행·배치 ID를 보존하고,
+    #    다음 적재 시 누락된 스냅샷 컬럼들이 자동 진화 추가된다.
     legacy_db = tmp_path / "legacy.sqlite"
-    load_tables([p1], db_path=legacy_db, engine="sqlite")
+    _, l1 = load_tables([p1], db_path=legacy_db, engine="sqlite")
     _, l2 = load_tables([p2], db_path=legacy_db, engine="sqlite")
     lcon = sqlite3.connect(str(legacy_db))
     try:
-        lcon.execute('UPDATE "_etl_datasets" SET "rollback_snapshots_json" = NULL')
+        lcon.execute("PRAGMA foreign_keys = OFF")
+        lcon.execute(
+            'CREATE TABLE "_etl_datasets_old" ('
+            '"dataset_id" TEXT PRIMARY KEY, '
+            '"batch_id" TEXT NOT NULL REFERENCES "_etl_load_batches" ("batch_id"), '
+            '"load_order_index" INTEGER NOT NULL, '
+            '"target_table" TEXT NOT NULL, '
+            '"dataset_kind" TEXT NOT NULL, '
+            '"source_name" TEXT NOT NULL, '
+            '"source_format" TEXT NOT NULL, '
+            '"source_encoding" TEXT NOT NULL, '
+            '"source_sha256" TEXT, '
+            '"schema_fingerprint" TEXT NOT NULL, '
+            '"increment_mode" TEXT NOT NULL, '
+            '"primary_key_columns" TEXT NOT NULL, '
+            '"rows_read" INTEGER NOT NULL, '
+            '"rows_loaded" INTEGER NOT NULL, '
+            '"rows_quarantined" INTEGER NOT NULL, '
+            '"schema_drift_detected" INTEGER NOT NULL, '
+            '"loaded_at" TEXT NOT NULL)'
+        )
+        lcon.execute(
+            'INSERT INTO "_etl_datasets_old" '
+            'SELECT "dataset_id", "batch_id", "load_order_index", "target_table", '
+            '"dataset_kind", "source_name", "source_format", "source_encoding", '
+            '"source_sha256", "schema_fingerprint", "increment_mode", "primary_key_columns", '
+            '"rows_read", "rows_loaded", "rows_quarantined", "schema_drift_detected", '
+            '"loaded_at" FROM "_etl_datasets"'
+        )
+        lcon.execute('DROP TABLE "_etl_datasets"')
+        lcon.execute('ALTER TABLE "_etl_datasets_old" RENAME TO "_etl_datasets"')
         lcon.commit()
     finally:
         lcon.close()
+
     with pytest.raises(InputError, match="스냅샷이 없어"):
         rollback_batch(legacy_db, l2.batch_id, engine="sqlite")
-    # l1 데이터가 삭제되지 않고 그대로 보호됨 확인
+    # 차단 후 행 값과 _etl_batch_id가 전혀 손상되지 않았는지 검증
     lcon = sqlite3.connect(str(legacy_db))
     try:
-        cnt = lcon.execute("SELECT COUNT(*) FROM items").fetchone()
-        assert cnt is not None and cnt[0] == 3
+        rows_preserved = lcon.execute(
+            "SELECT item_id, item_name, _etl_batch_id FROM items ORDER BY item_id"
+        ).fetchall()
+        assert rows_preserved == [
+            (1, "Alpha-v2", l2.batch_id),
+            (2, "Beta", l1.batch_id),
+            (3, "Gamma", l2.batch_id),
+        ]
+    finally:
+        lcon.close()
+
+    # 다음 적재 시 구버전 `_etl_datasets`에 스냅샷 컬럼들이 자동 진화 추가되는지 확인
+    _, l3 = load_tables([p3], db_path=legacy_db, engine="sqlite")
+    assert l3.status == "succeeded"
+    lcon = sqlite3.connect(str(legacy_db))
+    try:
+        migrated_cols = {
+            str(r[1]) for r in lcon.execute('PRAGMA table_info("_etl_datasets")').fetchall()
+        }
+        assert {
+            "rows_updated",
+            "rollback_snapshots_json",
+            "snapshot_source_batches_json",
+        } <= migrated_cols
     finally:
         lcon.close()
 
@@ -1115,7 +1170,20 @@ def test_rollback_snapshot_preserves_json_nested_and_uuid_types(tmp_path: Path) 
         assert decoded == orig
         assert type(decoded) is type(orig)
 
-    # PostgreSQL JSON/JSONB 복원 바인딩: Python repr("{'active': True}")가 아닌 유효 JSON
+    # PostgreSQL JSON/JSONB/배열 원문 텍스트 래퍼: JSON null vs SQL NULL 및 정확한 큰 정수 보존
+    pg_null = db_loader._PgTypedText("jsonb", "null")
+    pg_big_num = db_loader._PgTypedText("jsonb", '{"big": 9007199254740993}')
+    pg_jsonb_arr = db_loader._PgTypedText("jsonb[]", '{"{\\"a\\": 1}","null",NULL}')
+    for typed_val in (pg_null, pg_big_num, pg_jsonb_arr):
+        enc = db_loader._encode_snapshot_value(typed_val)
+        dec = db_loader._decode_snapshot_value(json.loads(json.dumps(enc, ensure_ascii=False)))
+        assert dec == typed_val
+        assert db_loader._bind_restore_value(dec, typed_val.pg_type, "postgres") == typed_val.text
+    # SQL NULL은 여전히 None으로 유지되어 JSON 리터럴 "null"과 완전히 구분된다.
+    assert db_loader._bind_restore_value(None, "jsonb", "postgres") is None
+    assert db_loader._bind_restore_value(pg_null, "jsonb", "postgres") == "null"
+
+    # PostgreSQL JSON/JSONB·jsonb[] 원소별 바인딩 (네이티브 스칼라 배열 int4[]는 그대로 유지)
     pg_obj = db_loader._bind_restore_value({"active": True}, "jsonb", "postgres")
     if isinstance(pg_obj, str):
         assert json.loads(pg_obj) == {"active": True}
@@ -1126,15 +1194,26 @@ def test_rollback_snapshot_preserves_json_nested_and_uuid_types(tmp_path: Path) 
         assert json.loads(pg_scalar) == "hello"
     else:
         assert getattr(pg_scalar, "obj", None) == "hello"
-    # PostgreSQL ARRAY 컬럼의 list는 JSON 문자열로 바꾸지 않고 list 그대로 유지
+    pg_arr_bound = db_loader._bind_restore_value(
+        [{"a": 1}, None, {"b": True}], "jsonb[]", "postgres"
+    )
+    assert isinstance(pg_arr_bound, list) and len(pg_arr_bound) == 3
+    assert pg_arr_bound[1] is None
+    if isinstance(pg_arr_bound[0], str):
+        assert json.loads(pg_arr_bound[0]) == {"a": 1}
+        assert json.loads(pg_arr_bound[2]) == {"b": True}
+    else:
+        assert getattr(pg_arr_bound[0], "obj", None) == {"a": 1}
+        assert getattr(pg_arr_bound[2], "obj", None) == {"b": True}
+    assert db_loader._bind_restore_value([1, 2], "int4[]", "postgres") == [1, 2]
     assert db_loader._bind_restore_value([1, 2], "array", "postgres") == [1, 2]
-    assert db_loader._bind_restore_value(None, "jsonb", "postgres") is None
     # SQLite fallback도 유효 JSON 문자열로 직렬화
     assert json.loads(db_loader._bind_restore_value({"active": True}, "text", "sqlite")) == {
         "active": True
     }
 
-    # DuckDB 사전 생성 테이블(JSON · LIST · STRUCT 컬럼 포함) UPSERT 후 롤백 시 복합 값 원복 검증
+    # DuckDB 사전 생성 테이블(JSON · LIST · STRUCT 컬럼 포함):
+    # 실제로 복합 컬럼을 모두 변경한 뒤 스냅샷 복원이 원값을 되돌리는지 검증
     ddb_path = tmp_path / "complex.duckdb"
     con = duckdb.connect(str(ddb_path))
     try:
@@ -1165,10 +1244,27 @@ def test_rollback_snapshot_preserves_json_nested_and_uuid_types(tmp_path: Path) 
     finally:
         con.close()
 
+    # 1) CSV에 meta_json 컬럼을 포함해 실제 JSON 컬럼 값을 덮어쓰고 롤백 복원 검증
     csv_u = tmp_path / "items.csv"
-    csv_u.write_text("code,name\nA1,NewName\nA2,Added\n", encoding="utf-8")
+    csv_u.write_text(
+        'code,name,meta_json\nA1,NewName,"{""active"": false, ""score"": 99}"\n'
+        'A2,Added,"{""active"": true, ""score"": 5}"\n',
+        encoding="utf-8",
+    )
     _, res = load_tables([csv_u], db_path=ddb_path, engine="duckdb")
     assert res.status == "succeeded"
+
+    # 롤백 전 실제로 meta_json이 새 값으로 바뀌었는지 확인
+    con = duckdb.connect(str(ddb_path))
+    try:
+        mid = con.execute(
+            'SELECT "name", "meta_json" FROM "items" WHERE "code" = \'A1\''
+        ).fetchone()
+        assert mid is not None
+        assert mid[0] == "NewName"
+        assert json.loads(str(mid[1])) == {"active": False, "score": 99}
+    finally:
+        con.close()
 
     rb = rollback_batch(ddb_path, res.batch_id, engine="duckdb")
     assert rb["total_deleted"] == 1
@@ -1190,3 +1286,213 @@ def test_rollback_snapshot_preserves_json_nested_and_uuid_types(tmp_path: Path) 
     assert tags == ["alpha", "beta"]
     assert spec == {"active": True, "ver": 1}
     assert bid == "seed-batch"
+
+    # 2) DuckDB LIST(tags) · STRUCT(spec) 컬럼도 실제로 변경된 후 스냅샷으로 원복되는지 검증
+    adapter = db_loader._DbAdapter(ddb_path, "duckdb")
+    try:
+        full_snaps, omit = db_loader._fetch_existing_rows_by_pks(
+            adapter, "items", ["code"], [("A1",)], columns=None
+        )
+        assert omit is None and full_snaps is not None and len(full_snaps) == 1
+        adapter.begin()
+        adapter.execute(
+            'UPDATE "items" SET "name" = ?, "meta_json" = ?::JSON, "tags" = ?, '
+            '"spec" = ?, "_etl_batch_id" = ? WHERE "code" = ?',
+            [
+                "Mutated",
+                json.dumps({"active": False, "score": 0}),
+                ["gamma"],
+                {"active": False, "ver": 9},
+                "batch_complex_test",
+                "A1",
+            ],
+        )
+        adapter.execute(
+            'INSERT INTO "_etl_load_batches" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                "batch_complex_test",
+                "2026-01-01T00:00:00Z",
+                "oltp",
+                "c1",
+                "duckdb",
+                "succeeded",
+                1,
+                1,
+                1,
+                0,
+                "{}",
+                "",
+            ),
+        )
+        adapter.execute(
+            'INSERT INTO "_etl_datasets" VALUES ('
+            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "ds_complex_test",
+                "batch_complex_test",
+                0,
+                "items",
+                "standalone",
+                "items",
+                "csv",
+                "utf-8",
+                None,
+                "fp",
+                "upsert",
+                json.dumps(["code"]),
+                1,
+                1,
+                0,
+                0,
+                "2026-01-01T00:00:00Z",
+                1,
+                json.dumps(full_snaps, ensure_ascii=False),
+                json.dumps(["seed-batch"]),
+            ),
+        )
+        adapter.commit()
+    finally:
+        adapter.close()
+
+    # 변경 확인
+    con = duckdb.connect(str(ddb_path))
+    try:
+        mut = con.execute('SELECT "tags", "spec" FROM "items" WHERE "code" = \'A1\'').fetchone()
+        assert mut == (["gamma"], {"active": False, "ver": 9})
+    finally:
+        con.close()
+
+    rb_complex = rollback_batch(ddb_path, "batch_complex_test", engine="duckdb")
+    assert rb_complex["total_restored"] == 1
+    con = duckdb.connect(str(ddb_path))
+    try:
+        restored_row = con.execute(
+            'SELECT "name", "meta_json", "tags", "spec", "_etl_batch_id" '
+            'FROM "items" WHERE "code" = \'A1\''
+        ).fetchone()
+        assert restored_row is not None
+        assert restored_row[0] == "OldName"
+        assert json.loads(str(restored_row[1])) == {"active": True, "score": 1}
+        assert restored_row[2] == ["alpha", "beta"]
+        assert restored_row[3] == {"active": True, "ver": 1}
+        assert restored_row[4] == "seed-batch"
+    finally:
+        con.close()
+
+
+def test_rollback_interleaved_order_self_fk_cascade_and_unique_reuse(tmp_path: Path) -> None:
+    """혼합 배치 롤백이 정확한 역순으로 실행되어 자기참조 CASCADE FK와 UNIQUE 재사용을 보존한다."""
+    import sqlite3
+
+    # 1. 자기참조 ON DELETE CASCADE FK: 배치 2가 신규 B를 삽입한 뒤 기존 A가 B를 참조하도록 갱신
+    #    롤백은 반드시 A 복원(B 참조 해제) -> B 삭제 순으로 실행되어야 A가 연쇄 삭제되지 않는다.
+    sfk_db = tmp_path / "self_fk.sqlite"
+    con = sqlite3.connect(str(sfk_db))
+    try:
+        con.execute("PRAGMA foreign_keys = ON")
+        con.execute(
+            'CREATE TABLE "nodes" ('
+            '"id" TEXT PRIMARY KEY, '
+            '"parent_id" TEXT REFERENCES "nodes" ("id") ON DELETE CASCADE, '
+            '"_etl_batch_id" TEXT NOT NULL, '
+            '"_etl_dataset_id" TEXT NOT NULL, '
+            '"_etl_loaded_at" TEXT NOT NULL)'
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    n1 = tmp_path / "sfk1" / "nodes.csv"
+    n2 = tmp_path / "sfk2" / "nodes.csv"
+    n1.parent.mkdir()
+    n2.parent.mkdir()
+    n1.write_text("id,parent_id\nA,\nR,\n", encoding="utf-8")
+    # Row 0: 신규 B 삽입(parent=NULL), Row 1: 기존 A를 parent=B로 갱신
+    n2.write_text("id,parent_id\nB,\nA,B\n", encoding="utf-8")
+
+    _, sr1 = load_tables([n1], db_path=sfk_db, engine="sqlite")
+    _, sr2 = load_tables([n2], db_path=sfk_db, engine="sqlite")
+    assert sr2.status == "succeeded"
+
+    srb2 = rollback_batch(sfk_db, sr2.batch_id, engine="sqlite")
+    assert srb2["total_deleted"] == 1
+    assert srb2["total_restored"] == 1
+
+    con = sqlite3.connect(str(sfk_db))
+    try:
+        node_rows = con.execute(
+            'SELECT "id", "parent_id", "_etl_batch_id" FROM "nodes" ORDER BY "id"'
+        ).fetchall()
+    finally:
+        con.close()
+    assert node_rows == [("A", None, sr1.batch_id), ("R", None, sr1.batch_id)]
+
+    # 2. 구버전 스냅샷(삽입 마커 없음)이 자기참조 FK 혼합 배치를 포함하면 삭제 전에 롤백 차단
+    _, sr3 = load_tables([n2], db_path=sfk_db, engine="sqlite", force_reload=True)
+    con = sqlite3.connect(str(sfk_db))
+    try:
+        raw_snap = con.execute(
+            'SELECT "rollback_snapshots_json" FROM "_etl_datasets" WHERE "batch_id" = ?',
+            (sr3.batch_id,),
+        ).fetchone()
+        assert raw_snap is not None
+        only_restores = [s for s in json.loads(str(raw_snap[0])) if "__etl_op__" not in s]
+        con.execute(
+            'UPDATE "_etl_datasets" SET "rollback_snapshots_json" = ? WHERE "batch_id" = ?',
+            (json.dumps(only_restores, ensure_ascii=False), sr3.batch_id),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    with pytest.raises(InputError, match="자기참조 외래 키"):
+        rollback_batch(sfk_db, sr3.batch_id, engine="sqlite")
+    # 차단 후 A, B 모두 삭제되지 않고 보존됨을 검증
+    con = sqlite3.connect(str(sfk_db))
+    try:
+        preserved = con.execute('SELECT "id", "parent_id" FROM "nodes" ORDER BY "id"').fetchall()
+        assert preserved == [("A", "B"), ("B", None), ("R", None)]
+    finally:
+        con.close()
+
+    # 3. 반대 순서(기존 행 갱신으로 UNIQUE 해제 -> 후속 신규 행 삽입으로 UNIQUE 재사용):
+    #    롤백은 반드시 S2 삭제(UNIQUE 해제) -> S1 복원 순으로 실행되어야 UNIQUE 충돌이 없다.
+    uq_db = tmp_path / "uq_reuse.sqlite"
+    con = sqlite3.connect(str(uq_db))
+    try:
+        con.execute(
+            'CREATE TABLE "slots" ('
+            '"slot_id" TEXT PRIMARY KEY, '
+            '"tag" TEXT UNIQUE NOT NULL, '
+            '"_etl_batch_id" TEXT NOT NULL, '
+            '"_etl_dataset_id" TEXT NOT NULL, '
+            '"_etl_loaded_at" TEXT NOT NULL)'
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    u1 = tmp_path / "uqr1" / "slots.csv"
+    u2 = tmp_path / "uqr2" / "slots.csv"
+    u1.parent.mkdir()
+    u2.parent.mkdir()
+    u1.write_text("slot_id,tag\nS1,OLD\nS3,KEEP\n", encoding="utf-8")
+    # Row 0: S1을 OLD -> TEMP로 갱신, Row 1: 신규 S2가 해방된 OLD를 재사용
+    u2.write_text("slot_id,tag\nS1,TEMP\nS2,OLD\n", encoding="utf-8")
+
+    _, ur1 = load_tables([u1], db_path=uq_db, engine="sqlite")
+    _, ur2 = load_tables([u2], db_path=uq_db, engine="sqlite")
+    assert ur2.status == "succeeded"
+
+    urb2 = rollback_batch(uq_db, ur2.batch_id, engine="sqlite")
+    assert urb2["total_deleted"] == 1
+    assert urb2["total_restored"] == 1
+
+    con = sqlite3.connect(str(uq_db))
+    try:
+        slot_rows = con.execute(
+            'SELECT "slot_id", "tag", "_etl_batch_id" FROM "slots" ORDER BY "slot_id"'
+        ).fetchall()
+    finally:
+        con.close()
+    assert slot_rows == [("S1", "OLD", ur1.batch_id), ("S3", "KEEP", ur1.batch_id)]
