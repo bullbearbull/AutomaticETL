@@ -192,3 +192,57 @@ def test_one_to_one_cycle_deduplication_and_orphan_rows() -> None:
     assert len(log_fks) == 1
     assert log_fks[0].orphan_rows == 1
     assert abs(log_fks[0].inclusion_rate - 0.95) < 1e-6
+
+
+def test_camelcase_associative_composite_pk_selection() -> None:
+    """camelCase 연관 테이블 복합 PK(orderID, productID)와 다수 반복 문자열 FK를 검증한다."""
+    customers = NamedTableInput(
+        name="customers",
+        headers=("customerID", "companyName"),
+        rows=tuple((f"CUS{i:02d}", f"Company {i}") for i in range(1, 26)),
+    )
+    orders = NamedTableInput(
+        name="orders",
+        headers=("orderID", "customerID"),
+        rows=tuple((str(10248 + i), f"CUS{(i % 25) + 1:02d}") for i in range(60)),
+    )
+    products = NamedTableInput(
+        name="products",
+        headers=("productID", "productName"),
+        rows=tuple((str(i), f"Product {i}") for i in range(1, 6)),
+    )
+    order_details = NamedTableInput(
+        name="order_details",
+        headers=("orderID", "productID", "unitPrice", "quantity", "discount"),
+        rows=(
+            ("10248", "1", "14.0", "12", "0"),
+            ("10248", "2", "9.8", "10", "0"),
+            ("10249", "2", "18.6", "9", "0"),
+            ("10249", "3", "42.4", "40", "0"),
+            ("10250", "1", "14.0", "10", "0.15"),
+            ("10250", "4", "16.8", "35", "0.15"),
+            ("10251", "3", "42.4", "6", "0.05"),
+            ("10251", "5", "21.0", "15", "0.05"),
+            ("10252", "4", "16.8", "20", "0"),
+            ("10253", "5", "21.0", "25", "0"),
+        ),
+    )
+
+    with MultiTableContext(extra_tables=[customers, orders, products, order_details]) as mctx:
+        bundles = profile_all_tables(mctx)
+        analysis = analyze_multi_table_relations(mctx, bundles)
+
+    od_pk = analysis.primary_keys["order_details"]
+    assert od_pk.recommend_surrogate is False
+    assert od_pk.columns == ["orderID", "productID"]
+    assert od_pk.is_composite is True
+    assert analysis.primary_keys["orders"].columns == ["orderID"]
+    assert analysis.primary_keys["products"].columns == ["productID"]
+    assert any(
+        fk.child_table == "orders"
+        and fk.child_columns == ["customerID"]
+        and fk.parent_table == "customers"
+        and fk.parent_columns == ["customerID"]
+        and fk.inclusion_rate == 1.0
+        for fk in analysis.foreign_keys
+    )

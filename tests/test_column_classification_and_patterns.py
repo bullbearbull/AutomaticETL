@@ -243,3 +243,23 @@ def test_end_to_end_column_classification_and_s4_stats() -> None:
         assert cls_by["is_paid"].category is ColumnRoleCategory.BOOLEAN
         assert cls_by["memo"].category is ColumnRoleCategory.FREE_TEXT
         assert cls_by["memo"].missing_count == 1
+
+
+def test_string_pattern_rejects_title_case_words_and_two_word_names() -> None:
+    """영문 Title-Case 단어와 공백 2단어 인명은 규칙성 문자열로 오분해하지 않는다."""
+    months = ["January", "February", "March", "April", "May", "June", "July", "August"]
+    bands = ["High", "Medium", "Low", "None", "High", "Medium", "Low"]
+    cities = ["London", "Berlin", "Madrid", "Seattle", "Tokyo", "Paris"]
+    names = [
+        "Maria Anders",
+        "Ana Trujillo",
+        "Antonio Moreno",
+        "Thomas Hardy",
+        "Christina Berglund",
+        "Hanna Moos",
+    ]
+
+    assert analyze_string_pattern(months) is None
+    assert analyze_string_pattern(bands) is None
+    assert analyze_string_pattern(cities) is None
+    assert analyze_string_pattern(names) is None

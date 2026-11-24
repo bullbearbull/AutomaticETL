@@ -332,6 +332,29 @@ def classify_table_columns(
                     ):
                         category = ColumnRoleCategory.CODE_IDENTIFIER
                         reasons.append("결측 없는 유일 단문 식별 코드")
+                    elif (
+                        prof.count >= 2
+                        and prof.length.minimum >= 2
+                        and prof.length.maximum <= 32
+                        and sample_strs
+                        and all(" " not in v.strip() and "\t" not in v.strip() for v in sample_strs)
+                        and (
+                            (
+                                prof.length.minimum == prof.length.maximum
+                                and all(
+                                    v.strip().isascii()
+                                    and (v.strip().isupper() or any(c.isdigit() for c in v))
+                                    for v in sample_strs
+                                )
+                            )
+                            or _INDEX_NAME_RE.search(
+                                re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", col.name)
+                            )
+                            is not None
+                        )
+                    ):
+                        category = ColumnRoleCategory.CODE_IDENTIFIER
+                        reasons.append("반복 참조 단문 식별·코드 칼럼(외래키/코드 후보)")
                     else:
                         category = ColumnRoleCategory.FREE_TEXT
                         reasons.append("규칙성 없는 자유 텍스트")

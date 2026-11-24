@@ -21,7 +21,7 @@ import re
 import shutil
 import tempfile
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -509,11 +509,47 @@ class MultiTableContext:
                 raise InputError(
                     f"적재한 행 수가 감지한 행 수와 다르다({slot.table_info.display_name})."
                 )
-        except duckdb.Error as exc:
-            raise InputError(
-                f"테이블을 DuckDB에 적재하지 못했다({slot.table_info.display_name}): "
-                f"{type(exc).__name__}"
-            ) from exc
+        except duckdb.Error as strict_exc:
+            # 비표준 따옴표/비인용 쉼표가 섞인 실무 CSV는 완화 모드로 1회 재시도(경고 기록)
+            try:
+                self.connection.execute(f"DROP TABLE IF EXISTS {RAW_TABLE}")
+                self.connection.execute(
+                    f"CREATE TABLE {RAW_TABLE} AS SELECT * FROM read_csv(?, "
+                    f"header=false, skip={slot.spec.skip_lines}, "
+                    f"columns={{{columns_spec}}}, "
+                    f"allow_quoted_nulls=false, delim='{slot.spec.delimiter}', "
+                    f"auto_detect=false, quote='\"', escape='\"', "
+                    f"strict_mode=false, null_padding=true, ignore_errors=true)",
+                    [str(slot.spec.load_path)],
+                )
+                loaded = self.connection.execute(f"SELECT COUNT(*) FROM {RAW_TABLE}").fetchone()
+                loaded_cnt = int(loaded[0]) if (loaded is not None and loaded[0]) else 0
+                if loaded_cnt <= 0:
+                    raise strict_exc
+                dropped = max(0, slot.spec.row_count - loaded_cnt)
+                if dropped > 0:
+                    warn_msg = (
+                        f"{slot.table_info.display_name}: 비표준 CSV 형식 행 {dropped}건을 "
+                        f"제외하고 완화 파서로 {loaded_cnt}행을 적재했다."
+                    )
+                else:
+                    warn_msg = (
+                        f"{slot.table_info.display_name}: 비표준 CSV 구분/따옴표 형식을 "
+                        f"완화 파서로 보정해 {loaded_cnt}행 전체를 적재했다."
+                    )
+                slot.row_count = loaded_cnt
+                slot.spec = replace(
+                    slot.spec,
+                    row_count=loaded_cnt,
+                    warnings=[*slot.spec.warnings, warn_msg],
+                )
+                slot.table_info = slot.table_info.model_copy(update={"row_count": loaded_cnt})
+                self.warnings.append(warn_msg)
+            except duckdb.Error as exc:
+                raise InputError(
+                    f"테이블을 DuckDB에 적재하지 못했다({slot.table_info.display_name}): "
+                    f"{type(exc).__name__}"
+                ) from exc
 
     def activate(self, table_id: str) -> TableSlotContext:
         """지정한 내부 스키마(`t0`, `t1`, ...)를 현재 DuckDB 기본 스키마로 전환한다."""

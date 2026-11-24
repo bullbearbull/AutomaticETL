@@ -19,12 +19,21 @@ from autoetl.contracts import (
     TableProfileBundle,
 )
 
+_CAMEL_RE = re.compile(r"([a-z0-9])([A-Z])")
 _KEY_NAME_RE = re.compile(
     r"(^|_)(id|pk|key|code|cd|no|num|seq|uuid|guid|번호|코드|식별자)$",
     re.IGNORECASE,
 )
+_SEQ_DISCRIMINATOR_RE = re.compile(
+    r"(^|_)(line_?no|item_?no|detail_?no|sub_?no|row_?no|seq|seq_?no|line|순번|항번)$",
+    re.IGNORECASE,
+)
 
 _MIN_ACCEPTABLE_PK_SCORE = 40.0
+
+
+def _to_snake(name: str) -> str:
+    return _CAMEL_RE.sub(r"\1_\2", name.strip()).lower()
 
 
 def _singularize(word: str) -> str:
@@ -43,6 +52,7 @@ def _score_candidate_key(
     prof_by_col: Mapping[str, ColumnProfile],
     referenced_by_count: int,
     col_positions: Mapping[str, int],
+    outgoing_fk_cols: set[str],
 ) -> tuple[float, list[str]]:
     """후보 키 하나의 PK 적합도(0~100)와 선정 근거 목록을 계산한다."""
     if not candidate.unique or candidate.violation_count > 0:
@@ -65,6 +75,16 @@ def _score_candidate_key(
     elif n_cols == 2:
         score += 14.0
         reasons.append("2칼럼 복합 키")
+        c0, c1 = candidate.columns[0], candidate.columns[1]
+        is_weak_entity = (
+            c0 in outgoing_fk_cols and _SEQ_DISCRIMINATOR_RE.search(_to_snake(c1)) is not None
+        ) or (c1 in outgoing_fk_cols and _SEQ_DISCRIMINATOR_RE.search(_to_snake(c0)) is not None)
+        if is_weak_entity:
+            score += 12.0
+            reasons.append("상세(약한 개체) 테이블의 FK + 순번 복합 키")
+        elif all(c in outgoing_fk_cols for c in candidate.columns):
+            score += 10.0
+            reasons.append("연결(매핑/상세) 테이블의 복합 FK 키")
     else:
         score += 6.0
         reasons.append(f"{n_cols}칼럼 복합 키")
@@ -111,14 +131,19 @@ def _score_candidate_key(
     else:
         reasons.append("연속 수치·장문 텍스트 포함으로 감점")
 
-    # 4. 이름 신호 및 선두 컬럼 보너스(동률 판결)
+    # 4. 이름 신호 및 선두 컬럼 보너스(camelCase 포함 동률 판결)
     table_singular = _singularize(table_name)
     name_hits = 0
     for col in candidate.columns:
-        low = col.lower()
-        if low in {f"{table_singular}_id", f"{table_singular}_code", f"{table_singular}_no", "id"}:
+        snake = _to_snake(col)
+        if snake in {
+            f"{table_singular}_id",
+            f"{table_singular}_code",
+            f"{table_singular}_no",
+            "id",
+        }:
             name_hits += 2
-        elif _KEY_NAME_RE.search(col) is not None:
+        elif _KEY_NAME_RE.search(snake) is not None:
             name_hits += 1
     if name_hits > 0:
         bonus = min(15.0, name_hits * 6.0)
@@ -144,12 +169,15 @@ def select_primary_key(
     prof_by_col = {p.column: p for p in bundle.profiles}
     col_positions = {c.name: c.index for c in bundle.ingest.columns}
 
-    # 이 테이블의 각 키 조합을 참조하는 타 테이블 FK 개수 집계
+    # 이 테이블의 각 키 조합을 참조하는 타 테이블 FK 개수 및 이 테이블의 발신 FK 컬럼 집계
     ref_counts: dict[tuple[str, ...], int] = {}
+    outgoing_fk_cols: set[str] = set()
     for fk in foreign_keys:
         if fk.parent_table == table_name:
             key_tup = tuple(fk.parent_columns)
             ref_counts[key_tup] = ref_counts.get(key_tup, 0) + 1
+        if fk.child_table == table_name and fk.child_slot_name is None:
+            outgoing_fk_cols.update(fk.child_columns)
 
     valid_candidates = [ck for ck in candidate_keys if ck.unique and ck.violation_count == 0]
     if not valid_candidates:
@@ -172,11 +200,17 @@ def select_primary_key(
         key_tup = tuple(ck.columns)
         ref_cnt = ref_counts.get(key_tup, 0)
         sc, reasons = _score_candidate_key(
-            table_name, ck, cls_by_col, prof_by_col, ref_cnt, col_positions
+            table_name,
+            ck,
+            cls_by_col,
+            prof_by_col,
+            ref_cnt,
+            col_positions,
+            outgoing_fk_cols,
         )
-        first_pos = min(col_positions.get(c, 999) for c in ck.columns)
-        # 동률 시: 컬럼 수 적을수록, 선두 컬럼일수록 우선
-        tie_key = (-len(ck.columns), -first_pos)
+        pos_sum = sum(col_positions.get(c, 999) for c in ck.columns)
+        # 동률 시: 컬럼 수 적을수록, 선두에 가까운 컬럼 조합일수록 우선
+        tie_key = (-len(ck.columns), -pos_sum)
         scored.append((sc, tie_key, ck, reasons, ref_cnt))
 
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)

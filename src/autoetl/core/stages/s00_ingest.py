@@ -491,7 +491,9 @@ def _header_row_count(
         if len(evidence) < MIN_HEADER_EVIDENCE:
             break  # 빈 칸·결측 표기는 헤더 근거가 아니다 — 근거 부족은 데이터로 본다.
         ratio = sum(1 for cell in evidence if _profile_kind(cell) == "text") / len(evidence)
-        if ratio < HEADER_TEXT_RATIO:
+        # 2행 이상 다중 헤더로 판정하면 실제 데이터 행이 사라지고 셀 값이 컬럼명이 되므로,
+        # 첫 헤더 이후(count >= 1)에는 엄격 과반(> 0.5)일 때만 추가 헤더 행으로 인정한다.
+        if (count >= 1 and ratio <= HEADER_TEXT_RATIO) or ratio < HEADER_TEXT_RATIO:
             break  # 데이터 형태다.
         count += 1
     if count:

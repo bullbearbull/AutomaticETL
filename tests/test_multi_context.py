@@ -221,3 +221,49 @@ def test_multi_table_context_error_guards(tmp_path: Path) -> None:
     empty_dir.mkdir()
     with pytest.raises(InputError):
         discover_table_sources(empty_dir)
+
+
+def test_resilient_csv_fallback_and_international_postcode_header(tmp_path: Path) -> None:
+    """비인용 쉼표가 섞인 비표준 CSV 복구와 영문 우편번호 첫 행의 헤더 오인 차단을 검증한다."""
+    # 1. 비인용 쉼표로 DuckDB 기본 dialect 스니퍼가 실패하는 실무 CSV (Northwind 패턴)
+    messy_csv = tmp_path / "customers.csv"
+    messy_csv.write_text(
+        "customerID,companyName,address,city\n"
+        "ALFKI,Alfreds Futterkiste,Obere Str. 57,Berlin\n"
+        "ROMEY,Romero y tomillo,Gran Via, 1,Madrid\n"
+        "ANATR,Ana Trujillo,Avda. 2222,Mexico\n"
+        "BLAUS,Blauer See,Forsterstr. 57,Mannheim\n",
+        encoding="utf-8",
+    )
+
+    # 2. 강형 2개(supplierID=int, postalCode=다수 int) 중 첫 행이 영국 우편번호(EC1 4SD)인 CSV
+    suppliers_csv = tmp_path / "suppliers.csv"
+    suppliers_csv.write_text(
+        "supplierID,companyName,postalCode,country\n"
+        "1,Exotic Liquids,EC1 4SD,UK\n"
+        "2,New Orleans Cajun,70117,USA\n"
+        "3,Grandma Kelly,48104,USA\n"
+        "4,Tokyo Traders,100,Japan\n"
+        "5,Mayumi,545,Japan\n",
+        encoding="utf-8",
+    )
+
+    with MultiTableContext([messy_csv, suppliers_csv]) as mctx:
+        bundles = profile_all_tables(mctx)
+        by_name = {b.source.table_name: b for b in bundles}
+
+        # customers.csv: 완화 파서로 복구 + 경고 기록
+        cust = by_name["customers"]
+        assert cust.source.row_count >= 3
+        assert any("완화 파서" in w for w in mctx.warnings)
+
+        # suppliers.csv: 첫 데이터 행(1, Exotic Liquids, EC1 4SD)을 2번째 헤더로 오인하지 않음
+        sup = by_name["suppliers"]
+        assert sup.ingest.header_row_count == 1
+        assert sup.source.row_count == 5
+        assert [c.name for c in sup.ingest.columns] == [
+            "supplierID",
+            "companyName",
+            "postalCode",
+            "country",
+        ]

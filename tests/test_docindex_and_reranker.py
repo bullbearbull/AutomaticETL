@@ -315,3 +315,63 @@ def test_index_from_parsed_json_bundle_and_binary_logit_reranker(tmp_path: Path)
     )
     scores = reranker.score_pairs("복구 절차", ["일반 안내", "백업 스냅샷 복구"])
     assert scores[1] > 0.95 and scores[0] < 0.05
+
+
+def test_currency_prefixed_table_auto_casts_for_duckdb_sql(tmp_path: Path) -> None:
+    """달러($)·원화(₩) 통화 기호가 붙은 추출 표도 수동 CAST 없이 DuckDB SUM 집계가 동작한다."""
+    doc_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body>"
+        '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>'
+        "<w:r><w:t>Invoice Summary</w:t></w:r></w:p>"
+        "<w:tbl>"
+        "<w:tr>"
+        "<w:tc><w:p><w:r><w:t>Category</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>Total Value</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>KRW Budget</w:t></w:r></w:p></w:tc>"
+        "</w:tr>"
+        "<w:tr>"
+        "<w:tc><w:p><w:r><w:t>Hardware</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>$25,285.00</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>₩1,200,000</w:t></w:r></w:p></w:tc>"
+        "</w:tr>"
+        "<w:tr>"
+        "<w:tc><w:p><w:r><w:t>Hardware</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>$10,000.50</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>₩800,000</w:t></w:r></w:p></w:tc>"
+        "</w:tr>"
+        "<w:tr>"
+        "<w:tc><w:p><w:r><w:t>Software</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>$60,720.00</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>₩500,000</w:t></w:r></w:p></w:tc>"
+        "</w:tr>"
+        "</w:tbl>"
+        "</w:body>"
+        "</w:document>"
+    )
+    styles_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style>'
+        "</w:styles>"
+    )
+    src = tmp_path / "invoice.docx"
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("word/document.xml", doc_xml)
+        zf.writestr("word/styles.xml", styles_xml)
+
+    db_path = tmp_path / "inv.sqlite"
+    build_document_index(src, db_path)
+    with DocumentIndex(db_path) as idx:
+        tbls = idx.list_tables()
+        assert len(tbls) == 1
+        res = idx.query_table(
+            tbls[0].table_uid,
+            'SELECT "Category", ROUND(SUM("Total Value"), 2) AS usd_sum, '
+            'SUM("KRW Budget") AS krw_sum FROM tbl GROUP BY "Category" ORDER BY usd_sum DESC',
+        )
+        assert res.rows == [
+            ["Software", "60720.0", "500000"],
+            ["Hardware", "35285.5", "2000000"],
+        ]

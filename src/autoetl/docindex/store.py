@@ -293,23 +293,38 @@ def _validate_readonly_sql(sql: str) -> str:
     return cleaned
 
 
+def _strip_currency_prefix(raw: str) -> str:
+    s = raw.strip()
+    if s and s[0] in "$₩€£¥":
+        return s[1:].strip()
+    if len(s) >= 2 and s[0] in "+-" and s[1] in "$₩€£¥":
+        return s[0] + s[2:].strip()
+    return s
+
+
 def _infer_duckdb_col_type(values: Sequence[str]) -> tuple[str, list[Any]]:
-    """문자열 표 칼럼이 순수 정수/실수(천단위 쉼표 포함)면 수치형으로 변환해 집계 SQL을 지원한다."""
-    non_empty = [v.strip() for v in values if v.strip() != ""]
+    """정수·실수(천단위 쉼표·통화기호 포함) 표 칼럼을 수치형으로 변환해 집계 SQL을 지원한다."""
+    non_empty = [_strip_currency_prefix(v) for v in values if v.strip() != ""]
     if not non_empty:
         return "VARCHAR", [None if v.strip() == "" else v for v in values]
 
     if all(_INT_RE.fullmatch(v) is not None for v in non_empty):
         return (
             "BIGINT",
-            [None if v.strip() == "" else int(v.strip().replace(",", "")) for v in values],
+            [
+                None if v.strip() == "" else int(_strip_currency_prefix(v).replace(",", ""))
+                for v in values
+            ],
         )
     if all(
         (_INT_RE.fullmatch(v) is not None or _FLOAT_RE.fullmatch(v) is not None) for v in non_empty
     ):
         return (
             "DOUBLE",
-            [None if v.strip() == "" else float(v.strip().replace(",", "")) for v in values],
+            [
+                None if v.strip() == "" else float(_strip_currency_prefix(v).replace(",", ""))
+                for v in values
+            ],
         )
     return "VARCHAR", [None if v.strip() == "" else v.strip() for v in values]
 

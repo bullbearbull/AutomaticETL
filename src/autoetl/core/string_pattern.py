@@ -291,10 +291,31 @@ def _build_decomposition_from_token_rows(
     if slot_count == 0:
         return None
 
-    # 자유 문장 방어: 공백 구분자에 고정어 없이 평균 길이가 길면 제외
+    # 자유 문장·인명 방어: 공백 구분자에 고정어가 전혀 없으면
+    # 숫자/날짜 슬롯이나 저카디널리티 계층 슬롯이 있는 경우에만 규칙 문자열로 인정
     if delimiter_hint == " " and non_delim_literal_count == 0:
         avg_len = sum(len(v) for v in raw_values) / len(raw_values)
         if avg_len > 18 or slot_count >= 4:
+            return None
+        slot_segs = [s for s in segments if s.kind is StringSegmentKind.SLOT]
+        has_structured_slot = any(
+            s.slot_category
+            in {
+                ColumnRoleCategory.TEMPORAL,
+                ColumnRoleCategory.INDEX,
+                ColumnRoleCategory.DISCRETE_NUMERIC,
+            }
+            or (
+                s.slot_category
+                in {
+                    ColumnRoleCategory.CATEGORICAL_NOMINAL,
+                    ColumnRoleCategory.CATEGORICAL_ORDINAL,
+                }
+                and s.unique_count / max(len(aligned), 1) <= 0.35
+            )
+            for s in slot_segs
+        )
+        if not has_structured_slot:
             return None
 
     # 고정부(구분자 또는 리터럴)가 전혀 없고 슬롯이 1개뿐이면 규칙 분해 의미가 없다
@@ -368,6 +389,13 @@ def _try_delimiter_strategy(values: Sequence[str]) -> _CandidateDecomposition | 
 def _try_char_class_strategy(values: Sequence[str]) -> _CandidateDecomposition | None:
     """전략 B: 구분자 없이 영문·숫자·한글 경계로 분해한다(예: `PRJ2026KR001`)."""
     tokenized = [_CHAR_CLASS_RE.findall(v) for v in values]
+    # 일반 영문 대소문자 단어(Title Case: 'January', 'High', 'London') 오탐 차단:
+    # 문자클래스 경계 분해는 반드시 숫자 등 이질적 도메인이 결합된 코드에만 적용한다.
+    has_digit_boundary = sum(any(tok.isdigit() for tok in row) for row in tokenized) / max(
+        len(tokenized), 1
+    )
+    if has_digit_boundary < MIN_COVERAGE:
+        return None
     return _build_decomposition_from_token_rows(
         "char_class", values, tokenized, delimiter_hint=None
     )
