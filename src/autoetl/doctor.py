@@ -118,6 +118,20 @@ def collect_doctor_report() -> DoctorReport:
             ),
             install_hint="" if tesseract_bin else "선택 설치: tesseract-ocr (+ kor/eng 언어팩)",
         ),
+        DoctorCheck(
+            name="원문 문서 인덱스 · 리트리벌 (SQLite FTS5 + DuckDB SQL / 선택 ONNX 리랭커)",
+            category="docindex",
+            available=True,
+            detail=(
+                "0MB SQLite FTS5 + DuckDB 표 SQL + CPU ONNX 리랭커(onnxruntime·tokenizers) 활성"
+                if (has_onnx and _has_module("tokenizers"))
+                else "0MB SQLite FTS5 + DuckDB 표 SQL 활성 "
+                "(선택 CPU ONNX 리랭커는 onnxruntime·numpy·tokenizers 설치 시 활성)"
+            ),
+            install_hint=""
+            if (has_onnx and _has_module("tokenizers"))
+            else "선택 설치: pip install onnxruntime numpy tokenizers",
+        ),
     ]
 
     return DoctorReport(

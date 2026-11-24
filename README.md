@@ -145,7 +145,7 @@ autoetl ui
 ```
 
 별도 프런트엔드 빌드나 외부 서버 없이 `http://127.0.0.1:8765`에 로컬 웹 UI가 뜹니다.  
-**문서 파서** 모드와 **다중 테이블 ETL 분석** 모드를 전환해 파일을 끌어다 놓으면 칼럼 유형·문자열 분해·PK/FK·DDL·ERD·문서 파싱 결과를 탭별로 확인하고 전체 번들을 ZIP으로 받을 수 있습니다. 기본적으로 루프백(`127.0.0.1`)에만 열립니다.
+**문서 파서**, **다중 테이블 ETL 분석**, **원문 문서 인덱스 · 검색(VectorDB 없음)** 3개 모드를 전환해 문서 파싱·PK/FK/DDL/ERD 분석·FTS5/ONNX 원문 검색·목차 뷰어·추출 표 DuckDB SQL까지 브라우저에서 바로 실행하고 ZIP 또는 `.sqlite` 인덱스로 내려받을 수 있습니다. 기본적으로 루프백(`127.0.0.1`)에만 열립니다.
 
 ### 6. VectorDB 없이 원문 문서 색인·검색하기 (0MB 기본 + 선택 CPU ONNX 리랭커)
 
@@ -156,9 +156,9 @@ autoetl ui
 autoetl index ./docs --out ./doc_index.sqlite
 autoetl query ./doc_index.sqlite "개인정보 암호화 보관 기간"
 
-# 선택 초경량 CPU ONNX Cross-Encoder 리랭커(100M~280M INT8, 환각 0%)
+# 선택 초경량 CPU ONNX Cross-Encoder 리랭커(280MB INT8, 환각 0%, HF onnx/ 폴더 자동 인식)
 autoetl query ./doc_index.sqlite "개인정보 암호화 보관 기간" \
-  --reranker onnx --reranker-model ./models/bge-reranker-v2-m3-int8.onnx --format json
+  --reranker onnx --reranker-model ./models/jina_v2_int8/onnx/model_int8.onnx --format json
 ```
 
 ### 7. Python에서 불러 쓰기

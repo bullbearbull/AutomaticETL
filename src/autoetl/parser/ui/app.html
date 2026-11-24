@@ -343,6 +343,60 @@
     border-color: #bfdbfe;
     color: var(--accent);
   }
+  .search-bar-row {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    margin-bottom: 14px;
+  }
+  .outline-split {
+    display: grid;
+    grid-template-columns: 340px 1fr;
+    gap: 16px;
+    align-items: start;
+  }
+  @media (max-width: 900px) { .outline-split { grid-template-columns: 1fr; } }
+  .outline-list {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    max-height: 560px;
+    overflow-y: auto;
+    background: var(--surface-alt);
+    padding: 6px;
+  }
+  .outline-item {
+    width: 100%;
+    text-align: left;
+    border: 1px solid transparent;
+    background: transparent;
+    border-radius: 8px;
+    padding: 7px 10px;
+    font-size: 12.5px;
+    color: var(--text);
+    cursor: pointer;
+    display: block;
+    margin-bottom: 2px;
+  }
+  .outline-item:hover { background: var(--surface); border-color: var(--border); }
+  .outline-item.active {
+    background: var(--accent-soft);
+    border-color: #bfdbfe;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .sql-textarea {
+    width: 100%;
+    min-height: 86px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 13px;
+    background: #0f172a;
+    color: #e2e8f0;
+    resize: vertical;
+  }
 </style>
 </head>
 <body>
@@ -370,6 +424,7 @@
   <div class="mode-bar" id="modeBar">
     <button class="mode-btn active" data-mode="parserModePanel" type="button">문서 파서 (Auto Parser)</button>
     <button class="mode-btn" data-mode="etlModePanel" type="button">다중 테이블 ETL 분석 (CSV · TSV · XLSX)</button>
+    <button class="mode-btn" data-mode="docIndexModePanel" type="button">원문 문서 인덱스 · 검색 (VectorDB 없음)</button>
   </div>
 
   <div id="parserModePanel">
@@ -560,6 +615,101 @@
           <button class="btn btn-sm" id="copyEtlReportBtn" type="button">리포트 복사</button>
         </div>
         <pre class="code-box" id="etlReportPre"></pre>
+      </div>
+    </section>
+  </div>
+
+  <div id="docIndexModePanel" class="hidden">
+    <section class="card">
+      <div class="upload-grid">
+        <div class="dropzone" id="docIdxDropzone" tabindex="0">
+          <strong>인덱싱할 문서 여러 개를 끌어다 놓거나 클릭해 선택하세요</strong>
+          <small>VectorDB · 생성 LLM 없음 (0MB 기본 SQLite FTS5 한글 2-gram + 목차 트리 + DuckDB 표 SQL)</small>
+          <div class="file-chips" id="docIdxSelectedFiles"><span class="selected-file">선택된 문서 없음</span></div>
+          <input type="file" id="docIdxFileInput" class="hidden" multiple accept=".pdf,.pptx,.docx,.hwpx,.xlsx,.hwp,.doc,.ppt">
+        </div>
+        <div class="opts-panel">
+          <div class="opts-grid">
+            <label class="field">
+              리랭커 모드 (선택 AI)
+              <select id="docIdxReranker">
+                <option value="none" selected>사용 안 함 (0MB SQLite FTS5 기본)</option>
+                <option value="onnx">CPU ONNX Cross-Encoder 리랭커</option>
+              </select>
+            </label>
+            <div style="display:flex; align-items:flex-end;">
+              <button class="btn btn-sm" id="docIdxClearBtn" type="button">선택 문서 초기화</button>
+            </div>
+          </div>
+          <label class="field hidden" id="docIdxModelField">
+            로컬 ONNX 리랭커 모델 경로 (.onnx)
+            <input type="text" id="docIdxRerankerModel" placeholder="예: /path/to/jina_v2_int8/onnx/model_int8.onnx">
+          </label>
+          <div style="display:flex; gap:10px;">
+            <button class="btn btn-primary" id="docIdxBuildBtn" type="button" style="flex:1;" disabled>원문 문서 인덱스 구축</button>
+            <a class="btn hidden" id="docIdxDownloadBtn" href="#">SQLite 인덱스 다운로드</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="status-banner" id="docIdxStatusBanner"></div>
+
+    <section class="card hidden" id="docIdxResultSection">
+      <div class="kpi-row" id="docIdxKpiRow"></div>
+
+      <div class="search-bar-row">
+        <label class="field" style="flex:2; min-width:240px;">
+          원문 검색 질의 (한글 2-gram · 영문 키워드 · 자연어 문장)
+          <input type="text" id="docIdxQueryInput" placeholder="예: 12월 기상전망 기온 강수량 또는 대설 행동요령">
+        </label>
+        <label class="field" style="min-width:170px;">
+          문서 범위 필터
+          <select id="docIdxDocFilter">
+            <option value="">전체 문서</option>
+          </select>
+        </label>
+        <label class="field" style="width:90px;">
+          Top-K
+          <input type="number" id="docIdxTopK" value="5" min="1" max="20">
+        </label>
+        <button class="btn btn-primary" id="docIdxSearchBtn" type="button">원문 검색</button>
+      </div>
+
+      <div class="tabs" id="docIdxTabsBar">
+        <button class="tab-btn active" data-docidx-tab="docIdxTabSearch" type="button">검색 결과 · 원문 EvidencePack (<span id="docIdxHitCnt">0</span>)</button>
+        <button class="tab-btn" data-docidx-tab="docIdxTabOutline" type="button">문서 목차 · 원문 읽기 (<span id="docIdxSecCnt">0</span>)</button>
+        <button class="tab-btn" data-docidx-tab="docIdxTabSql" type="button">추출 표 DuckDB SQL (<span id="docIdxTblCnt">0</span>)</button>
+      </div>
+
+      <div class="tab-panel active" id="docIdxTabSearch">
+        <div id="docIdxSearchMeta" style="font-size:12.5px; color:var(--muted); margin-bottom:10px;"></div>
+        <div id="docIdxHitsList"><p style="color:var(--muted);">위 검색창에 질문이나 키워드를 입력하면 청크 절단 없는 원문 섹션 전체가 표시됩니다.</p></div>
+      </div>
+
+      <div class="tab-panel" id="docIdxTabOutline">
+        <div class="outline-split">
+          <div class="outline-list" id="docIdxOutlineList"></div>
+          <div>
+            <div class="toolbar">
+              <strong id="docIdxSectionTitle">목차에서 섹션을 선택하세요</strong>
+              <button class="btn btn-sm" id="copyDocIdxSecBtn" type="button">원문 복사</button>
+            </div>
+            <div id="docIdxSectionMeta" style="font-size:12px; color:var(--muted); margin-bottom:8px;"></div>
+            <pre class="code-box" id="docIdxSectionBody">목차 노드를 클릭하면 청크 절단 없는 원문 섹션 전체가 표시됩니다.</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="tab-panel" id="docIdxTabSql">
+        <div class="toolbar">
+          <select id="docIdxTableSelect" class="search-input" style="min-width:300px;"></select>
+          <button class="btn btn-sm btn-primary" id="docIdxRunSqlBtn" type="button">읽기 전용 SQL 실행</button>
+        </div>
+        <div id="docIdxTableCols" style="margin-bottom:8px;"></div>
+        <textarea id="docIdxSqlInput" class="sql-textarea">SELECT * FROM tbl LIMIT 50</textarea>
+        <div id="docIdxSqlMeta" style="font-size:12.5px; color:var(--muted); margin:8px 0;"></div>
+        <div class="table-wrap"><table class="data-table" id="docIdxSqlResultTable"></table></div>
       </div>
     </section>
   </div>
@@ -934,6 +1084,7 @@ document.getElementById("modeBar").addEventListener("click", e => {
   const target = btn.getAttribute("data-mode");
   document.getElementById("parserModePanel").classList.toggle("hidden", target !== "parserModePanel");
   document.getElementById("etlModePanel").classList.toggle("hidden", target !== "etlModePanel");
+  document.getElementById("docIndexModePanel").classList.toggle("hidden", target !== "docIndexModePanel");
 });
 
 function showEtlStatus(msg, kind) {
@@ -1256,6 +1407,368 @@ document.getElementById("etlRunBtn").addEventListener("click", async () => {
     }
   } catch (err) {
     showEtlStatus("로컬 서버 통신 오류가 발생했습니다.", "error");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// VectorDB-free Original-Text Document Index & Retrieval controller (XSS-safe DOM builders only)
+let docIdxSelectedFiles = [];
+let docIdxState = null;
+
+function showDocIdxStatus(msg, kind) {
+  const b = document.getElementById("docIdxStatusBanner");
+  b.className = "status-banner " + kind;
+  b.textContent = msg;
+}
+function hideDocIdxStatus() {
+  const b = document.getElementById("docIdxStatusBanner");
+  b.className = "status-banner";
+  b.textContent = "";
+}
+
+function renderDocIdxFileChips() {
+  const box = document.getElementById("docIdxSelectedFiles");
+  box.textContent = "";
+  if (docIdxSelectedFiles.length === 0) {
+    box.appendChild(el("span", {class: "selected-file"}, "선택된 문서 없음"));
+    document.getElementById("docIdxBuildBtn").disabled = true;
+    return;
+  }
+  docIdxSelectedFiles.forEach(f => {
+    box.appendChild(el("span", {class: "file-chip"}, `${f.name} (${(f.size / 1024).toFixed(1)} KB)`));
+  });
+  document.getElementById("docIdxBuildBtn").disabled = false;
+}
+
+function addDocIdxFiles(fileList) {
+  const seen = new Set(docIdxSelectedFiles.map(f => `${f.name}:${f.size}`));
+  for (const f of Array.from(fileList || [])) {
+    const key = `${f.name}:${f.size}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      docIdxSelectedFiles.push(f);
+    }
+  }
+  renderDocIdxFileChips();
+}
+
+const docIdxDz = document.getElementById("docIdxDropzone");
+const docIdxFi = document.getElementById("docIdxFileInput");
+docIdxDz.addEventListener("click", () => docIdxFi.click());
+docIdxDz.addEventListener("dragover", e => { e.preventDefault(); docIdxDz.classList.add("dragover"); });
+docIdxDz.addEventListener("dragleave", () => docIdxDz.classList.remove("dragover"));
+docIdxDz.addEventListener("drop", e => {
+  e.preventDefault();
+  docIdxDz.classList.remove("dragover");
+  if (e.dataTransfer && e.dataTransfer.files) addDocIdxFiles(e.dataTransfer.files);
+});
+docIdxFi.addEventListener("change", () => {
+  if (docIdxFi.files) addDocIdxFiles(docIdxFi.files);
+  docIdxFi.value = "";
+});
+document.getElementById("docIdxClearBtn").addEventListener("click", () => {
+  docIdxSelectedFiles = [];
+  renderDocIdxFileChips();
+});
+document.getElementById("docIdxReranker").addEventListener("change", e => {
+  document.getElementById("docIdxModelField").classList.toggle("hidden", e.target.value !== "onnx");
+});
+
+function activateDocIdxSubTab(tabId) {
+  const bar = document.getElementById("docIdxTabsBar");
+  bar.querySelectorAll(".tab-btn").forEach(b => {
+    b.classList.toggle("active", b.getAttribute("data-docidx-tab") === tabId);
+  });
+  document.querySelectorAll("#docIdxResultSection .tab-panel").forEach(p => {
+    p.classList.toggle("active", p.id === tabId);
+  });
+}
+
+document.getElementById("docIdxTabsBar").addEventListener("click", e => {
+  const btn = e.target.closest(".tab-btn");
+  if (!btn) return;
+  activateDocIdxSubTab(btn.getAttribute("data-docidx-tab"));
+});
+
+async function loadDocIdxSection(sectionId, activeBtn) {
+  if (!docIdxState || !docIdxState.index_id) return;
+  document.querySelectorAll("#docIdxOutlineList .outline-item").forEach(b => b.classList.remove("active"));
+  if (activeBtn) activeBtn.classList.add("active");
+  document.getElementById("docIdxSectionTitle").textContent = "원문 섹션 불러오는 중...";
+  document.getElementById("docIdxSectionBody").textContent = "";
+  try {
+    const res = await fetch("/api/docindex/section", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({index_id: docIdxState.index_id, section_id: sectionId}),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      document.getElementById("docIdxSectionTitle").textContent = body.error || "섹션 조회 실패";
+      return;
+    }
+    const sec = body.section || {};
+    const pathStr = (sec.section_path || []).join(" > ") || sec.title || sectionId;
+    document.getElementById("docIdxSectionTitle").textContent = pathStr;
+    document.getElementById("docIdxSectionMeta").textContent =
+      `${sec.section_id || sectionId} · p.${sec.page_start || 1}` +
+      (sec.page_end && sec.page_end !== sec.page_start ? `-${sec.page_end}` : "") +
+      ` · ${sec.char_count || 0}자 · 포함 표 ${(body.tables || []).length}개`;
+    document.getElementById("docIdxSectionBody").textContent = body.full_text || "";
+  } catch (_) {
+    document.getElementById("docIdxSectionTitle").textContent = "로컬 서버 통신 오류";
+  }
+}
+
+function renderDocIdxTableMeta(idx) {
+  const tables = (docIdxState && docIdxState.tables) || [];
+  const t = tables[idx];
+  const colsBox = document.getElementById("docIdxTableCols");
+  colsBox.textContent = "";
+  if (!t) {
+    document.getElementById("docIdxSqlMeta").textContent = "추출된 표가 없습니다.";
+    document.getElementById("docIdxRunSqlBtn").disabled = true;
+    return;
+  }
+  document.getElementById("docIdxRunSqlBtn").disabled = false;
+  colsBox.appendChild(el("span", {class: "slot-badge"}, `table_uid: ${t.table_uid}`));
+  colsBox.appendChild(el("span", {class: "slot-badge"}, `${t.row_count}행 × ${t.col_count}열 (p.${t.page})`));
+  (t.headers || []).forEach(h => {
+    colsBox.appendChild(el("span", {class: "slot-badge slot-var"}, `"${h}"`));
+  });
+}
+
+function renderDocIdxBuilt(data) {
+  docIdxState = data;
+  document.getElementById("docIdxResultSection").classList.remove("hidden");
+  const dl = document.getElementById("docIdxDownloadBtn");
+  if (data.download_token) {
+    dl.href = "/api/download/" + encodeURIComponent(data.download_token);
+    dl.classList.remove("hidden");
+  }
+  const sum = data.summary || {};
+  const docs = data.documents || [];
+  const secs = data.sections || [];
+  const tbls = data.tables || [];
+
+  const kpiRow = document.getElementById("docIdxKpiRow");
+  kpiRow.textContent = "";
+  [
+    ["인덱싱 문서", `${sum.documents_indexed || docs.length}건`],
+    ["원문 섹션", `${sum.sections_indexed || secs.length}개`],
+    ["추출 표 (SQL 가능)", `${sum.tables_indexed || tbls.length}개`],
+    ["인덱스 구축 시간", `${(data.elapsed_seconds || 0).toFixed(2)}s`],
+    ["기본 검색 엔진", "0MB SQLite FTS5"],
+  ].forEach(([lbl, val]) => {
+    const k = el("div", {class: "kpi"});
+    k.appendChild(el("div", {class: "lbl"}, lbl));
+    k.appendChild(el("div", {class: "val"}, val));
+    kpiRow.appendChild(k);
+  });
+
+  document.getElementById("docIdxSecCnt").textContent = String(secs.length);
+  document.getElementById("docIdxTblCnt").textContent = String(tbls.length);
+  document.getElementById("docIdxHitCnt").textContent = "0";
+
+  // Document filter dropdown
+  const dSel = document.getElementById("docIdxDocFilter");
+  dSel.textContent = "";
+  dSel.appendChild(el("option", {value: ""}, `전체 문서 (${docs.length}건)`));
+  docs.forEach(d => {
+    const fname = String(d.source_path || "").split(/[\\/]/).pop() || d.doc_id;
+    dSel.appendChild(el("option", {value: d.doc_id}, `[${String(d.format || "").toUpperCase()}] ${fname} — ${d.title || ""}`));
+  });
+
+  // Outline Tree
+  const docNameById = {};
+  docs.forEach(d => {
+    docNameById[d.doc_id] = String(d.source_path || "").split(/[\\/]/).pop() || d.doc_id;
+  });
+  const oList = document.getElementById("docIdxOutlineList");
+  oList.textContent = "";
+  secs.forEach(s => {
+    const indent = Math.min(4, Number(s.heading_level || 0)) * 12;
+    const item = el("button", {
+      class: "outline-item",
+      type: "button",
+      style: `padding-left:${10 + indent}px;`,
+    }, `[${docNameById[s.doc_id] || s.doc_id}] ${s.title || s.section_id} (${s.char_count}자)`);
+    item.addEventListener("click", () => loadDocIdxSection(s.section_id, item));
+    oList.appendChild(item);
+  });
+  if (secs.length > 0 && oList.firstChild) {
+    loadDocIdxSection(secs[0].section_id, oList.firstChild);
+  }
+
+  // Tables dropdown for DuckDB SQL
+  const tSel = document.getElementById("docIdxTableSelect");
+  tSel.textContent = "";
+  if (tbls.length === 0) {
+    tSel.appendChild(el("option", {value: "-1"}, "추출된 표가 없습니다"));
+    renderDocIdxTableMeta(-1);
+  } else {
+    tbls.forEach((t, idx) => {
+      const fname = String(t.source_path || "").split(/[\\/]/).pop() || t.doc_id;
+      tSel.appendChild(el("option", {value: String(idx)}, `[${fname}] ${t.table_id} (p.${t.page}, ${t.row_count}×${t.col_count})`));
+    });
+    renderDocIdxTableMeta(0);
+  }
+}
+
+function renderDocIdxHits(pack) {
+  const hits = pack.hits || [];
+  document.getElementById("docIdxHitCnt").textContent = String(hits.length);
+  const modeLabel = pack.mode === "fts5+onnx_rerank"
+    ? `FTS5 + CPU ONNX 리랭커 (${pack.reranker_model || "onnx"})`
+    : "0MB SQLite FTS5 BM25 + 목차 가중";
+  document.getElementById("docIdxSearchMeta").textContent =
+    `검색 모드: ${modeLabel} · 후보 ${pack.total_candidates || 0}개 중 상위 ${hits.length}건 · 응답 ${Number(pack.elapsed_ms || 0).toFixed(2)}ms`;
+
+  const list = document.getElementById("docIdxHitsList");
+  list.textContent = "";
+  if (hits.length === 0) {
+    list.appendChild(el("p", {style: "color:var(--muted);"}, "일치하는 원문 섹션이 없습니다. 다른 키워드나 목차 탭을 사용해 보세요."));
+    return;
+  }
+  hits.forEach((h, idx) => {
+    const card = el("div", {class: "chunk-card"});
+    const meta = el("div", {class: "chunk-meta"});
+    const fname = String(h.source_path || "").split(/[\\/]/).pop() || h.doc_id;
+    meta.appendChild(el("strong", null, `#${idx + 1} [${fname}]`));
+    meta.appendChild(el("span", {class: "badge"}, `최종 ${Number(h.final_score || 0).toFixed(3)}`));
+    meta.appendChild(el("span", null, `BM25 ${Number(h.bm25_score || 0).toFixed(3)}`));
+    if (h.rerank_score !== null && h.rerank_score !== undefined) {
+      meta.appendChild(el("span", {class: "badge badge-ok"}, `ONNX ${Number(h.rerank_score).toFixed(3)}`));
+    }
+    meta.appendChild(el("span", null, `p.${h.page_start}` + (h.page_end !== h.page_start ? `-${h.page_end}` : "")));
+    meta.appendChild(el("span", null, `§ ${(h.section_path || []).join(" > ") || h.title}`));
+    if (h.matched_terms && h.matched_terms.length) {
+      meta.appendChild(el("span", null, `매칭: ${h.matched_terms.slice(0, 6).join(", ")}`));
+    }
+    const openBtn = el("button", {class: "btn btn-sm", type: "button"}, "목차 뷰어로 원문 열기");
+    openBtn.addEventListener("click", () => {
+      activateDocIdxSubTab("docIdxTabOutline");
+      loadDocIdxSection(h.section_id, null);
+    });
+    meta.appendChild(openBtn);
+    card.appendChild(meta);
+    const preview = String(h.full_text || "");
+    card.appendChild(el("pre", {class: "chunk-body"}, preview.length > 2400 ? preview.slice(0, 2400) + "\n… (목차 뷰어에서 전체 원문 확인)" : preview));
+    list.appendChild(card);
+  });
+}
+
+async function runDocIdxSearch() {
+  if (!docIdxState || !docIdxState.index_id) return;
+  const query = document.getElementById("docIdxQueryInput").value.trim();
+  if (!query) {
+    showDocIdxStatus("검색할 질의나 키워드를 입력해 주세요.", "error");
+    return;
+  }
+  const btn = document.getElementById("docIdxSearchBtn");
+  btn.disabled = true;
+  const rerankerKind = document.getElementById("docIdxReranker").value;
+  showDocIdxStatus(
+    rerankerKind === "onnx" ? `"${query}" 원문 검색 + CPU ONNX 리랭킹 실행 중...` : `"${query}" 0MB FTS5 원문 검색 중...`,
+    "info"
+  );
+  try {
+    const res = await fetch("/api/docindex/query", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        index_id: docIdxState.index_id,
+        query,
+        top_k: Number(document.getElementById("docIdxTopK").value) || 5,
+        doc_id: document.getElementById("docIdxDocFilter").value || null,
+        reranker: rerankerKind,
+        reranker_model: document.getElementById("docIdxRerankerModel").value.trim() || null,
+      }),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      showDocIdxStatus(body.error || "문서 검색에 실패했습니다.", "error");
+    } else {
+      hideDocIdxStatus();
+      activateDocIdxSubTab("docIdxTabSearch");
+      renderDocIdxHits(body);
+    }
+  } catch (_) {
+    showDocIdxStatus("로컬 서버 통신 오류가 발생했습니다.", "error");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById("docIdxBuildBtn").addEventListener("click", async () => {
+  if (docIdxSelectedFiles.length === 0) return;
+  const btn = document.getElementById("docIdxBuildBtn");
+  btn.disabled = true;
+  showDocIdxStatus(`${docIdxSelectedFiles.length}개 문서 파싱 및 SQLite FTS5 원문 인덱스 구축 중...`, "info");
+  try {
+    const filesPayload = [];
+    for (const f of docIdxSelectedFiles) {
+      filesPayload.push({filename: f.name, content_base64: await fileToBase64(f)});
+    }
+    const res = await fetch("/api/docindex/build", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({files: filesPayload}),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      showDocIdxStatus(body.error || "문서 인덱스 구축에 실패했습니다.", "error");
+    } else {
+      hideDocIdxStatus();
+      renderDocIdxBuilt(body);
+    }
+  } catch (_) {
+    showDocIdxStatus("로컬 서버 통신 오류가 발생했습니다.", "error");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById("docIdxSearchBtn").addEventListener("click", runDocIdxSearch);
+document.getElementById("docIdxQueryInput").addEventListener("keydown", e => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    runDocIdxSearch();
+  }
+});
+document.getElementById("copyDocIdxSecBtn").addEventListener("click", e => {
+  copyText(document.getElementById("docIdxSectionBody").textContent || "", e.target);
+});
+document.getElementById("docIdxTableSelect").addEventListener("change", e => {
+  renderDocIdxTableMeta(Number(e.target.value));
+});
+document.getElementById("docIdxRunSqlBtn").addEventListener("click", async () => {
+  if (!docIdxState || !docIdxState.index_id) return;
+  const idx = Number(document.getElementById("docIdxTableSelect").value);
+  const t = (docIdxState.tables || [])[idx];
+  if (!t) return;
+  const sql = document.getElementById("docIdxSqlInput").value.trim() || "SELECT * FROM tbl LIMIT 50";
+  const btn = document.getElementById("docIdxRunSqlBtn");
+  btn.disabled = true;
+  document.getElementById("docIdxSqlMeta").textContent = "격리 DuckDB에서 읽기 전용 SQL 실행 중...";
+  try {
+    const res = await fetch("/api/docindex/table-sql", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({index_id: docIdxState.index_id, table_uid: t.table_uid, sql}),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      document.getElementById("docIdxSqlMeta").textContent = "오류: " + (body.error || "SQL 실행 실패");
+      buildSimpleTable(document.getElementById("docIdxSqlResultTable"), ["오류"], [[body.error || "SQL 실행 실패"]]);
+    } else {
+      document.getElementById("docIdxSqlMeta").textContent =
+        `조회 결과: ${body.total_matched || 0}행` + (body.truncated ? " (상위 일부만 표시)" : "") + ` · SQL: ${body.sql_executed}`;
+      buildSimpleTable(document.getElementById("docIdxSqlResultTable"), body.columns || [], body.rows || []);
+    }
+  } catch (_) {
+    document.getElementById("docIdxSqlMeta").textContent = "로컬 서버 통신 오류가 발생했습니다.";
   } finally {
     btn.disabled = false;
   }

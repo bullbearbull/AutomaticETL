@@ -4,6 +4,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- **로컬 웹 UI 3번째 모드 — 원문 문서 인덱스 · 검색 (`autoetl ui`)**:
+  - 다중 문서(PDF·DOCX·PPTX·XLSX·HWPX·HWP·DOC·PPT) 업로드 및 SQLite FTS5 인덱스 구축(`POST /api/docindex/build`) + `.sqlite` 인덱스 다운로드(`/api/download/<token>`)
+  - 0MB FTS5 및 선택 로컬 CPU ONNX 리랭커 전환 원문 검색(`POST /api/docindex/query`), 클릭형 목차 트리·원문 전체 뷰어(`POST /api/docindex/section`), 추출 표 격리 DuckDB 읽기 전용 SQL 플레이그라운드(`POST /api/docindex/table-sql`)
+- **`autoetl doctor` 원문 문서 인덱스 및 선택 CPU ONNX 리랭커(`onnxruntime`·`tokenizers`) 준비 상태 점검 항목 추가**
+
+### Changed
+
+- **CPU ONNX Cross-Encoder 리랭커 실전 최적화 (`src/autoetl/docindex/reranker.py`)**:
+  - HuggingFace 표준 `onnx/model_int8.onnx` 상위 폴더 `tokenizer.json` 자동 탐색 및 아키텍처별 패딩 토큰 ID(`XLM-RoBERTa <pad>=1`, `BERT [PAD]=0`) 동적 판별
+  - 30KB 이상 장문 섹션 전체에서 질의 어휘 밀집 창을 우선 선별하는 질의 기반 슬라이딩 창(`max_windows=3`)과 길이 버킷 정렬 배치 + `ORT_ENABLE_ALL` 적용으로 2-코어 CPU 추론 속도 26~35% 단축 및 장문 후반부 재현율 개선
+  - `jinaai/jina-reranker-v2-base-multilingual` (INT8 ~280MB, 한국어·다국어) 권장 모델 목록 추가
+
 ## [0.2.0-beta.1] — 2026-11-24 (`0.2.0b1`)
 
 0MB 결정론 다중 테이블 ETL 엔진과 VectorDB 없는 원문 문서 인덱스·리트리벌 엔진을 추가한 두 번째 베타 릴리스.

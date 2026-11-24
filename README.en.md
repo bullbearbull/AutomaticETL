@@ -144,7 +144,7 @@ autoetl parse ./docs --out ./batch_out --workers 4 --resume
 autoetl ui
 ```
 
-Starts a stdlib-only web UI on `http://127.0.0.1:8765` (loopback only by default). Switch between **Document Parser** and **Multi-Table ETL Analysis** to inspect column roles, decomposed string patterns, PK/FK graphs, verified DDL, Mermaid ERD, or parsed document outputs, and download the full bundle as a ZIP.
+Starts a stdlib-only web UI on `http://127.0.0.1:8765` (loopback only by default). Switch between **Document Parser**, **Multi-Table ETL Analysis**, and **Original-Text Document Index & Retrieval (VectorDB-free)** to inspect parsed documents, column roles, PK/FK graphs, verified DDL/ERD, full-section FTS5/ONNX search, heading outlines, and sandboxed DuckDB table SQL, and download ZIP bundles or `.sqlite` indexes.
 
 ### 6. VectorDB-free original-text document index & retrieval (0MB default + optional CPU ONNX reranker)
 
@@ -155,9 +155,9 @@ Index parsed bundles (`parsed.json`) or raw documents into a single SQLite file 
 autoetl index ./docs --out ./doc_index.sqlite
 autoetl query ./doc_index.sqlite "encryption retention policy"
 
-# Optional ultra-lightweight CPU ONNX Cross-Encoder reranker (100M–280M INT8, 0% hallucination)
+# Optional ultra-lightweight CPU ONNX Cross-Encoder reranker (~280MB INT8, 0% hallucination)
 autoetl query ./doc_index.sqlite "encryption retention policy" \
-  --reranker onnx --reranker-model ./models/bge-reranker-v2-m3-int8.onnx --format json
+  --reranker onnx --reranker-model ./models/jina_v2_int8/onnx/model_int8.onnx --format json
 ```
 
 ### 7. Python API

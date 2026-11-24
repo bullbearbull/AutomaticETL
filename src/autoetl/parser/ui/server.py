@@ -77,52 +77,142 @@ def _zip_directory(src_dir: Path, dst_zip: Path) -> None:
                 zf.write(p, p.relative_to(src_dir).as_posix())
 
 
+_MAX_CACHED_DOC_INDEXES = 6
+_MAX_CACHED_RERANKERS = 2
+
+
 class _BundleStore:
-    """다운로드용 번들 ZIP을 임시 디렉터리에 LRU 캐싱한다."""
+    """다운로드용 번들 ZIP 및 SQLite 인덱스 파일을 임시 디렉터리에 LRU 캐싱한다."""
 
     def __init__(self, max_items: int = _MAX_CACHED_BUNDLES) -> None:
         self._dir = Path(tempfile.mkdtemp(prefix="autoetl_ui_bundles_"))
         self._max_items = max_items
         self._lock = threading.Lock()
-        self._items: OrderedDict[str, tuple[Path, str]] = OrderedDict()
+        self._items: OrderedDict[str, tuple[Path, str, str]] = OrderedDict()
+
+    def _evict_locked(self) -> None:
+        while len(self._items) > self._max_items:
+            _old_tok, (old_path, _old_name, _old_ct) = self._items.popitem(last=False)
+            old_path.unlink(missing_ok=True)
 
     def put_zip(self, bundle_dir: Path, download_name: str) -> str:
         token = secrets.token_hex(12)
         zip_path = self._dir / f"{token}.zip"
         _zip_directory(bundle_dir, zip_path)
         with self._lock:
-            self._items[token] = (zip_path, download_name)
-            while len(self._items) > self._max_items:
-                _old_tok, (old_path, _old_name) = self._items.popitem(last=False)
-                old_path.unlink(missing_ok=True)
+            self._items[token] = (zip_path, download_name, "application/zip")
+            self._evict_locked()
         return token
 
-    def get_zip(self, token: str) -> tuple[Path, str] | None:
+    def put_file(
+        self,
+        src_path: Path,
+        download_name: str,
+        *,
+        content_type: str = "application/octet-stream",
+    ) -> str:
+        token = secrets.token_hex(12)
+        ext = src_path.suffix.lower() if src_path.suffix else ".bin"
+        dst_path = self._dir / f"{token}{ext}"
+        shutil.copy2(src_path, dst_path)
+        with self._lock:
+            self._items[token] = (dst_path, download_name, content_type)
+            self._evict_locked()
+        return token
+
+    def get(self, token: str) -> tuple[Path, str, str] | None:
         if not token or not all(ch in "0123456789abcdef" for ch in token):
             return None
         with self._lock:
             entry = self._items.get(token)
             if entry is None:
                 return None
-            zip_path, dl_name = entry
-            if not zip_path.is_file():
+            file_path, dl_name, content_type = entry
+            if not file_path.is_file():
                 self._items.pop(token, None)
                 return None
             self._items.move_to_end(token)
-            return zip_path, dl_name
+            return file_path, dl_name, content_type
 
     def close(self) -> None:
         shutil.rmtree(self._dir, ignore_errors=True)
 
 
+class _DocIndexStore:
+    """로컬 웹 UI의 원문 문서 인덱스(`.sqlite`)와 선택 ONNX 리랭커 인스턴스를 LRU 관리한다."""
+
+    def __init__(self, max_items: int = _MAX_CACHED_DOC_INDEXES) -> None:
+        self._dir = Path(tempfile.mkdtemp(prefix="autoetl_ui_docindex_"))
+        self._max_items = max_items
+        self._lock = threading.Lock()
+        self._items: OrderedDict[str, Path] = OrderedDict()
+        self._rerankers: OrderedDict[str, Any] = OrderedDict()
+
+    def allocate(self) -> tuple[str, Path]:
+        token = secrets.token_hex(12)
+        return token, self._dir / f"{token}.sqlite"
+
+    def register(self, token: str, db_path: Path) -> None:
+        with self._lock:
+            self._items[token] = db_path
+            while len(self._items) > self._max_items:
+                _old_tok, old_path = self._items.popitem(last=False)
+                old_path.unlink(missing_ok=True)
+
+    def get(self, token: str) -> Path | None:
+        if not token or not all(ch in "0123456789abcdef" for ch in token):
+            return None
+        with self._lock:
+            db_path = self._items.get(token)
+            if db_path is None:
+                return None
+            if not db_path.is_file():
+                self._items.pop(token, None)
+                return None
+            self._items.move_to_end(token)
+            return db_path
+
+    def get_onnx_reranker(self, model_path_raw: str) -> Any:
+        from autoetl.docindex.reranker import OnnxCrossEncoderReranker
+
+        cleaned = model_path_raw.strip()
+        if not cleaned:
+            raise ParserInputError("ONNX 리랭커 모델 파일 경로(`reranker_model`)가 필요하다.")
+        resolved = Path(cleaned).expanduser().resolve()
+        if resolved.suffix.lower() != ".onnx":
+            raise ParserInputError("리랭커 모델 파일은 `.onnx` 확장자여야 한다.")
+        if not resolved.is_file():
+            raise ParserInputError(f"ONNX 리랭커 모델 파일을 찾을 수 없다: {resolved.name}")
+        key = str(resolved)
+        with self._lock:
+            cached = self._rerankers.get(key)
+            if cached is not None:
+                self._rerankers.move_to_end(key)
+                return cached
+        reranker = OnnxCrossEncoderReranker(resolved)
+        reranker._ensure_ready()
+        with self._lock:
+            self._rerankers[key] = reranker
+            while len(self._rerankers) > _MAX_CACHED_RERANKERS:
+                self._rerankers.popitem(last=False)
+        return reranker
+
+    def close(self) -> None:
+        with self._lock:
+            self._rerankers.clear()
+            self._items.clear()
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+
 class _ParserUiHttpServer(ThreadingHTTPServer):
-    """번들 스토어와 HTML 캐시를 보유하는 `ThreadingHTTPServer` 확장."""
+    """번들 스토어·문서 인덱스 스토어·HTML 캐시를 보유하는 `ThreadingHTTPServer` 확장."""
 
     allow_reuse_address = True
 
     def __init__(self, server_address: tuple[str, int], handler_cls: type[BaseHTTPRequestHandler]):
         self.ui_html_bytes = _load_ui_html()
         self.bundle_store = _BundleStore()
+        self.docindex_store = _DocIndexStore()
         super().__init__(server_address, handler_cls)
 
     def server_close(self) -> None:
@@ -130,6 +220,7 @@ class _ParserUiHttpServer(ThreadingHTTPServer):
             super().server_close()
         finally:
             self.bundle_store.close()
+            self.docindex_store.close()
 
 
 class _ParserUiRequestHandler(BaseHTTPRequestHandler):
@@ -181,20 +272,22 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
 
         if path_only.startswith("/api/download/"):
             token = path_only[len("/api/download/") :].strip("/")
-            found = self.server.bundle_store.get_zip(token)
+            found = self.server.bundle_store.get(token)
             if found is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "요청한 번들을 찾을 수 없다."})
                 return
-            zip_path, dl_name = found
+            file_path, dl_name, content_type = found
             safe_ascii = "".join(
                 ch if (ch.isascii() and (ch.isalnum() or ch in "._-")) else "_" for ch in dl_name
             )
-            if not safe_ascii.endswith(".zip"):
+            if content_type == "application/zip" and not safe_ascii.endswith(".zip"):
                 safe_ascii += ".zip"
+            elif not Path(safe_ascii).suffix:
+                safe_ascii += file_path.suffix or ".bin"
             self._send_bytes(
                 HTTPStatus.OK,
-                zip_path.read_bytes(),
-                content_type="application/zip",
+                file_path.read_bytes(),
+                content_type=content_type,
                 extra_headers={"Content-Disposition": f'attachment; filename="{safe_ascii}"'},
             )
             return
@@ -237,7 +330,235 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
             if req is not None:
                 self._handle_analyze_tables(req)
             return
+        if path_only == "/api/docindex/build":
+            req = self._read_json_body()
+            if req is not None:
+                self._handle_docindex_build(req)
+            return
+        if path_only == "/api/docindex/query":
+            req = self._read_json_body()
+            if req is not None:
+                self._handle_docindex_query(req)
+            return
+        if path_only == "/api/docindex/section":
+            req = self._read_json_body()
+            if req is not None:
+                self._handle_docindex_section(req)
+            return
+        if path_only == "/api/docindex/table-sql":
+            req = self._read_json_body()
+            if req is not None:
+                self._handle_docindex_table_sql(req)
+            return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "알 수 없는 API 경로다."})
+
+    def _resolve_docindex_db(self, req: dict[str, Any]) -> Path | None:
+        index_id = str(req.get("index_id", "")).strip()
+        db_path = self.server.docindex_store.get(index_id)
+        if db_path is None:
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": "문서 인덱스를 찾을 수 없다(만료되었거나 잘못된 index_id)."},
+            )
+            return None
+        return db_path
+
+    def _handle_docindex_build(self, req: dict[str, Any]) -> None:
+        from autoetl.docindex import DocumentToolkit, build_document_index
+
+        raw_files = req.get("files")
+        if not isinstance(raw_files, list) or not raw_files:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "인덱싱할 문서 파일 목록(`files`)이 1개 이상 필요하다."},
+            )
+            return
+
+        allowed = supported_extensions()
+        decoded_files: list[tuple[str, bytes]] = []
+        total_bytes = 0
+        seen_names: set[str] = set()
+
+        for idx, item in enumerate(raw_files):
+            if not isinstance(item, dict):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "각 파일 항목은 `filename`과 `content_base64` 객체여야 한다."},
+                )
+                return
+            filename = Path(str(item.get("filename", "")).strip()).name
+            b64_data = item.get("content_base64")
+            if not filename or not isinstance(b64_data, str) or not b64_data:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "각 항목에 파일명(`filename`)과 내용(`content_base64`)이 필요하다."},
+                )
+                return
+            ext = Path(filename).suffix.lower()
+            if ext not in allowed:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": f"지원하지 않는 문서 파일 형식이다: '{ext or '(없음)'}' "
+                        f"(지원: {', '.join(allowed)})"
+                    },
+                )
+                return
+            try:
+                fbytes = base64.b64decode(b64_data, validate=True)
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "파일 Base64 디코딩에 실패했다."})
+                return
+            total_bytes += len(fbytes)
+            if total_bytes > _MAX_UPLOAD_BYTES:
+                self._send_json(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    {"error": "업로드 파일 합계 크기가 50MB 상한을 초과했다."},
+                )
+                return
+            safe_name = filename
+            if safe_name in seen_names:
+                safe_name = f"{idx + 1}_{filename}"
+            seen_names.add(safe_name)
+            decoded_files.append((safe_name, fbytes))
+
+        t0 = time.perf_counter()
+        index_id, db_path = self.server.docindex_store.allocate()
+        try:
+            with tempfile.TemporaryDirectory(prefix="autoetl_ui_docbuild_") as td:
+                in_dir = Path(td) / "docs"
+                in_dir.mkdir()
+                for fname, fbytes in decoded_files:
+                    (in_dir / fname).write_bytes(fbytes)
+
+                summary = build_document_index(in_dir, db_path)
+                self.server.docindex_store.register(index_id, db_path)
+                download_token = self.server.bundle_store.put_file(
+                    db_path,
+                    "autoetl_docindex.sqlite",
+                    content_type="application/vnd.sqlite3",
+                )
+                with DocumentToolkit(db_path) as kit:
+                    outline_res = kit.get_outline()
+                    tables_res = kit.list_tables()
+
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "index_id": index_id,
+                    "download_token": download_token,
+                    "elapsed_seconds": round(time.perf_counter() - t0, 3),
+                    "summary": summary.model_dump(mode="json"),
+                    "documents": outline_res["documents"],
+                    "sections": outline_res["sections"],
+                    "tables": tables_res["tables"],
+                },
+            )
+        except ParserInputError as exc:
+            db_path.unlink(missing_ok=True)
+            self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
+        except Exception:
+            db_path.unlink(missing_ok=True)
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {
+                    "error": (
+                        "문서 인덱스 구축 중 내부 오류가 발생했다"
+                        "(문서 본문 보호를 위해 상세 원문 생략)."
+                    )
+                },
+            )
+
+    def _handle_docindex_query(self, req: dict[str, Any]) -> None:
+        from autoetl.docindex import DocumentToolkit
+
+        db_path = self._resolve_docindex_db(req)
+        if db_path is None:
+            return
+        query_text = str(req.get("query", "")).strip()
+        if not query_text:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "검색 질의(`query`)가 필요하다."})
+            return
+        try:
+            top_k = max(1, min(20, int(req.get("top_k", 5))))
+        except (TypeError, ValueError):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "`top_k`는 정수여야 한다."})
+            return
+        doc_id_raw = req.get("doc_id")
+        doc_id = (
+            str(doc_id_raw).strip() if isinstance(doc_id_raw, str) and doc_id_raw.strip() else None
+        )
+        reranker_kind = str(req.get("reranker", "none") or "none").strip().lower()
+        reranker_model = str(req.get("reranker_model", "") or "").strip()
+
+        try:
+            reranker_obj: Any = None
+            if reranker_kind == "onnx":
+                reranker_obj = self.server.docindex_store.get_onnx_reranker(reranker_model)
+            elif reranker_kind != "none":
+                raise ParserInputError(
+                    f"지원하지 않는 리랭커 유형이다: '{reranker_kind}' (지원: none, onnx)"
+                )
+
+            with DocumentToolkit(db_path, reranker=reranker_obj) as kit:
+                pack = kit.search_documents(query_text, top_k=top_k, doc_id=doc_id)
+            self._send_json(HTTPStatus.OK, pack)
+        except ParserInputError as exc:
+            self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
+        except Exception:
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {
+                    "error": (
+                        "문서 검색 중 내부 오류가 발생했다(문서 본문 보호를 위해 상세 원문 생략)."
+                    )
+                },
+            )
+
+    def _handle_docindex_section(self, req: dict[str, Any]) -> None:
+        from autoetl.docindex import DocumentToolkit
+
+        db_path = self._resolve_docindex_db(req)
+        if db_path is None:
+            return
+        section_id = str(req.get("section_id", "")).strip()
+        if not section_id:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "`section_id`가 필요하다."})
+            return
+        try:
+            with DocumentToolkit(db_path) as kit:
+                content = kit.read_section(section_id)
+            self._send_json(HTTPStatus.OK, content)
+        except ParserInputError as exc:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+        except Exception:
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": "원문 섹션 조회 중 내부 오류가 발생했다."},
+            )
+
+    def _handle_docindex_table_sql(self, req: dict[str, Any]) -> None:
+        from autoetl.docindex import DocumentToolkit
+
+        db_path = self._resolve_docindex_db(req)
+        if db_path is None:
+            return
+        table_uid = str(req.get("table_uid", "")).strip()
+        sql = str(req.get("sql", "SELECT * FROM tbl LIMIT 50")).strip()
+        if not table_uid:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "`table_uid`가 필요하다."})
+            return
+        try:
+            with DocumentToolkit(db_path) as kit:
+                result = kit.query_table(table_uid, sql)
+            self._send_json(HTTPStatus.OK, result)
+        except ParserInputError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except Exception:
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": "표 SQL 실행 중 내부 오류가 발생했다."},
+            )
 
     def _handle_analyze_tables(self, req: dict[str, Any]) -> None:
         from autoetl.contracts import Purpose
