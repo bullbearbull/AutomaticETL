@@ -1,0 +1,53 @@
+name: Claude PR 리뷰
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+
+concurrency:
+  group: code-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: 자동 코드 리뷰
+    # draft, 봇, fork PR은 건너뜁니다(fork에서는 secrets를 쓸 수 없습니다).
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.3.3
+      # claude-agent-sdk는 Claude Code CLI를 함께 제공하므로 별도 설치가 필요 없습니다.
+      - name: PR 리뷰 실행
+        # 리뷰가 실패해도 PR 체크가 빨갛게 되지 않도록 합니다.
+        continue-on-error: true
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "ANTHROPIC_API_KEY 시크릿이 설정되지 않아 자동 코드 리뷰를 건너뜁니다."
+            exit 0
+          fi
+          uv run --no-project --python 3.12 \
+            --with-requirements .github/pr-review/scripts/requirements.txt \
+            python .github/pr-review/scripts/review.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          # 선택 설정:
+          # REVIEW_MODEL: claude-sonnet-5-5
+          # REVIEW_MAX_BUDGET_USD: "2.0"
+          # REVIEW_BOT_LOGIN: "github-actions[bot]"
