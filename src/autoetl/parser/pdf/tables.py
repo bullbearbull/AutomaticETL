@@ -389,6 +389,57 @@ def _detect_ruled_grid_tables(
             continue
 
         tx0, ttop, tx1, tbot = xs[0], ys[0], xs[-1], ys[-1]
+        table_width = max(1.0, tx1 - tx0)
+        table_height = max(1.0, tbot - ttop)
+
+        # 배경색이 다른 행 밴드(예: 흰 행과 연녹색 소계 행 사이에 테두리선이 생략된 한컴/엑셀 표)의
+        # 수평 경계를 복원해 행 경계와 음영 판정을 정확히 맞춘다.
+        eff_hs = list(hs)
+        table_shaded = [
+            sr
+            for sr in shaded_rects
+            if sr.height < table_height * 0.75
+            and sr.x0 >= tx0 - 4.0
+            and sr.x1 <= tx1 + 4.0
+            and sr.top >= ttop - 4.0
+            and sr.bottom <= tbot + 4.0
+        ]
+        if table_shaded:
+            edge_ys = _cluster_coords(
+                [val for sr in table_shaded for val in (sr.top, sr.bottom)],
+                tol=2.5,
+            )
+            added_shaded_h = False
+            for cy in edge_ys:
+                if any(abs(cy - existing_y) <= 3.0 for existing_y in ys):
+                    continue
+                ivs = sorted(
+                    (max(tx0, sr.x0), min(tx1, sr.x1))
+                    for sr in table_shaded
+                    if (abs(sr.top - cy) <= 2.5 or abs(sr.bottom - cy) <= 2.5)
+                    and min(tx1, sr.x1) > max(tx0, sr.x0)
+                )
+                if not ivs:
+                    continue
+                merged_ivs: list[tuple[float, float]] = [ivs[0]]
+                for ix0, ix1 in ivs[1:]:
+                    px0, px1 = merged_ivs[-1]
+                    if ix0 <= px1 + 3.0:
+                        merged_ivs[-1] = (px0, max(px1, ix1))
+                    else:
+                        merged_ivs.append((ix0, ix1))
+                covered = sum(ix1 - ix0 for ix0, ix1 in merged_ivs)
+                if covered >= table_width * 0.60:
+                    for ix0, ix1 in merged_ivs:
+                        if ix1 - ix0 >= 10.0:
+                            eff_hs.append(_HSeg(y=cy, x0=ix0, x1=ix1))
+                            added_shaded_h = True
+            if added_shaded_h:
+                ys = _cluster_coords([s.y for s in eff_hs], tol=3.0)
+                n_rows = len(ys) - 1
+                ttop, tbot = ys[0], ys[-1]
+                table_height = max(1.0, tbot - ttop)
+
         tbox = (tx0, ttop, tx1, tbot)
 
         # 이 표 영역 안의 텍스트 스팬 수집
@@ -421,7 +472,7 @@ def _detect_ruled_grid_tables(
                 while r_end + 1 < n_rows:
                     # 가로 병합 폭 전체에서 아래 경계선이 없어야 세로 병합 인정
                     if all(
-                        not _has_h_border(hs, ys[r_end + 1], xs[cc], xs[cc + 1])
+                        not _has_h_border(eff_hs, ys[r_end + 1], xs[cc], xs[cc + 1])
                         for cc in range(c, c_end + 1)
                     ):
                         r_end += 1
@@ -483,8 +534,8 @@ def _detect_ruled_grid_tables(
                     )
                 )
 
-        # 묶음 행(예: 5행마다만 가로선을 그리는 통계표) 분할:
-        # 세로 병합 없는 격자 행에서 여러 열이 공통 y 기준선 k(>=2)개를 공유하면 k행으로 전개
+        # 묶음 행(예: 5행마다만 가로선을 그리는 통계표·강조 박스 내부 2행) 분할:
+        # 세로 병합 없는 격자 행에서 여러 열이 공통 다중 열 기준선(anchor) k(>=2)개를 공유하면 전개
         expanded_grid: list[list[str]] = []
         expanded_cells: list[TableCell] = []
         expanded_bold: list[float] = []
@@ -498,63 +549,95 @@ def _detect_ruled_grid_tables(
         for cell, c_spans in raw_cells:
             cells_by_row[cell.row].append((cell, c_spans))
 
-        table_height = max(1.0, tbot - ttop)
         for r in range(n_rows):
             row_entries = cells_by_row[r]
             row_h = max(1.0, ys[r + 1] - ys[r])
-            # 행 중심을 덮고 표 전체 배경(>=75% 높이)이 아닌 채움 사각형만 행 음영으로 인정
+            # 행 중심을 덮고 표 전체 배경(>=75%)이 아닌 채움 사각형(셀 단위 분할 채움 포함) 집계
             row_y_mid = (ys[r] + ys[r + 1]) / 2.0
-            matched_shade = next(
-                (
-                    sr
-                    for sr in shaded_rects
-                    if sr.height < table_height * 0.75
-                    and sr.top <= row_y_mid <= sr.bottom
-                    and (min(sr.bottom, ys[r + 1]) - max(sr.top, ys[r])) >= row_h * 0.55
-                    and sr.x0 <= tx0 + 10.0
-                    and sr.x1 >= tx1 - 10.0
-                ),
-                None,
-            )
-            is_shaded_r = matched_shade is not None
-            fill_color_r = matched_shade.fill_color if matched_shade is not None else None
+            row_shade_hits = [
+                sr
+                for sr in shaded_rects
+                if sr.height < table_height * 0.75
+                and sr.top <= row_y_mid <= sr.bottom
+                and (min(sr.bottom, ys[r + 1]) - max(sr.top, ys[r])) >= row_h * 0.55
+                and min(sr.x1, tx1) > max(sr.x0, tx0)
+            ]
+            is_shaded_r = False
+            fill_color_r: tuple[float, float, float] | None = None
+            if row_shade_hits:
+                shade_ivs = sorted(
+                    (max(tx0, sr.x0), min(tx1, sr.x1)) for sr in row_shade_hits
+                )
+                merged_sh: list[tuple[float, float]] = [shade_ivs[0]]
+                for sx0, sx1 in shade_ivs[1:]:
+                    px0, px1 = merged_sh[-1]
+                    if sx0 <= px1 + 3.0:
+                        merged_sh[-1] = (px0, max(px1, sx1))
+                    else:
+                        merged_sh.append((sx0, sx1))
+                shade_cov = sum(sx1 - sx0 for sx0, sx1 in merged_sh)
+                if shade_cov >= table_width * 0.70:
+                    is_shaded_r = True
+                    best_sr = max(
+                        row_shade_hits,
+                        key=lambda sr: min(sr.x1, tx1) - max(sr.x0, tx0),
+                    )
+                    fill_color_r = best_sr.fill_color
             bold_r = (row_bold_hits[r] / row_span_totals[r]) if row_span_totals[r] > 0 else 0.0
 
-            can_split = (
-                not row_has_vmerge[r]
-                and all(cell.col_span == 1 for cell, _ in row_entries)
-                and len(row_entries) >= 3
-            )
-            sub_y_bands: list[list[RawTextSpan]] = []
+            can_split = not row_has_vmerge[r] and len(row_entries) >= 3
+            anchor_centers: list[float] = []
             if can_split:
                 all_r_spans = [sp for _, sps in row_entries for sp in sps]
                 cand_bands = _group_spans_into_rows(all_r_spans)
                 if len(cand_bands) >= 2:
-                    band_centers = [
+                    raw_centers = [
                         sum(sp.y_center for sp in band) / len(band) for band in cand_bands
                     ]
-                    multi_line_cols = 0
-                    non_empty_cols = 0
+                    # 다중 열(>=2열)이 실제로 정렬된 밴드만 유효 앵커 행으로 채택해
+                    # 1개 열의 줄바꿈(예: 2줄 비고 셀)이 3개 빈 행으로 찢어지는 현상을 차단한다.
+                    band_col_counts = [0] * len(raw_centers)
                     for _, sps in row_entries:
                         if not sps:
                             continue
-                        non_empty_cols += 1
-                        hit_bands = {
+                        hit_b = {
                             min(
-                                range(len(band_centers)),
-                                key=lambda bi: abs(band_centers[bi] - sp.y_center),
+                                range(len(raw_centers)),
+                                key=lambda bi: abs(raw_centers[bi] - sp.y_center),
                             )
                             for sp in sps
                         }
-                        if len(hit_bands) >= 2:
-                            multi_line_cols += 1
-                    if non_empty_cols >= 3 and multi_line_cols >= max(2, int(non_empty_cols * 0.5)):
-                        sub_y_bands = cand_bands
+                        for bi in hit_b:
+                            band_col_counts[bi] += 1
+                    cand_anchors = [
+                        raw_centers[bi]
+                        for bi, cnt in enumerate(band_col_counts)
+                        if cnt >= 2
+                    ]
+                    if len(cand_anchors) >= 2:
+                        multi_line_cols = 0
+                        non_empty_cols = 0
+                        for _, sps in row_entries:
+                            if not sps:
+                                continue
+                            non_empty_cols += 1
+                            hit_anchors = {
+                                min(
+                                    range(len(cand_anchors)),
+                                    key=lambda ai: abs(cand_anchors[ai] - sp.y_center),
+                                )
+                                for sp in sps
+                            }
+                            if len(hit_anchors) >= 2:
+                                multi_line_cols += 1
+                        if non_empty_cols >= 3 and multi_line_cols >= max(
+                            2, int(non_empty_cols * 0.5)
+                        ):
+                            anchor_centers = cand_anchors
 
-            if sub_y_bands:
+            if anchor_centers:
                 split_subrows_used = True
-                band_centers = [sum(sp.y_center for sp in band) / len(band) for band in sub_y_bands]
-                for bi in range(len(sub_y_bands)):
+                for ai in range(len(anchor_centers)):
                     out_r = len(expanded_grid)
                     row_vals = [""] * n_cols
                     for cell, sps in row_entries:
@@ -562,10 +645,10 @@ def _detect_ruled_grid_tables(
                             sp
                             for sp in sps
                             if min(
-                                range(len(band_centers)),
-                                key=lambda k: abs(band_centers[k] - sp.y_center),
+                                range(len(anchor_centers)),
+                                key=lambda k: abs(anchor_centers[k] - sp.y_center),
                             )
-                            == bi
+                            == ai
                         ]
                         txt = _join_spans_text(sub_sps)
                         row_vals[cell.col] = txt

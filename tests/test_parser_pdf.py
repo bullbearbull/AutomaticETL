@@ -1228,3 +1228,309 @@ def test_pdf_colored_header_with_zebra_fill_does_not_drop_first_data_row() -> No
     assert tbl.rows[0] == ["강남본점", "125.4", "112%"]
     assert tbl.rows[1] == ["부산센텀", "88.2", "98%"]
     assert tbl.rows[2] == ["대구동성로", "64.0", "105%"]
+
+
+def test_pdf_dotted_borders_reconstructed_and_multiline_cells_preserved(tmp_path: Path) -> None:
+    """한컴 PDF처럼 0.36pt 점선 스트로크로 그린 표 내부 가로선을 복원해 2줄 셀 분할을 막는다."""
+    pg = _PdfPageSpec()
+    xs = [70.0, 200.0, 280.0, 360.0, 520.0]
+    ys = [120.0, 148.0, 188.0, 218.0, 258.0]  # 헤더 + 3개 데이터 행
+
+    # 외곽·헤더 아래·최하단 실선 + 세로 실선
+    for y in (ys[0], ys[1], ys[-1]):
+        pg.add_line(xs[0], y, xs[-1], y, width=0.6)
+    for x in xs:
+        pg.add_line(x, ys[0], x, ys[-1], width=0.6)
+
+    # 내부 행 구분선(ys[2], ys[3])을 0.36pt 길이, 0.84pt 간격의 점선 스트로크로 그림
+    for y in (ys[2], ys[3]):
+        pdf_y = pg.height - y
+        cur_x = xs[0]
+        while cur_x < xs[-1]:
+            pg.ops.append(f"0.36 w {cur_x:.2f} {pdf_y:.2f} m {cur_x + 0.36:.2f} {pdf_y:.2f} l S")
+            cur_x += 0.84
+
+    # 헤더
+    pg.add_text("Type", 80.0, 138.0, font="F2", size=10.0)
+    pg.add_text("Count", 215.0, 138.0, font="F2", size=10.0)
+    pg.add_text("Amount", 295.0, 138.0, font="F2", size=10.0)
+    pg.add_text("Notes", 375.0, 138.0, font="F2", size=10.0)
+
+    # 행 1: 비고 열만 2줄, 나머지 열은 세로 중앙 정렬
+    pg.add_text("DirectDeal", 80.0, 172.0, size=10.0)
+    pg.add_text("647", 225.0, 172.0, size=10.0)
+    pg.add_text("213.2", 300.0, 172.0, size=10.0)
+    pg.add_text("Line one note,", 370.0, 164.0, size=10.0)
+    pg.add_text("line two detail", 370.0, 178.0, size=10.0)
+
+    # 행 2: 1줄 행
+    pg.add_text("Family", 80.0, 206.0, size=10.0)
+    pg.add_text("122", 225.0, 206.0, size=10.0)
+    pg.add_text("13.3", 300.0, 206.0, size=10.0)
+    pg.add_text("Single line note", 370.0, 206.0, size=10.0)
+
+    # 행 3: 비고 열 2줄
+    pg.add_text("Misuse", 80.0, 242.0, size=10.0)
+    pg.add_text("83", 225.0, 242.0, size=10.0)
+    pg.add_text("23.1", 300.0, 242.0, size=10.0)
+    pg.add_text("Restricted merchant,", 370.0, 234.0, size=10.0)
+    pg.add_text("excessive rent", 370.0, 248.0, size=10.0)
+
+    pdf_path = tmp_path / "dotted_table.pdf"
+    pdf_path.write_bytes(_build_pdf_bytes([pg]))
+
+    doc = parse_document(pdf_path, options=ParseOptions(extract_crops=False))
+    assert len(doc.tables) == 1
+    tbl = doc.tables[0]
+    assert tbl.row_count == 4
+    assert tbl.col_count == 4
+    assert tbl.headers == ["Type", "Count", "Amount", "Notes"]
+    assert tbl.rows == [
+        ["DirectDeal", "647", "213.2", "Line one note, line two detail"],
+        ["Family", "122", "13.3", "Single line note"],
+        ["Misuse", "83", "23.1", "Restricted merchant, excessive rent"],
+    ]
+
+
+def test_pdf_filled_polygon_rects_colspan_subrow_split_and_wrap_guard(tmp_path: Path) -> None:
+    """`m l l l h f*` 채움 다각형, `col_span` 묶음 행 분할, 무선 2줄 셀 보호를 함께 검증한다."""
+    from autoetl.parser.pdf.extractor import extract_pdf_document
+    from autoetl.parser.pdf.geometry import RawPageData, RawTextSpan, RawVectorLine
+    from autoetl.parser.pdf.tables import extract_page_tables
+
+    # 1) `m l l l l h f*` 셀 채움 다각형이 RawVectorRect로 복원되고 색상 경계로 소계 행이 분리됨
+    pg = _PdfPageSpec()
+    xs = [60.0, 120.0, 200.0, 300.0, 400.0]
+    # 행1(125..175): col0+1 병합 2개 소행, 행2(175..225): 배경색 경계
+    ys = [100.0, 125.0, 175.0, 225.0]
+
+    for y in ys:
+        pg.add_line(xs[0], y, xs[-1], y, width=0.6)
+    for x in xs:
+        if x == xs[1]:
+            # col0+1 병합 영역(ys[0]..ys[2])에는 세로선 없음, 아래쪽(ys[2]..ys[3])만 세로선
+            pg.add_line(x, ys[2], x, ys[3], width=0.6)
+        else:
+            pg.add_line(x, ys[0], x, ys[-1], width=0.6)
+
+    # 셀별 `m l l l l h f*` 헤더 채움(하늘색) + 하단 반쪽(200..225) 연녹색 채움
+    def add_poly_fill(x0: float, top: float, x1: float, bot: float, rgb: str) -> None:
+        y_top = pg.height - top
+        y_bot = pg.height - bot
+        pg.ops.append(
+            f"q {rgb} rg {x0:.2f} {y_top:.2f} m {x0:.2f} {y_bot:.2f} l "
+            f"{x1:.2f} {y_bot:.2f} l {x1:.2f} {y_top:.2f} l {x0:.2f} {y_top:.2f} l h f* Q"
+        )
+
+    for c0, c1 in [(xs[0], xs[2]), (xs[2], xs[3]), (xs[3], xs[4])]:
+        add_poly_fill(c0, ys[0], c1, ys[1], "0.87 0.90 0.97")
+    for c0, c1 in [(xs[0], xs[1]), (xs[1], xs[2]), (xs[2], xs[3]), (xs[3], xs[4])]:
+        add_poly_fill(c0, 200.0, c1, ys[3], "0.95 1.00 0.86")
+
+    pg.add_text("Item", 80.0, 116.0, font="F2", size=10.0)
+    pg.add_text("2024", 230.0, 116.0, font="F2", size=10.0)
+    pg.add_text("2025", 330.0, 116.0, font="F2", size=10.0)
+
+    # col_span=2 묶음 행(선 없이 2줄 정렬)
+    pg.add_text("FraudCount", 70.0, 142.0, size=10.0)
+    pg.add_text("630", 230.0, 142.0, size=10.0)
+    pg.add_text("992", 330.0, 142.0, size=10.0)
+    pg.add_text("FraudAmt", 70.0, 162.0, size=10.0)
+    pg.add_text("49302", 230.0, 162.0, size=10.0)
+    pg.add_text("66765", 330.0, 162.0, size=10.0)
+
+    # 배경색 전환 행(175..200 흰색, 200..225 연녹색)
+    pg.add_text("Joint", 130.0, 190.0, size=10.0)
+    pg.add_text("510", 230.0, 190.0, size=10.0)
+    pg.add_text("606", 330.0, 190.0, size=10.0)
+    pg.add_text("Special", 130.0, 215.0, size=10.0)
+    pg.add_text("60", 230.0, 215.0, size=10.0)
+    pg.add_text("106", 330.0, 215.0, size=10.0)
+
+    pdf_path = tmp_path / "poly_colspan.pdf"
+    pdf_path.write_bytes(_build_pdf_bytes([pg]))
+
+    raw_doc = extract_pdf_document(pdf_path)
+    assert len(raw_doc.pages[0].rects) == 7
+
+    doc = parse_document(pdf_path, options=ParseOptions(extract_crops=False))
+    assert len(doc.tables) == 1
+    tbl = doc.tables[0]
+    assert tbl.headers == ["Item", "", "2024", "2025"]
+    assert tbl.rows == [
+        ["FraudCount", "", "630", "992"],
+        ["FraudAmt", "", "49302", "66765"],
+        ["", "Joint", "510", "606"],
+        ["", "Special", "60", "106"],
+    ]
+
+    # 2) 내부 가로선이 아예 없는 묶음 행에서도 2줄 비고 셀이 3행으로 찢어지지 않아야 함
+    xs2 = [60.0, 180.0, 260.0, 340.0, 520.0]
+    ys2 = [100.0, 126.0, 210.0]
+    lines2 = [RawVectorLine(x0=xs2[0], top=y, x1=xs2[-1], bottom=y) for y in ys2] + [
+        RawVectorLine(x0=x, top=ys2[0], x1=x, bottom=ys2[-1]) for x in xs2
+    ]
+
+    def sp(txt: str, x0: float, top: float, x1: float) -> RawTextSpan:
+        return RawTextSpan(
+            text=txt,
+            x0=x0,
+            top=top,
+            x1=x1,
+            bottom=top + 10.0,
+            font_name="MalgunGothic",
+            font_size=10.0,
+            is_bold=False,
+            is_italic=False,
+        )
+
+    spans2 = [
+        sp("유형", 80, 108, 120),
+        sp("건수", 200, 108, 230),
+        sp("금액", 280, 108, 310),
+        sp("비고", 360, 108, 400),
+        # 1번째 데이터 행: 비고 2줄, 나머지 열 세로 중앙
+        sp("특정거래", 80, 144, 140),
+        sp("647", 200, 144, 230),
+        sp("213.2", 280, 144, 320),
+        sp("수의계약 조건위반,", 355, 134, 480),
+        sp("특정업체 몰아주기", 355, 154, 480),
+        # 2번째 데이터 행: 1줄
+        sp("가족거래", 80, 184, 140),
+        sp("122", 200, 184, 230),
+        sp("13.3", 280, 184, 320),
+        sp("직계존비속 거래 등", 355, 184, 480),
+    ]
+    raw_pg = RawPageData(page=1, width=595.0, height=842.0, rotation=0, spans=spans2, lines=lines2)
+    res2 = extract_page_tables(raw_pg)
+    assert len(res2.tables) == 1
+    assert res2.tables[0].rows == [
+        ["특정거래", "647", "213.2", "수의계약 조건위반, 특정업체 몰아주기"],
+        ["가족거래", "122", "13.3", "직계존비속 거래 등"],
+    ]
+
+
+def test_pdf_shadow_dedup_korean_superscript_and_table_page_not_multicolumn(
+    tmp_path: Path,
+) -> None:
+    """그림자 중복 제거, `1｣` 위첨자 병합, 표 사이 단위 표기의 다단 오탐 방지를 검증한다."""
+    from autoetl.parser.pdf.geometry import RawPageData, RawTextSpan, RawVectorLine
+    from autoetl.parser.pdf.layout import analyze_page_layout
+    from autoetl.parser.pdf.tables import extract_ruled_tables
+
+    # 1) 실제 PDF에서 그림자/의사볼드 미세 오프셋 중복 텍스트 제거 확인
+    pg = _PdfPageSpec()
+    pg.add_text("Ref", 82.5, 80.5, font="F2", size=16.0)
+    pg.add_text("Ref", 81.7, 79.8, font="F2", size=16.0)
+    pg.add_text(" 1", 118.5, 80.5, font="F2", size=16.0)
+    pg.add_text("1", 117.7, 79.8, font="F2", size=16.0)
+    pg.add_text("Body paragraph text.", 70.0, 140.0, size=12.0)
+
+    pdf_path = tmp_path / "shadow_dedup.pdf"
+    pdf_path.write_bytes(_build_pdf_bytes([pg]))
+    doc = parse_document(pdf_path, options=ParseOptions(extract_crops=False))
+    md = render_document_markdown(doc)
+    assert "RefRef" not in md
+    assert "Ref 1" in md
+
+    # 2) `1｣` 위첨자 인라인 병합 + 두 전폭 표 사이의 좌측 소제목·우측 단위 표기 다단 오탐 방지
+    def mk_sp(txt: str, x0: float, top: float, x1: float, fs: float = 12.0) -> RawTextSpan:
+        return RawTextSpan(
+            text=txt,
+            x0=x0,
+            top=top,
+            x1=x1,
+            bottom=top + fs,
+            font_name="HCRBatang",
+            font_size=fs,
+            is_bold=False,
+            is_italic=False,
+        )
+
+    xs = [70.0, 290.0, 520.0]
+    t1_ys = [170.0, 200.0, 360.0]
+    t2_ys = [460.0, 490.0, 650.0]
+    lines: list[RawVectorLine] = []
+    for y_list in (t1_ys, t2_ys):
+        for y in y_list:
+            lines.append(RawVectorLine(x0=xs[0], top=y, x1=xs[-1], bottom=y))
+        for x in xs:
+            lines.append(RawVectorLine(x0=x, top=y_list[0], x1=x, bottom=y_list[-1]))
+
+    spans = [
+        mk_sp("< 연도별 점검 결과", 140.0, 100.0, 280.0, 13.0),
+        mk_sp("1｣", 281.0, 98.0, 292.0, 8.2),
+        mk_sp(">", 298.0, 100.0, 306.0, 13.0),
+        mk_sp("□ 분야별 점검 결과", 70.0, 130.0, 210.0, 14.0),
+        mk_sp("(단위: 건, 억 원, 금액 기준)", 395.0, 152.0, 525.0, 10.0),
+        mk_sp("사업분야", 90.0, 180.0, 160.0, 11.0),
+        mk_sp("적발건수", 310.0, 180.0, 380.0, 11.0),
+        mk_sp("합계", 90.0, 240.0, 140.0, 11.0),
+        mk_sp("992", 310.0, 240.0, 350.0, 11.0),
+        mk_sp("□ 패턴별 점검 결과", 70.0, 418.0, 210.0, 14.0),
+        mk_sp("(단위: 건, 억 원, 건수 기준)", 395.0, 442.0, 525.0, 10.0),
+        mk_sp("유형", 90.0, 470.0, 140.0, 11.0),
+        mk_sp("적발금액", 310.0, 470.0, 380.0, 11.0),
+        mk_sp("특정거래", 90.0, 540.0, 160.0, 11.0),
+        mk_sp("213.2", 310.0, 540.0, 360.0, 11.0),
+    ]
+    raw_pg = RawPageData(page=1, width=595.0, height=842.0, rotation=0, spans=spans, lines=lines)
+    tbl_res = extract_ruled_tables(raw_pg)
+    assert len(tbl_res.tables) == 2
+    layout_res = analyze_page_layout(
+        raw_pg,
+        excluded_span_indices=tbl_res.consumed_span_indices,
+        header_footer_span_indices=frozenset(),
+        body_font_size=14.0,
+        outline=[],
+        excluded_boxes=tbl_res.consumed_table_boxes,
+    )
+    assert layout_res.column_count == 1
+    assert layout_res.column_gutters_x == []
+    joined_texts = [b.text for b in layout_res.text_blocks]
+    assert any("점검 결과1｣ >" in t for t in joined_texts)
+    assert not any(t.strip() == "1｣" for t in joined_texts)
+
+
+def test_pdf_type0_cidfont_widths_digit_one_and_tz_scaling(tmp_path: Path) -> None:
+    """Type0 CIDFont `/W`+`/ToUnicode` 실측 폭, 숫자 `1` 고정폭, `Tz` 장평 보정을 검증한다."""
+    from autoetl.parser.pdf.extractor import extract_pdf_document
+    from autoetl.parser.pdf.geometry import estimate_text_width
+
+    class _DummyStream:
+        def __init__(self, data: bytes) -> None:
+            self._data = data
+
+        def get_data(self) -> bytes:
+            return self._data
+
+    cmap = (
+        b"begincmap\n"
+        b"2 beginbfchar\n<0004> <ac00>\n<0005> <0031>\nendbfchar\n"
+        b"1 beginbfrange\n<0006> <0007> <0032>\nendbfrange\n"
+        b"endcmap\n"
+    )
+    fake_type0 = {
+        "/Subtype": "/Type0",
+        "/DescendantFonts": [{"/DW": 1000, "/W": [4, [970, 550, 550, 550]]}],
+        "/ToUnicode": _DummyStream(cmap),
+    }
+    cache: dict[int, dict[str, float] | None] = {}
+    assert estimate_text_width("가123", 10.0, fake_type0, width_cache=cache) == pytest.approx(
+        (0.97 + 0.55 * 3) * 10.0, abs=0.05
+    )
+    # 폴백 휴리스틱에서도 '1'은 '2'와 동일한 숫자 폭이어야 하며 0.28로 축소되지 않아야 함
+    assert estimate_text_width("1", 10.0, None) == pytest.approx(
+        estimate_text_width("2", 10.0, None), abs=0.01
+    )
+    assert estimate_text_width("가", 10.0, None) == pytest.approx(9.7, abs=0.05)
+
+    # `Tz` 수평 축척(50%)이 스팬 폭에 반영되는지 확인
+    pg = _PdfPageSpec()
+    pg.ops.append("BT /F1 12.00 Tf 100 Tz 1 0 0 1 70 700 Tm (ABCDEF) Tj ET")
+    pg.ops.append("BT /F1 12.00 Tf 50 Tz 1 0 0 1 70 670 Tm (ABCDEF) Tj ET")
+    pdf_path = tmp_path / "tz_scale.pdf"
+    pdf_path.write_bytes(_build_pdf_bytes([pg]))
+    extracted = extract_pdf_document(pdf_path)
+    sp_normal, sp_half = extracted.pages[0].spans
+    assert sp_half.width == pytest.approx(sp_normal.width * 0.5, rel=0.05)

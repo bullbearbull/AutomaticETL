@@ -12,11 +12,13 @@ import base64
 import csv
 import io
 import json
+import re
 import secrets
 import shutil
 import tempfile
 import threading
 import time
+import unicodedata
 import webbrowser
 import zipfile
 from collections import OrderedDict
@@ -25,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from autoetl.doctor import collect_doctor_report
 from autoetl.parser.adapters import ParseOptions, ParserInputError
@@ -42,6 +45,40 @@ _MAX_REQUEST_BYTES = 70 * 1024 * 1024  # base64 ~50MB 원본 대응
 _MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 _MAX_CACHED_BUNDLES = 10
 _MAX_INLINE_CROP_BYTES = 4 * 1024 * 1024
+_UNSAFE_FILENAME_RE = re.compile(r'[\x00-\x1f\x7f/\\:*?"<>|]+')
+
+
+def _normalize_upload_filename(raw_name: Any) -> str:
+    """업로드 파일명에서 경로 성분을 제거하고 macOS NFD 한글을 표준 NFC로 정규화한다."""
+    name = Path(str(raw_name or "").strip()).name
+    return unicodedata.normalize("NFC", name)
+
+
+def _build_content_disposition(dl_name: str, file_path: Path, content_type: str) -> str:
+    """한글·유니코드 파일명을 보존하는 RFC 5987 Content-Disposition 헤더를 생성한다."""
+    nfc_name = unicodedata.normalize("NFC", dl_name).strip()
+    safe_utf8 = _UNSAFE_FILENAME_RE.sub("_", nfc_name).strip(" .")
+    if content_type == "application/zip":
+        if not safe_utf8.lower().endswith(".zip"):
+            safe_utf8 = f"{safe_utf8 or 'autoetl_bundle'}.zip"
+    elif not Path(safe_utf8).suffix:
+        safe_utf8 = f"{safe_utf8 or 'download'}{file_path.suffix or '.bin'}"
+
+    raw_ascii = "".join(
+        ch if (ch.isascii() and (ch.isalnum() or ch in "._-")) else "_" for ch in safe_utf8
+    )
+    ascii_stem = re.sub(r"_+", "_", Path(raw_ascii).stem).strip("._-")
+    ascii_suffix = Path(raw_ascii).suffix
+    if content_type == "application/zip":
+        ascii_suffix = ".zip"
+    elif not ascii_suffix:
+        ascii_suffix = file_path.suffix or ".bin"
+    if not ascii_stem:
+        ascii_stem = "autoetl_bundle" if content_type == "application/zip" else "download"
+    safe_ascii = f"{ascii_stem}{ascii_suffix}"
+
+    encoded_utf8 = quote(safe_utf8, safe="")
+    return f"attachment; filename=\"{safe_ascii}\"; filename*=UTF-8''{encoded_utf8}"
 
 _MIME_BY_EXT: dict[str, str] = {
     ".png": "image/png",
@@ -323,18 +360,12 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "요청한 번들을 찾을 수 없다."})
                 return
             file_path, dl_name, content_type = found
-            safe_ascii = "".join(
-                ch if (ch.isascii() and (ch.isalnum() or ch in "._-")) else "_" for ch in dl_name
-            )
-            if content_type == "application/zip" and not safe_ascii.endswith(".zip"):
-                safe_ascii += ".zip"
-            elif not Path(safe_ascii).suffix:
-                safe_ascii += file_path.suffix or ".bin"
+            content_disp = _build_content_disposition(dl_name, file_path, content_type)
             self._send_bytes(
                 HTTPStatus.OK,
                 file_path.read_bytes(),
                 content_type=content_type,
-                extra_headers={"Content-Disposition": f'attachment; filename="{safe_ascii}"'},
+                extra_headers={"Content-Disposition": content_disp},
             )
             return
 
@@ -437,7 +468,7 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
                     {"error": "각 파일 항목은 `filename`과 `content_base64` 객체여야 한다."},
                 )
                 return
-            filename = Path(str(item.get("filename", "")).strip()).name
+            filename = _normalize_upload_filename(item.get("filename", ""))
             b64_data = item.get("content_base64")
             if not filename or not isinstance(b64_data, str) or not b64_data:
                 self._send_json(
@@ -711,7 +742,7 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
                         {"error": "각 파일 항목은 `filename`과 `content_base64` 객체여야 한다."},
                     )
                     return
-                filename = Path(str(item.get("filename", "")).strip()).name
+                filename = _normalize_upload_filename(item.get("filename", ""))
                 b64_data = item.get("content_base64")
                 if not filename or not isinstance(b64_data, str) or not b64_data:
                     self._send_json(
@@ -910,7 +941,7 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
             )
 
     def _handle_parse(self, req: dict[str, Any]) -> None:
-        filename = Path(str(req.get("filename", "")).strip()).name
+        filename = _normalize_upload_filename(req.get("filename", ""))
         b64_data = req.get("content_base64")
         raw_opts = req.get("options")
         opts_in: dict[str, Any] = raw_opts if isinstance(raw_opts, dict) else {}

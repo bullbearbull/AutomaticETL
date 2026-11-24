@@ -234,7 +234,7 @@ def render_document_markdown(
                 parts.append("")
             elif blk.kind == ElementKind.LIST_ITEM:
                 stripped = blk.text.strip()
-                if stripped.startswith(("o ", "O ")):
+                if stripped.startswith(("o ", "O ", "ㅇ ")):
                     sub = stripped[2:].strip()
                     if _ORDERED_LIST_PREFIX_RE.match(sub):
                         parts.append(f"  {sub}")
@@ -243,7 +243,7 @@ def render_document_markdown(
                 elif _ORDERED_LIST_PREFIX_RE.match(stripped):
                     parts.append(stripped)
                 else:
-                    text = stripped.lstrip("•▪▫■□●○◦◆◇▶▷·-* ").strip()
+                    text = stripped.lstrip("•▪▫■□●○◦◆◇▶▷▸▹►·-* ").strip()
                     parts.append(f"- {text or stripped}")
                 prev_was_list = True
             elif blk.kind == ElementKind.FORMULA_OR_CODE:

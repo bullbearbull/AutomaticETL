@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
@@ -312,8 +313,146 @@ def union_area(rects: list[tuple[float, float, float, float]]) -> float:
     return total
 
 
-def estimate_text_width(text: str, font_size: float, font_dict: Any = None) -> float:
-    """텍스트 스팬의 가로 폭(pt)을 글꼴 `/Widths` 또는 유니코드 폭 휴리스틱으로 추정한다."""
+_BFCHAR_BLOCK_RE = re.compile(r"beginbfchar\s+(.*?)\s+endbfchar", re.DOTALL)
+_BFRANGE_BLOCK_RE = re.compile(r"beginbfrange\s+(.*?)\s+endbfrange", re.DOTALL)
+_BFCHAR_PAIR_RE = re.compile(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>")
+_BFRANGE_ENTRY_RE = re.compile(
+    r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(?:<([0-9A-Fa-f]+)>|\[([^\]]+)\])"
+)
+_HEX_TOKEN_RE = re.compile(r"<([0-9A-Fa-f]+)>")
+
+
+def _decode_cmap_hex(hex_str: str) -> str | None:
+    if not hex_str or len(hex_str) % 2 != 0:
+        return None
+    try:
+        raw = bytes.fromhex(hex_str)
+    except ValueError:
+        return None
+    if len(raw) == 1:
+        val = raw[0]
+        return chr(val) if val > 0 else None
+    if len(raw) % 2 != 0:
+        return None
+    try:
+        decoded = raw.decode("utf-16-be")
+    except UnicodeDecodeError:
+        return None
+    if not decoded or decoded in ("\uffff", "\x00"):
+        return None
+    return decoded
+
+
+def _extract_type0_unicode_widths(font_dict: Any) -> dict[str, float] | None:
+    """Type0 CIDFont(`/DW`, `/W`, `/ToUnicode`)에서 문자→em 폭 맵을 추출한다."""
+    if font_dict is None or not hasattr(font_dict, "get"):
+        return None
+    try:
+        descs = font_dict.get("/DescendantFonts")
+        if descs is None:
+            return None
+        if hasattr(descs, "get_object"):
+            descs = descs.get_object()
+        if not descs:
+            return None
+        desc_font = descs[0]
+        if hasattr(desc_font, "get_object"):
+            desc_font = desc_font.get_object()
+        if desc_font is None or not hasattr(desc_font, "get"):
+            return None
+
+        dw_raw = desc_font.get("/DW")
+        default_w = float(dw_raw) if dw_raw is not None else 1000.0
+        cid_widths: dict[int, float] = {}
+        w_arr = desc_font.get("/W")
+        if w_arr is not None:
+            if hasattr(w_arr, "get_object"):
+                w_arr = w_arr.get_object()
+            items = list(w_arr)
+            i = 0
+            while i + 1 < len(items):
+                c_start = int(items[i])
+                nxt = items[i + 1]
+                if hasattr(nxt, "get_object"):
+                    nxt = nxt.get_object()
+                if isinstance(nxt, list):
+                    for off, val in enumerate(nxt):
+                        cid_widths[c_start + off] = float(val)
+                    i += 2
+                elif i + 2 < len(items):
+                    c_end = int(nxt)
+                    val = float(items[i + 2])
+                    # 비정상적으로 거대한 범위를 방어한다
+                    if c_end >= c_start and (c_end - c_start) <= 65535:
+                        for cid in range(c_start, c_end + 1):
+                            cid_widths[cid] = val
+                    i += 3
+                else:
+                    break
+
+        tu = font_dict.get("/ToUnicode")
+        if tu is None:
+            return None
+        if hasattr(tu, "get_object"):
+            tu = tu.get_object()
+        if not hasattr(tu, "get_data"):
+            return None
+        cmap_text = bytes(tu.get_data()).decode("latin-1", errors="ignore")
+
+        uni_widths: dict[str, float] = {}
+        for block in _BFCHAR_BLOCK_RE.findall(cmap_text):
+            for cid_hex, uni_hex in _BFCHAR_PAIR_RE.findall(block):
+                ch = _decode_cmap_hex(uni_hex)
+                if ch is None or len(ch) != 1:
+                    continue
+                cid = int(cid_hex, 16)
+                w_em = cid_widths.get(cid, default_w) / 1000.0
+                if w_em > 0.0:
+                    uni_widths.setdefault(ch, w_em)
+
+        for block in _BFRANGE_BLOCK_RE.findall(cmap_text):
+            for lo_hex, hi_hex, dst_hex, arr_body in _BFRANGE_ENTRY_RE.findall(block):
+                lo = int(lo_hex, 16)
+                hi = int(hi_hex, 16)
+                if hi < lo or (hi - lo) > 4096:
+                    continue
+                if dst_hex:
+                    base_uni = _decode_cmap_hex(dst_hex)
+                    if base_uni is None or len(base_uni) != 1:
+                        continue
+                    base_cp = ord(base_uni)
+                    for off in range(hi - lo + 1):
+                        cp = base_cp + off
+                        if cp > 0x10FFFF:
+                            break
+                        ch = chr(cp)
+                        w_em = cid_widths.get(lo + off, default_w) / 1000.0
+                        if w_em > 0.0:
+                            uni_widths.setdefault(ch, w_em)
+                elif arr_body:
+                    for off, tok_hex in enumerate(_HEX_TOKEN_RE.findall(arr_body)):
+                        if lo + off > hi:
+                            break
+                        ch = _decode_cmap_hex(tok_hex)
+                        if ch is None or len(ch) != 1:
+                            continue
+                        w_em = cid_widths.get(lo + off, default_w) / 1000.0
+                        if w_em > 0.0:
+                            uni_widths.setdefault(ch, w_em)
+
+        return uni_widths or None
+    except Exception:
+        return None
+
+
+def estimate_text_width(
+    text: str,
+    font_size: float,
+    font_dict: Any = None,
+    *,
+    width_cache: dict[int, dict[str, float] | None] | None = None,
+) -> float:
+    """스팬 가로 폭(pt)을 `/Widths`·CIDFont `/W` 또는 유니코드 폭 휴리스틱으로 추정한다."""
     if not text or font_size <= 0.0:
         return 0.0
 
@@ -342,7 +481,28 @@ def estimate_text_width(text: str, font_size: float, font_dict: Any = None) -> f
         except Exception:
             pass
 
-    # 2. CJK(한글·한자·가나)와 라틴 문자 비율을 구분한 유니코드 휴리스틱
+        # 2. Type0 CIDFont의 /DescendantFonts(/W, /DW) + /ToUnicode 실측 폭 사용
+        cache_key = id(font_dict)
+        if width_cache is not None and cache_key in width_cache:
+            cid_uni_widths = width_cache[cache_key]
+        else:
+            cid_uni_widths = _extract_type0_unicode_widths(font_dict)
+            if width_cache is not None:
+                width_cache[cache_key] = cid_uni_widths
+        if cid_uni_widths:
+            total_em = 0.0
+            matched = 0
+            for ch in text:
+                w_em = cid_uni_widths.get(ch)
+                if w_em is not None:
+                    total_em += w_em
+                    matched += 1
+                else:
+                    total_em += _char_width_factor(ch)
+            if matched > 0:
+                return max(font_size * 0.25, total_em * font_size)
+
+    # 3. CJK(한글·한자·가나)와 라틴 문자 비율을 구분한 유니코드 휴리스틱
     total_factor = sum(_char_width_factor(ch) for ch in text)
     return max(font_size * 0.25, total_factor * font_size)
 
@@ -350,29 +510,42 @@ def estimate_text_width(text: str, font_size: float, font_dict: Any = None) -> f
 def _char_width_factor(ch: str) -> float:
     if ch == " ":
         return 0.28
-    if ch in "ilI1.,:;|!'`":
+    if ch in "ilI.,:;|!'`":
         return 0.28
     if ch in "mwMW@#%&":
         return 0.78
     eaw = unicodedata.east_asian_width(ch)
     if eaw in ("W", "F"):
-        return 0.91
+        return 0.97
     if ch.isupper():
         return 0.64
     if ch.isdigit():
-        return 0.54
+        return 0.56
     return 0.50
 
 
 def detect_font_style(font_name: str, font_dict: Any = None) -> tuple[bool, bool]:
     """글꼴 이름과 FontDescriptor 플래그에서 굵게(bold)·기울임(italic) 여부를 판정한다."""
     lower = font_name.lower()
-    is_bold = any(tok in lower for tok in ("bold", "black", "heavy", "semibold", "demi", "medi"))
+    is_bold = any(
+        tok in lower
+        for tok in ("bold", "black", "heavy", "semibold", "demi", "medi", "headline", "h2hdr")
+    )
     is_italic = any(tok in lower for tok in ("italic", "oblique", "slant"))
 
     if font_dict is not None and hasattr(font_dict, "get"):
         try:
             desc = font_dict.get("/FontDescriptor")
+            if desc is None:
+                descs = font_dict.get("/DescendantFonts")
+                if descs is not None and hasattr(descs, "get_object"):
+                    descs = descs.get_object()
+                if descs:
+                    first_desc = descs[0]
+                    if hasattr(first_desc, "get_object"):
+                        first_desc = first_desc.get_object()
+                    if first_desc is not None and hasattr(first_desc, "get"):
+                        desc = first_desc.get("/FontDescriptor")
             if desc is not None and hasattr(desc, "get_object"):
                 desc = desc.get_object()
             if desc is not None and hasattr(desc, "get"):

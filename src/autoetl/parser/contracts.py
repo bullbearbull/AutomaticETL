@@ -7,9 +7,10 @@ PDF를 우선 깊게 구현하되, 다음 단계에서 PPTX·DOCX·HWPX 어댑�
 
 from __future__ import annotations
 
+import unicodedata
 from enum import Enum
 
-from pydantic import Field, NonNegativeInt, PositiveInt
+from pydantic import Field, NonNegativeInt, PositiveInt, field_validator
 
 from autoetl.contracts.common import ContractModel
 
@@ -133,6 +134,12 @@ class DocumentMetadata(ContractModel):
     producer: str | None = None
     has_outline: bool = False
     is_encrypted: bool = False
+
+    @field_validator("source_path")
+    @classmethod
+    def _normalize_source_path_nfc(cls, value: str) -> str:
+        # macOS 등에서 전달된 NFD 분해 한글 파일명을 표준 NFC로 정규화한다.
+        return unicodedata.normalize("NFC", value)
 
 
 class OutlineEntry(ContractModel):

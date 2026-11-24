@@ -158,6 +158,192 @@ def _float_operand(val: Any) -> float:
     return float(val)
 
 
+def _try_segments_as_axis_rect(
+    segments: list[tuple[tuple[float, float], tuple[float, float]]],
+    coord: PageCoordTransform,
+) -> tuple[float, float, float, float] | None:
+    """닫힌 4변 축 정렬 다각형(`m l l l [l] h`)이면 정규화 사각형 좌표를 반환한다."""
+    transformed: list[tuple[float, float, float, float]] = []
+    for p1, p2 in segments:
+        nx0, ny0 = coord.point(p1[0], p1[1])
+        nx1, ny1 = coord.point(p2[0], p2[1])
+        if math.hypot(nx1 - nx0, ny1 - ny0) >= 0.05:
+            transformed.append((nx0, ny0, nx1, ny1))
+    if len(transformed) != 4:
+        return None
+
+    h_edges: list[tuple[float, float, float]] = []  # (y, x0, x1)
+    v_edges: list[tuple[float, float, float]] = []  # (x, y0, y1)
+    for nx0, ny0, nx1, ny1 in transformed:
+        if abs(ny1 - ny0) <= 1.0 and abs(nx1 - nx0) >= 0.5:
+            h_edges.append(((ny0 + ny1) / 2.0, min(nx0, nx1), max(nx0, nx1)))
+        elif abs(nx1 - nx0) <= 1.0 and abs(ny1 - ny0) >= 0.5:
+            v_edges.append(((nx0 + nx1) / 2.0, min(ny0, ny1), max(ny0, ny1)))
+        else:
+            return None
+
+    if len(h_edges) != 2 or len(v_edges) != 2:
+        return None
+
+    h_edges.sort(key=lambda e: e[0])
+    v_edges.sort(key=lambda e: e[0])
+    top_y, hx0_a, hx1_a = h_edges[0]
+    bot_y, hx0_b, hx1_b = h_edges[1]
+    left_x, vy0_a, vy1_a = v_edges[0]
+    right_x, vy0_b, vy1_b = v_edges[1]
+
+    if bot_y - top_y < 0.5 or right_x - left_x < 0.5:
+        return None
+    if (
+        abs(hx0_a - left_x) > 1.5
+        or abs(hx0_b - left_x) > 1.5
+        or abs(hx1_a - right_x) > 1.5
+        or abs(hx1_b - right_x) > 1.5
+        or abs(vy0_a - top_y) > 1.5
+        or abs(vy0_b - top_y) > 1.5
+        or abs(vy1_a - bot_y) > 1.5
+        or abs(vy1_b - bot_y) > 1.5
+    ):
+        return None
+    return (left_x, top_y, right_x, bot_y)
+
+
+def _stitch_dotted_lines(
+    dots: list[tuple[float, float, float, float]],
+    *,
+    is_horizontal: bool,
+) -> list[RawVectorLine]:
+    """동일 축 위에 반복 배치된 점선·파선 조각(`0.05~8pt`)을 연속 직선으로 복원한다."""
+    if len(dots) < 3:
+        return []
+
+    ordered = sorted(dots, key=lambda d: (d[0], d[1]))
+    buckets: list[list[tuple[float, float, float, float]]] = []
+    for item in ordered:
+        if not buckets or item[0] - buckets[-1][0][0] > 0.8:
+            buckets.append([item])
+        else:
+            buckets[-1].append(item)
+
+    reconstructed: list[RawVectorLine] = []
+
+    def emit_run(
+        run_count: int,
+        run_axis_sum: float,
+        run_w_sum: float,
+        start: float,
+        end: float,
+    ) -> None:
+        if run_count >= 3 and (end - start) >= 8.0:
+            axis_val = run_axis_sum / run_count
+            avg_w = run_w_sum / run_count
+            if is_horizontal:
+                reconstructed.append(
+                    RawVectorLine(
+                        x0=start,
+                        top=axis_val,
+                        x1=end,
+                        bottom=axis_val,
+                        stroke_width=avg_w,
+                        is_stroked=True,
+                    )
+                )
+            else:
+                reconstructed.append(
+                    RawVectorLine(
+                        x0=axis_val,
+                        top=start,
+                        x1=axis_val,
+                        bottom=end,
+                        stroke_width=avg_w,
+                        is_stroked=True,
+                    )
+                )
+
+    for bucket in buckets:
+        if len(bucket) < 3:
+            continue
+        bucket.sort(key=lambda d: d[1])
+        axis_sum = bucket[0][0]
+        run_start = bucket[0][1]
+        run_end = bucket[0][2]
+        max_dot = max(0.1, run_end - run_start)
+        w_sum = bucket[0][3]
+        count = 1
+
+        for axis_v, a0, a1, sw in bucket[1:]:
+            dot_len = max(0.1, a1 - a0)
+            gap_limit = min(5.0, max(2.8, max(max_dot, dot_len) * 4.5))
+            if a0 <= run_end + gap_limit:
+                run_end = max(run_end, a1)
+                axis_sum += axis_v
+                w_sum += sw
+                max_dot = max(max_dot, dot_len)
+                count += 1
+            else:
+                emit_run(count, axis_sum, w_sum, run_start, run_end)
+                axis_sum = axis_v
+                run_start = a0
+                run_end = a1
+                max_dot = dot_len
+                w_sum = sw
+                count = 1
+        emit_run(count, axis_sum, w_sum, run_start, run_end)
+    return reconstructed
+
+
+def _deduplicate_shadow_spans(spans: list[RawTextSpan]) -> list[RawTextSpan]:
+    """그림자·의사 볼드(faux-bold)로 동일 좌표에 중복 출력된 텍스트 스팬을 1개로 정리한다."""
+    if len(spans) < 2:
+        return spans
+
+    kept: list[RawTextSpan] = []
+    seen_by_text: dict[str, list[int]] = {}
+
+    for sp in spans:
+        key = sp.text.strip()
+        if not key:
+            kept.append(sp)
+            continue
+
+        dup_idx: int | None = None
+        for prev_idx in reversed(seen_by_text.get(key, ())):
+            prev = kept[prev_idx]
+            if prev.orientation != sp.orientation:
+                continue
+            min_fs = max(1.0, min(prev.font_size, sp.font_size))
+            if abs(prev.font_size - sp.font_size) > max(0.5, min_fs * 0.08):
+                continue
+            pos_tol = max(2.2, min_fs * 0.22)
+            if abs(prev.top - sp.top) > pos_tol or abs(prev.x0 - sp.x0) > pos_tol:
+                continue
+            x_ov = min(prev.x1, sp.x1) - max(prev.x0, sp.x0)
+            min_w = max(0.5, min(prev.width, sp.width))
+            if x_ov >= min_w * 0.45:
+                dup_idx = prev_idx
+                break
+
+        if dup_idx is not None:
+            prev = kept[dup_idx]
+            kept[dup_idx] = RawTextSpan(
+                text=sp.text,
+                x0=sp.x0,
+                top=sp.top,
+                x1=sp.x1,
+                bottom=sp.bottom,
+                font_name=sp.font_name,
+                font_size=sp.font_size,
+                is_bold=prev.is_bold or sp.is_bold,
+                is_italic=prev.is_italic or sp.is_italic,
+                orientation=sp.orientation,
+            )
+        else:
+            seen_by_text.setdefault(key, []).append(len(kept))
+            kept.append(sp)
+
+    return kept
+
+
 def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPageData:
     """단일 PDF 페이지에서 텍스트 스팬, 벡터 선·사각형·곡선, 배치 이미지를 추출한다."""
     crop = page.cropbox if page.cropbox is not None else page.mediabox
@@ -175,11 +361,15 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
     rects: list[RawVectorRect] = []
     curves: list[RawVectorCurve] = []
     images: list[RawImagePlacement] = []
+    tiny_h_dots: list[tuple[float, float, float, float]] = []
+    tiny_v_dots: list[tuple[float, float, float, float]] = []
+    font_width_cache: dict[int, dict[str, float] | None] = {}
 
     root_resources = _resolve_obj(page.get("/Resources"))
     form_stack: list[_FormFrame] = []
     line_width_stack: list[float] = [1.0]
     char_spacing_stack: list[float] = [0.0]
+    h_scale_stack: list[float] = [100.0]
     fill_color_stack: list[tuple[float, float, float] | None] = [None]
 
     # 현재 visitor_text 플러시 사이클 동안 누적된 대간격 TJ/Tc/Td 점프 힌트
@@ -187,6 +377,7 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
     pending_space_cuts: list[tuple[int, float]] = []  # (nonleading_space_idx, jump_em)
     pending_nonspace_count = 0
     pending_space_count = 0
+    pending_tj_kern_em = 0.0
     pending_ascii_exact = True
     pending_td_lead: tuple[float, float] | None = None
     pending_td_jumps: list[tuple[float, float]] = []
@@ -234,35 +425,66 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
 
     def flush_path(*, stroked: bool, filled: bool) -> None:
         stroke_w = line_width_stack[-1] if line_width_stack else 1.0
-        for p1, p2 in pending_segments:
-            nx0, ny0 = coord.point(p1[0], p1[1])
-            nx1, ny1 = coord.point(p2[0], p2[1])
-            seg_len = math.hypot(nx1 - nx0, ny1 - ny0)
-            if seg_len < 1.0:
-                continue
-            if abs(ny1 - ny0) <= 2.0 or abs(nx1 - nx0) <= 2.0:
-                lines.append(
-                    RawVectorLine(
-                        x0=min(nx0, nx1),
-                        top=min(ny0, ny1),
-                        x1=max(nx0, nx1),
-                        bottom=max(ny0, ny1),
-                        stroke_width=stroke_w,
-                        is_stroked=stroked,
-                    )
-                )
-            else:
-                curves.append(
-                    RawVectorCurve(
-                        x0=min(nx0, nx1),
-                        top=min(ny0, ny1),
-                        x1=max(nx0, nx1),
-                        bottom=max(ny0, ny1),
-                        segment_count=1,
-                    )
-                )
-
         fill_rgb = fill_color_stack[-1] if (filled and fill_color_stack) else None
+
+        # `m l l l h f*` 채움 다각형은 4개 선분 대신 RawVectorRect로 복원한다.
+        poly_rect = (
+            _try_segments_as_axis_rect(pending_segments, coord)
+            if (filled and pending_segments and not pending_rects)
+            else None
+        )
+        if poly_rect is not None:
+            rx0, ry0, rx1, ry1 = poly_rect
+            rects.append(
+                RawVectorRect(
+                    x0=rx0,
+                    top=ry0,
+                    x1=rx1,
+                    bottom=ry1,
+                    is_stroked=stroked,
+                    is_filled=filled,
+                    stroke_width=stroke_w,
+                    fill_color=fill_rgb,
+                )
+            )
+        else:
+            for p1, p2 in pending_segments:
+                nx0, ny0 = coord.point(p1[0], p1[1])
+                nx1, ny1 = coord.point(p2[0], p2[1])
+                seg_len = math.hypot(nx1 - nx0, ny1 - ny0)
+                if stroked and 0.05 <= seg_len < 8.0:
+                    if abs(ny1 - ny0) <= 0.6 and abs(nx1 - nx0) >= 0.05:
+                        tiny_h_dots.append(
+                            ((ny0 + ny1) / 2.0, min(nx0, nx1), max(nx0, nx1), stroke_w)
+                        )
+                    elif abs(nx1 - nx0) <= 0.6 and abs(ny1 - ny0) >= 0.05:
+                        tiny_v_dots.append(
+                            ((nx0 + nx1) / 2.0, min(ny0, ny1), max(ny0, ny1), stroke_w)
+                        )
+                if seg_len < 1.0:
+                    continue
+                if abs(ny1 - ny0) <= 2.0 or abs(nx1 - nx0) <= 2.0:
+                    lines.append(
+                        RawVectorLine(
+                            x0=min(nx0, nx1),
+                            top=min(ny0, ny1),
+                            x1=max(nx0, nx1),
+                            bottom=max(ny0, ny1),
+                            stroke_width=stroke_w,
+                            is_stroked=stroked,
+                        )
+                    )
+                else:
+                    curves.append(
+                        RawVectorCurve(
+                            x0=min(nx0, nx1),
+                            top=min(ny0, ny1),
+                            x1=max(nx0, nx1),
+                            bottom=max(ny0, ny1),
+                            segment_count=1,
+                        )
+                    )
+
         for rx0, ry0, rx1, ry1 in pending_rects:
             if rx1 - rx0 < 0.5 and ry1 - ry0 < 0.5:
                 continue
@@ -295,7 +517,7 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
 
     def _record_text_show_splits(elems: list[Any]) -> None:
         nonlocal pending_nonspace_count, pending_space_count
-        nonlocal pending_ascii_exact, saw_nonspace_since_flush
+        nonlocal pending_ascii_exact, saw_nonspace_since_flush, pending_tj_kern_em
         cur_tc = char_spacing_stack[-1] if char_spacing_stack else 0.0
         cur_fs = last_draw_fs if last_draw_fs > 1e-4 else 1.0
         tc_em = cur_tc / cur_fs
@@ -319,6 +541,8 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
 
             # PDF 명세(ISO 32000-1 9.4.4): 글자 간 추가 전진 = Tc - TJ/1000 (em 환산)
             if pending_nonspace_count > 0:
+                if abs(tj_num) < 150.0 and tj_num != 0.0:
+                    pending_tj_kern_em += -tj_num / 1000.0
                 if txt_s.strip():
                     extra_em = tc_em - (tj_num / 1000.0)
                     if extra_em >= 0.95:
@@ -353,6 +577,7 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
         if op == b"q":
             line_width_stack.append(line_width_stack[-1] if line_width_stack else 1.0)
             char_spacing_stack.append(char_spacing_stack[-1] if char_spacing_stack else 0.0)
+            h_scale_stack.append(h_scale_stack[-1] if h_scale_stack else 100.0)
             fill_color_stack.append(fill_color_stack[-1] if fill_color_stack else None)
             return
         if op == b"Q":
@@ -360,6 +585,8 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
                 line_width_stack.pop()
             if len(char_spacing_stack) > 1:
                 char_spacing_stack.pop()
+            if len(h_scale_stack) > 1:
+                h_scale_stack.pop()
             if len(fill_color_stack) > 1:
                 fill_color_stack.pop()
             return
@@ -395,6 +622,12 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
         if op == b"Tc" and args:
             with contextlib.suppress(TypeError, ValueError):
                 char_spacing_stack[-1] = _float_operand(args[0])
+            return
+        if op == b"Tz" and args:
+            with contextlib.suppress(TypeError, ValueError):
+                tz_val = abs(_float_operand(args[0]))
+                if 10.0 <= tz_val <= 500.0:
+                    h_scale_stack[-1] = tz_val
             return
         if op == b"Tf" and len(args) >= 2:
             with contextlib.suppress(TypeError, ValueError):
@@ -587,8 +820,16 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
         is_italic: bool,
         *,
         allow_pen_advance: bool = True,
+        tj_kern_em: float = 0.0,
     ) -> float:
-        text_w = estimate_text_width(piece, eff_size, font_dict)
+        text_w = estimate_text_width(
+            piece, eff_size, font_dict, width_cache=font_width_cache
+        )
+        if tj_kern_em != 0.0:
+            text_w = max(eff_size * 0.25, text_w + tj_kern_em * eff_size)
+        h_scale = (h_scale_stack[-1] / 100.0) if h_scale_stack else 1.0
+        if 0.1 <= h_scale <= 5.0 and abs(h_scale - 1.0) > 1e-4:
+            text_w *= h_scale
         if scale_x > 1e-4 and scale_y > 1e-4:
             aspect = scale_x / scale_y
             if 0.2 <= aspect <= 5.0:
@@ -628,6 +869,34 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
         sx0, stop, sx1, sbot = coord.rect_from_points(pdf_corners)
         eff_orientation = (orientation + coord.rotation) % 360
 
+        # 그림자·의사 볼드(미세 오프셋 중복 출력)는 펜 전진 보정 대신 즉시 교체
+        is_faux_duplicate = (
+            eff_orientation == 0
+            and spans
+            and spans[-1].orientation == 0
+            and piece.strip()
+            and spans[-1].text.strip() == piece.strip()
+            and abs(eff_size - spans[-1].font_size)
+            <= max(0.5, min(eff_size, spans[-1].font_size) * 0.08)
+            and abs(stop - spans[-1].top) <= max(2.2, eff_size * 0.22)
+            and abs(sx0 - spans[-1].x0) <= max(2.2, eff_size * 0.22)
+        )
+        if is_faux_duplicate:
+            prev = spans[-1]
+            spans[-1] = RawTextSpan(
+                text=piece,
+                x0=sx0,
+                top=stop,
+                x1=sx1,
+                bottom=sbot,
+                font_name=font_name,
+                font_size=round(eff_size, 2),
+                is_bold=prev.is_bold or is_bold,
+                is_italic=prev.is_italic or is_italic,
+                orientation=eff_orientation,
+            )
+            return text_w
+
         # pypdf는 같은 BT..ET 안에서 Tf(글꼴 전환)만 일어날 때 tm을 앞 스팬 폭만큼
         # 전진시키지 않아 같은 (x0, top)으로 보고한다. 직전 스팬과 좌표가 겹치면 펜 전진 보정.
         if (
@@ -661,12 +930,13 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
 
     def on_text(text: str, cm: Any, tm: Any, font_dict: Any, font_size: float) -> None:
         nonlocal saw_text_draw_since_flush, saw_nonspace_since_flush
-        nonlocal pending_nonspace_count, pending_space_count
+        nonlocal pending_nonspace_count, pending_space_count, pending_tj_kern_em
         nonlocal pending_ascii_exact, pending_td_lead
 
         glyph_cuts = list(pending_glyph_cuts)
         space_cuts = list(pending_space_cuts)
         tracked_nonspace = pending_nonspace_count
+        tj_kern_em = pending_tj_kern_em
         ascii_exact = pending_ascii_exact
         td_lead = pending_td_lead
         td_jumps_raw = list(pending_td_jumps)
@@ -675,6 +945,7 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
         pending_space_cuts.clear()
         pending_nonspace_count = 0
         pending_space_count = 0
+        pending_tj_kern_em = 0.0
         pending_ascii_exact = True
         pending_td_lead = None
         pending_td_jumps.clear()
@@ -692,6 +963,37 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
 
         cleaned = _sanitize_pdf_text(text, font_name)
         if not cleaned.strip():
+            # 글꼴·굵기 전환 직전에 단독 공백(' ')만 분리 플러시된 경우 직전 스팬에 공백 힌트 보존
+            if (
+                " " in cleaned
+                and spans
+                and spans[-1].orientation == 0
+                and not spans[-1].text.endswith(" ")
+            ):
+                eff_cm_sp = effective_cm(cm)
+                trm_sp = compose_matrix(to_matrix6(tm), eff_cm_sp)
+                scale_y_sp = math.hypot(trm_sp[2], trm_sp[3])
+                eff_fs_sp = float(font_size) * (scale_y_sp if scale_y_sp > 1e-4 else 1.0)
+                if eff_fs_sp <= 0.5:
+                    eff_fs_sp = max(1.0, float(font_size) if font_size else 10.0)
+                sp_x, sp_top = coord.point(trm_sp[4], trm_sp[5] + eff_fs_sp * 0.82)
+                prev_sp = spans[-1]
+                if (
+                    abs(sp_top - prev_sp.top) <= max(2.5, eff_fs_sp * 0.3)
+                    and prev_sp.x0 <= sp_x <= prev_sp.x1 + eff_fs_sp * 0.8
+                ):
+                    spans[-1] = RawTextSpan(
+                        text=prev_sp.text + " ",
+                        x0=prev_sp.x0,
+                        top=prev_sp.top,
+                        x1=prev_sp.x1,
+                        bottom=prev_sp.bottom,
+                        font_name=prev_sp.font_name,
+                        font_size=prev_sp.font_size,
+                        is_bold=prev_sp.is_bold,
+                        is_italic=prev_sp.is_italic,
+                        orientation=prev_sp.orientation,
+                    )
             return
 
         eff_cm = effective_cm(cm)
@@ -832,6 +1134,7 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
             is_bold,
             is_italic,
             allow_pen_advance=allow_pen,
+            tj_kern_em=tj_kern_em,
         )
 
     page.extract_text(
@@ -839,6 +1142,12 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
         visitor_operand_before=on_op_before,
         visitor_operand_after=on_op_after,
     )
+
+    if tiny_h_dots:
+        lines.extend(_stitch_dotted_lines(tiny_h_dots, is_horizontal=True))
+    if tiny_v_dots:
+        lines.extend(_stitch_dotted_lines(tiny_v_dots, is_horizontal=False))
+    spans = _deduplicate_shadow_spans(spans)
 
     return RawPageData(
         page=page_number,

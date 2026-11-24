@@ -33,13 +33,17 @@ _PAGE_NUM_ONLY_RE = re.compile(
 )
 _DIGIT_NORM_RE = re.compile(r"\d+")
 _HEADING_PREFIX_RE = re.compile(
-    r"^(?:제\s*\d+\s*[장절관편부조]|(?:chapter|section|part)\s+\d+|"
+    r"^(?:제\s*\d+\s*[장절관편부조]|(?:참고|별첨|붙임)\s*\d+|"
+    r"(?:chapter|section|part)\s+\d+|"
+    r"\[[❶❷❸❹❺❻❼❽❾❿➊➋➌➍➎➏➐➑➒➓①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮]\s*|"
     r"\d+(?:\.\d+){0,3}\.?\s+\S|[IVXLCDM]+\.\s+\S|[가-힣]\.\s+\S)",
     re.IGNORECASE,
 )
 _LIST_ITEM_RE = re.compile(
-    r"^\s*(?:[•▪▫■□●○◦◆◇▶▷※·\-\u2013—\*]\s+|"
-    r"\(?[0-9a-zA-Z가-하]\)\s+|[0-9]{1,2}\)\s+|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮]\s*)"
+    r"^\s*(?:[•▪▫■□●○◦◆◇※·\-\u2013—\*]\s+|"
+    r"[▶▷▸▹►]\s*|"
+    r"\(?[0-9a-zA-Z가-하]\)\s+|[0-9]{1,2}\)\s+|"
+    r"[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮❶❷❸❹❺❻❼❽❾❿➊➋➌➍➎➏➐➑➒➓]\s*)"
 )
 _CAPTION_TABLE_RE = re.compile(
     r"^\s*(?:<|\[)?\s*(?:표|table|tbl\.?)\s*\d+(?:[-.]\d+)*\s*(?:>|\]|:|\.)?",
@@ -94,7 +98,7 @@ class LayoutTextBlock:
     confidence: float
 
 
-_SUPERSCRIPT_REF_RE = re.compile(r"^\s*(?:\d{1,2}\)|[\u2217*†‡§])\s*$")
+_SUPERSCRIPT_REF_RE = re.compile(r"^\s*(?:\d{1,2}\s*[)\]｣」]|[\u2217*]{1,3}|[†‡§※])\s*$")
 
 
 @dataclass(frozen=True)
@@ -173,6 +177,7 @@ def _build_lines_from_spans(
                 "•",
                 "o",
                 "O",
+                "ㅇ",
                 "▪",
                 "▫",
                 "■",
@@ -180,6 +185,9 @@ def _build_lines_from_spans(
                 "●",
                 "○",
                 "◦",
+                "▸",
+                "▹",
+                "►",
                 "·",
                 "-",
                 "※",
@@ -328,14 +336,20 @@ def _find_vertical_gutters_in_band(
                         or right_chars < 20
                     ):
                         continue
-                    # 좌우 컬럼이 실제로 수직으로 겹치는지 확인(들여쓴 서명·주석 오탐 방지)
+                    # 좌우 컬럼이 실제로 수직 겹치는지 확인(서명·주석·표 위 단위 표기 오탐 방지)
                     l_top = min(ln.top for ln in left_lines)
                     l_bot = max(ln.bottom for ln in left_lines)
                     r_top = min(ln.top for ln in right_lines)
                     r_bot = max(ln.bottom for ln in right_lines)
                     ov = min(l_bot, r_bot) - max(l_top, r_top)
                     min_h = max(1.0, min(l_bot - l_top, r_bot - r_top))
-                    if ov >= body_font_size * 1.5 and ov / min_h >= 0.25:
+                    pair_tol = max(48.0, body_font_size * 3.5)
+                    has_parallel_pair = any(
+                        abs(ll.y_center - rl.y_center) <= pair_tol
+                        for ll in left_lines
+                        for rl in right_lines
+                    )
+                    if ov >= body_font_size * 1.5 and ov / min_h >= 0.25 and has_parallel_pair:
                         gutters.append(round(gutter_x, 2))
         else:
             i += 1
@@ -347,6 +361,7 @@ def _split_into_reading_groups(
     lines: list[TextLine],
     page_w: float,
     body_font_size: float,
+    excluded_boxes: tuple[tuple[float, float, float, float], ...] = (),
 ) -> tuple[list[tuple[int, list[TextLine]]], int, list[float], float]:
     """혼합 레이아웃(전폭 배너 + 다단 본문)을 지원하며 읽기 순서 그룹을 구성한다.
 
@@ -362,7 +377,7 @@ def _split_into_reading_groups(
     content_w = max(1.0, content_x1 - content_x0)
     mid_x = (content_x0 + content_x1) / 2.0
 
-    # 1단계: 페이지 중앙을 가로지르는 전폭 줄(제목 배너·초록·전폭 문장)을 경계로 수평 밴드 분할
+    # 1단계: 페이지 중앙을 가로지르는 전폭 줄·전폭 표/시각 영역을 경계로 수평 밴드 분할
     def is_full_width(ln: TextLine) -> bool:
         return (
             ln.width >= max(content_w * 0.58, page_w * 0.50)
@@ -370,10 +385,23 @@ def _split_into_reading_groups(
             and ln.x1 > mid_x + 20.0
         )
 
+    fw_divider_ys = sorted(
+        (box[1] + box[3]) / 2.0
+        for box in excluded_boxes
+        if (box[2] - box[0]) >= max(content_w * 0.55, page_w * 0.48)
+        and box[0] < mid_x - 20.0
+        and box[2] > mid_x + 20.0
+    )
+
     bands: list[tuple[bool, list[TextLine]]] = []  # (is_banner, band_lines)
     for ln in ordered:
         banner = is_full_width(ln)
-        if not bands or bands[-1][0] != banner:
+        crossed_divider = False
+        if bands and fw_divider_ys:
+            prev_y = bands[-1][1][-1].y_center
+            cur_y = ln.y_center
+            crossed_divider = any(prev_y < div_y < cur_y for div_y in fw_divider_ys)
+        if not bands or bands[-1][0] != banner or crossed_divider:
             bands.append((banner, [ln]))
         else:
             bands[-1][1].append(ln)
@@ -452,7 +480,7 @@ def _classify_line_kind(
     if _CAPTION_TABLE_RE.match(text) or _CAPTION_FIGURE_RE.match(text):
         return ElementKind.CAPTION, None, 0.92
 
-    if _LIST_ITEM_RE.match(text) or text.startswith(("o ", "O ")):
+    if _LIST_ITEM_RE.match(text) or text.startswith(("o ", "O ", "ㅇ ")):
         return ElementKind.LIST_ITEM, None, 0.90
 
     if line.is_monospace and len(text) >= 4:
@@ -695,6 +723,7 @@ def analyze_page_layout(
     header_footer_span_indices: frozenset[int],
     body_font_size: float | None,
     outline: list[OutlineEntry],
+    excluded_boxes: tuple[tuple[float, float, float, float], ...] = (),
 ) -> PageLayoutResult:
     """한 페이지의 텍스트 레이아웃(다단·읽기 순서·제목·목록·머리글/바닥글)을 분석한다."""
     all_sizes = [sp.font_size for sp in page.spans if sp.text.strip() and sp.font_size > 0]
@@ -734,7 +763,7 @@ def analyze_page_layout(
     body_lines = _build_lines_from_spans(page, body_indices)
 
     reading_groups, col_count, gutters, mc_ratio = _split_into_reading_groups(
-        body_lines, page.width, ref_body_size
+        body_lines, page.width, ref_body_size, excluded_boxes=excluded_boxes
     )
     text_strategy = (
         ParseStrategy.MULTI_COLUMN_LAYOUT

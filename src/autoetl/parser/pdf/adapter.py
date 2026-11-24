@@ -843,6 +843,10 @@ class PdfDocumentAdapter:
             else:
                 tables_res = ruled_res
 
+            excluded_boxes = tables_res.consumed_table_boxes + tuple(
+                (v.bbox.x0, v.bbox.top, v.bbox.x1, v.bbox.bottom)
+                for v in visuals_res.visual_regions
+            )
             layout_res = analyze_page_layout(
                 raw_page,
                 excluded_span_indices=(
@@ -851,6 +855,7 @@ class PdfDocumentAdapter:
                 header_footer_span_indices=hf_spans,
                 body_font_size=body_font_size,
                 outline=extracted.outline,
+                excluded_boxes=excluded_boxes,
             )
 
             tables, visuals = link_captions_to_elements(

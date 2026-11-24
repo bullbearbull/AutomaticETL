@@ -127,3 +127,45 @@ def test_ui_server_end_to_end_parse_and_zip_download() -> None:
         with pytest.raises(urllib.error.HTTPError) as exc_info:
             opener.open(bad_req)
         assert exc_info.value.code == 400
+
+
+def test_ui_server_korean_nfd_filename_normalized_and_rfc5987_download() -> None:
+    """macOS NFD 한글 파일명 NFC 정규화와 RFC 5987 UTF-8 ZIP 다운로드 헤더를 검증한다."""
+    import unicodedata
+    from urllib.parse import unquote
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    nfc_name = "(보도자료) 2026년 제2차 보조금관리위원회 개최.docx"
+    nfd_name = unicodedata.normalize("NFD", nfc_name)
+    assert nfd_name != nfc_name
+
+    with create_ui_server(host="127.0.0.1", port=0) as srv:
+        docx_bytes = _make_mini_docx_bytes("한글 파일명 테스트 본문")
+        req_payload = json.dumps(
+            {
+                "filename": nfd_name,
+                "content_base64": base64.b64encode(docx_bytes).decode("ascii"),
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            f"{srv.url}/api/parse",
+            data=req_payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with opener.open(req) as resp:
+            assert resp.status == 200
+            parsed = json.loads(resp.read().decode("utf-8"))
+            assert parsed["document"]["source_path"] == nfc_name
+            assert unicodedata.is_normalized("NFC", parsed["document"]["source_path"])
+            assert f"# {nfc_name}" in parsed["markdown"]
+            bundle_id = parsed["bundle_id"]
+
+        with opener.open(f"{srv.url}/api/download/{bundle_id}") as resp:
+            assert resp.status == 200
+            cd = resp.headers.get("Content-Disposition", "")
+            assert "filename*=UTF-8''" in cd
+            utf8_part = cd.split("filename*=UTF-8''", 1)[1].split(";", 1)[0]
+            expected_zip = "(보도자료) 2026년 제2차 보조금관리위원회 개최_autoetl_bundle.zip"
+            assert unquote(utf8_part) == expected_zip
+            assert "___________" not in cd
