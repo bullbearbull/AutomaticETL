@@ -9,7 +9,7 @@
 A local document parser and ETL tool that runs in a single Python process.  
 Deterministic code extracts digital text and native tables from PDF, Microsoft Office, and Korean Hancom (HWP/HWPX) documents first, and only routes cropped visual regions (scanned pages, charts, diagrams, formulas) to optional AI models (ONNX layout detection + OCR/VLM).
 
-> Status: **`v0.2.0-beta.3`** (installable from Git; not yet on PyPI).
+> Status: **`v0.2.0-beta.4`** (installable from Git; not yet on PyPI).
 > - **Document parser (`parse`, `ui`, `doctor`)**: ready to use across 8 formats, with RAG chunking, folder batching, a local web UI, and optional ONNX layout / OCR-VLM backends.
 > - **Deterministic Structured ETL (`analyze`, `ui`)**: zero-AI (0MB) multi-file CSV/TSV/XLSX analysis — missing values, 10-role column classification, structured string pattern decomposition, cross-table FKs (including hidden string-slot FKs), optimal PK selection, verified PostgreSQL DDL, Mermaid ERD, and topological Load Plan.
 > - **Original-Text Document Index & Retrieval (`index`, `query`)**: VectorDB-free, LLM-free **SQLite FTS5 (Korean 2-gram) + outline tree + sandboxed DuckDB table SQL** (0MB default) plus optional **ultra-lightweight CPU ONNX Cross-Encoder reranker** (100M–280M) returning full unbroken original-text `EvidencePack`s and agent/MCP tool schemas.
