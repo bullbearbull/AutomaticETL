@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+## [0.2.0-beta.1] — 2026-11-24 (`0.2.0b1`)
+
+0MB 결정론 다중 테이블 ETL 엔진과 VectorDB 없는 원문 문서 인덱스·리트리벌 엔진을 추가한 두 번째 베타 릴리스.
+
 ### Added
 
 - **결정론 다중 테이블 ETL 분석·관계도·최적 DB 적재 계획 엔진 (0MB AI, Milestones E1–E5)**:
@@ -17,6 +21,20 @@
   - `src/autoetl/docindex/`: 0MB 기본 **SQLite FTS5(한글 2-gram + 공백 혼합 토크나이저) + 제목 계층 목차 트리 + 원문 섹션 전체 조회 + 격리 DuckDB 표 SQL(`SELECT/WITH` 읽기 전용 검증)** 엔진(`DocumentIndex`, `build_document_index`, `EvidencePack`)
   - 선택 초경량 CPU ONNX Cross-Encoder 리랭커(`OnnxCrossEncoderReranker`): `bge-reranker-v2-m3(-ko)` / `bge-reranker-base` 등 100M–280M INT8 모델 지연 로딩, 장문 슬라이딩 창 최대 점수 집계, 원문 전체 무손실 반환
   - 프레임워크 비종속 에이전트/MCP 표준 도구 인터페이스(`DocumentToolkit` — `search_documents`, `get_outline`, `read_section`, `list_tables`, `query_table` 5종 + JSON Schema 스펙 + 단일 디스패처) 및 CLI(`autoetl index`, `autoetl query`)
+
+### Changed
+
+- **서비스 아키텍처 다이어그램 v0.2 갱신**: `assets/architecture.svg`·`assets/architecture.en.svg`를 3-트랙 구조(정형 ETL 0MB · 비정형 파싱 + 선택 OCR/VLM · 원문 문서 인덱스 0MB + 선택 CPU ONNX 리랭커)로 전면 개편
+
+### Fixed
+
+- **공개 실무 데이터(Northwind 11 CSV · Financial Sample XLSX · PDF/DOCX/PPTX/HWPX/HWP) 실전 검증 보완**:
+  - 비인용 쉼표가 섞인 비표준 CSV에서 DuckDB 기본 dialect 스니퍼 실패 시 완화 파서(`strict_mode=false, null_padding=true, ignore_errors=true`) 자동 복구 및 경고 기록
+  - 영문 우편번호(`EC1 4SD`) 등이 첫 데이터 행에 있을 때 2행 다중 헤더로 오인하던 문제 해결(2행 이상 헤더 판정에 텍스트 엄격 과반 `> 0.5` 요구)
+  - 영문 Title-Case 단어(`January`, `High`) 및 공백 2단어 인명(`Maria Anders`)이 규칙 문자열로 오분해되던 현상 차단
+  - 고유값 20개 초과 반복 문자열 FK 코드(`orders.customerID`)가 `free_text`로 빠지지 않고 `code_identifier`로 인식돼 테이블 간 FK가 정확히 탐지되도록 보완
+  - camelCase 키(`orderID`, `productID`) 정규화 및 연결 테이블 복합 FK·약한 개체 `(FK, line_no)` 복합 PK 가산·비식별 칼럼 불필요 `UNIQUE INDEX` 제거
+  - PDF/문서 추출 표의 통화 기호(`$`, `₩`, `€`, `£`, `¥`) 포함 금액 칼럼을 `DOUBLE`/`BIGINT`로 자동 추론해 수동 `CAST` 없이 DuckDB `SUM`/`AVG` SQL 집계 지원
 
 ## [0.1.0-beta.1] — 2026-11-23 (`0.1.0b1`)
 

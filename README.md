@@ -9,7 +9,7 @@
 로컬에서 바로 돌리는 문서 파서 겸 ETL 도구입니다.  
 PDF, Office 문서, 한글(HWP/HWPX) 파일에서 코드로 읽을 수 있는 본문·표는 결정론 파서로 즉시 뽑아내고, 스캔 페이지·차트·도식·수식처럼 시각 이해가 필요한 영역만 잘라서 AI 모델(ONNX 레이아웃 탐지 + OCR/VLM)에 넘깁니다.
 
-> 현재 **`v0.1.0-beta.1`** 베타 상태입니다. 아직 PyPI에는 올리지 않았고 Git으로 설치해 쓸 수 있습니다.
+> 현재 **`v0.2.0-beta.1`** 베타 상태입니다. 아직 PyPI에는 올리지 않았고 Git으로 설치해 쓸 수 있습니다.
 > - **문서 파서 (`parse`, `ui`, `doctor`)**: 8개 포맷 파싱, RAG 청킹, 폴더 일괄 처리, 로컬 웹 UI, 선택 레이아웃·OCR/VLM 연동까지 바로 사용 가능
 > - **결정론 정형 ETL (`analyze`, `ui`)**: 여러 CSV·TSV·XLSX 파일의 결측치·10종 칼럼 유형 분류·규칙 문자열 내부 분해·테이블 간 FK(숨은 문자열 슬롯 FK 포함)·최적 PK 선정·PostgreSQL DDL·Mermaid ERD·위상 적재 계획(Load Plan)을 **AI/LLM 없이(0MB)** 바로 생성
 > - **원문 문서 인덱스·리트리벌 (`index`, `query`)**: VectorDB·생성 LLM 없이 **SQLite FTS5(한글 2-gram) + 목차 트리 + DuckDB 표 SQL**(0MB 기본)과 선택 **초경량 CPU ONNX 리랭커**(100M–280M)로 청크 절단 없는 원문 `EvidencePack` 반환
