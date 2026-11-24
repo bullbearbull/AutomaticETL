@@ -375,3 +375,30 @@ def test_currency_prefixed_table_auto_casts_for_duckdb_sql(tmp_path: Path) -> No
             ["Software", "60720.0", "500000"],
             ["Hardware", "35285.5", "2000000"],
         ]
+
+
+def test_reranker_parent_tokenizer_resolution_and_query_guided_windows(tmp_path: Path) -> None:
+    """HF `onnx/model_int8.onnx` 상위 폴더 토크나이저 탐색과 장문 질의 창 선별을 검증한다."""
+    from autoetl.docindex.reranker import _resolve_tokenizer_path, _slice_windows
+
+    repo_dir = tmp_path / "jina_v2_int8"
+    onnx_dir = repo_dir / "onnx"
+    onnx_dir.mkdir(parents=True)
+    model_file = onnx_dir / "model_int8.onnx"
+    model_file.write_bytes(b"stub")
+    parent_tok = repo_dir / "tokenizer.json"
+    parent_tok.write_text("{}", encoding="utf-8")
+
+    assert _resolve_tokenizer_path(model_file, None) == parent_tok
+
+    # 25KB 장문 섹션의 맨 끝(24KB 지점)에 핵심 키워드가 있어도 max_windows=3 안에 포착되어야 한다
+    deep_section = (
+        "겨울철 일반 안내 문장입니다. " * 1400
+    ) + " 핵심 근거: 중국어선 불법조업 단속 및 해경활동 해양사고 대응 매뉴얼."
+    windows = _slice_windows(
+        deep_section,
+        query="중국어선 단속 해양사고",
+        max_windows=3,
+    )
+    assert len(windows) == 3
+    assert any("중국어선 불법조업" in w for w in windows)

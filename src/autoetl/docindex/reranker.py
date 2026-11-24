@@ -19,11 +19,26 @@ from typing import Any, Protocol, runtime_checkable
 from autoetl.parser.adapters import ParserInputError
 
 RECOMMENDED_RERANKER_MODELS: dict[str, str] = {
-    "bge-reranker-v2-m3": "BAAI/bge-reranker-v2-m3 (다국어·한국어, INT8 ~280MB)",
-    "bge-reranker-v2-m3-ko": "bge-reranker-v2-m3-ko (한국어 특화, INT8 ~280MB)",
-    "bge-reranker-base": "BAAI/bge-reranker-base (경량, INT8 ~110MB)",
-    "minilm-l6-v2": "cross-encoder/ms-marco-MiniLM-L-6-v2 (초경량 영문, INT8 ~25MB)",
+    "jina-reranker-v2-base-multilingual": (
+        "jinaai/jina-reranker-v2-base-multilingual (다국어·한국어, INT8 ~280MB)"
+    ),
+    "bge-reranker-v2-m3": "BAAI/bge-reranker-v2-m3 (다국어·한국어, INT8 ~570MB)",
+    "bge-reranker-base": "BAAI/bge-reranker-base (다국어·중영, INT8 ~280MB)",
+    "minilm-l6-v2": "cross-encoder/ms-marco-MiniLM-L-6-v2 (초경량 영문, INT8 ~23MB)",
 }
+
+
+def _resolve_tokenizer_path(model_path: Path, explicit: Path | str | None) -> Path:
+    """`tokenizer.json` 경로를 탐색한다(HuggingFace 표준 `onnx/model_int8.onnx` 상위 폴더 포함)."""
+    if explicit is not None:
+        return Path(explicit)
+    same_dir = model_path.parent / "tokenizer.json"
+    if same_dir.is_file():
+        return same_dir
+    parent_dir = model_path.parent.parent / "tokenizer.json"
+    if parent_dir.is_file():
+        return parent_dir
+    return same_dir
 
 
 @runtime_checkable
@@ -49,24 +64,47 @@ def _sigmoid(x: float) -> float:
     return z / (1.0 + z)
 
 
-def _slice_windows(text: str, *, max_chars: int = 1600, stride: int = 1200) -> list[str]:
-    """긴 원문 섹션의 앞/중/뒷부분을 슬라이딩 창으로 나눠 리랭킹 누락을 방지한다.
+def _slice_windows(
+    text: str,
+    *,
+    query: str = "",
+    max_chars: int = 1600,
+    stride: int = 1200,
+    max_windows: int = 3,
+) -> list[str]:
+    """긴 원문 섹션에서 질의 어휘가 밀집한 핵심 슬라이딩 창(최대 `max_windows`개)을 고른다.
 
     리랭킹 점수 산출에만 창 분할을 쓰고, 최종 EvidencePack에는 항상 원문 섹션 전체를 반환한다.
+    전체 문서를 스캔해 질의와 가장 많이 겹치는 창(선두 문맥 1개 포함)을 고르므로
+    30KB 이상 장문 섹션 뒤쪽의 근거도 누락 없이 포착하면서 CPU 추론량을 크게 줄인다.
     """
     cleaned = text.strip()
     if len(cleaned) <= max_chars:
         return [cleaned]
-    windows: list[str] = []
+    all_windows: list[str] = []
     start = 0
     limit = len(cleaned)
-    while start < limit and len(windows) < 6:
+    while start < limit:
         end = min(limit, start + max_chars)
-        windows.append(cleaned[start:end])
+        all_windows.append(cleaned[start:end])
         if end >= limit:
             break
         start += stride
-    return windows
+    if len(all_windows) <= max_windows:
+        return all_windows
+
+    # 질의 토큰(2글자 이상) 겹침 수로 핵심 창을 빠르게 선별하고, 선두 창(인덱스 0)은 항상 보존
+    q_terms = [t for t in query.lower().split() if len(t) >= 2]
+    if not q_terms:
+        return all_windows[:max_windows]
+
+    scored_indices = sorted(
+        range(1, len(all_windows)),
+        key=lambda i: sum(all_windows[i].lower().count(t) for t in q_terms),
+        reverse=True,
+    )
+    chosen = sorted([0, *scored_indices[: max(0, max_windows - 1)]])
+    return [all_windows[i] for i in chosen]
 
 
 class OnnxCrossEncoderReranker:
@@ -84,18 +122,16 @@ class OnnxCrossEncoderReranker:
         tokenizer_path: Path | str | None = None,
         max_length: int = 512,
         batch_size: int = 16,
+        max_windows: int = 3,
         providers: Sequence[str] = ("CPUExecutionProvider",),
         session: Any = None,
         tokenizer: Any = None,
     ) -> None:
         self._model_path = Path(model_path)
-        self._tokenizer_path = (
-            Path(tokenizer_path)
-            if tokenizer_path is not None
-            else self._model_path.parent / "tokenizer.json"
-        )
+        self._tokenizer_path = _resolve_tokenizer_path(self._model_path, tokenizer_path)
         self._max_length = max(64, min(2048, int(max_length)))
         self._batch_size = max(1, int(batch_size))
+        self._max_windows = max(1, min(12, int(max_windows)))
         self._providers = tuple(providers)
         self._session: Any = session
         self._tokenizer: Any = tokenizer
@@ -139,8 +175,11 @@ class OnnxCrossEncoderReranker:
                 )
             if not self._model_path.is_file():
                 raise ParserInputError(f"ONNX 리랭커 모델 파일이 없다: {self._model_path}")
+            sess_opts = self._ort.SessionOptions()
+            sess_opts.graph_optimization_level = self._ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             self._session = self._ort.InferenceSession(
                 str(self._model_path),
+                sess_options=sess_opts,
                 providers=list(self._providers),
             )
         if self._tokenizer is None:
@@ -155,7 +194,18 @@ class OnnxCrossEncoderReranker:
                 )
             tok = self._tok_mod.Tokenizer.from_file(str(self._tokenizer_path))
             tok.enable_truncation(max_length=self._max_length)
-            tok.enable_padding(pad_id=0, pad_token="<pad>")
+            # XLM-RoBERTa/Jina/BGE-M3(<pad>=1)와 BERT/MiniLM([PAD]=0)의 패딩 ID를 정확히 맞춘다.
+            pad_id: int | None = None
+            pad_token = "<pad>"
+            for candidate_tok in ("<pad>", "[PAD]", "<|pad|>"):
+                resolved = tok.token_to_id(candidate_tok)
+                if resolved is not None:
+                    pad_id = int(resolved)
+                    pad_token = candidate_tok
+                    break
+            if pad_id is None:
+                pad_id = 0
+            tok.enable_padding(pad_id=pad_id, pad_token=pad_token)
             self._tokenizer = tok
         return self._session, self._tokenizer
 
@@ -206,20 +256,23 @@ class OnnxCrossEncoderReranker:
         """질의와 각 원문 섹션의 관련도 점수(0.0~1.0)를 계산한다(장문 섹션은 최대 창 점수 사용)."""
         if not passages:
             return []
-        expanded_pairs: list[tuple[str, str]] = []
-        owner_indices: list[int] = []
+        expanded: list[tuple[int, tuple[str, str]]] = []
         for idx, passage in enumerate(passages):
-            for win in _slice_windows(passage):
-                expanded_pairs.append((query, win))
-                owner_indices.append(idx)
+            for win in _slice_windows(passage, query=query, max_windows=self._max_windows):
+                expanded.append((idx, (query, win)))
 
-        window_scores: list[float] = []
-        for start in range(0, len(expanded_pairs), self._batch_size):
-            batch = expanded_pairs[start : start + self._batch_size]
-            window_scores.extend(self._run_batch(batch))
+        # 길이 버킷 정렬로 단문과 장문 섹션이 같은 배치에서 과도하게 패딩되는 비용을 줄인다.
+        order = sorted(range(len(expanded)), key=lambda i: len(expanded[i][1][1]))
+        ordered_pairs = [expanded[i][1] for i in order]
+
+        ordered_scores: list[float] = []
+        for start in range(0, len(ordered_pairs), self._batch_size):
+            batch = ordered_pairs[start : start + self._batch_size]
+            ordered_scores.extend(self._run_batch(batch))
 
         best_per_passage = [0.0] * len(passages)
-        for owner, score in zip(owner_indices, window_scores, strict=True):
+        for orig_pos, score in zip(order, ordered_scores, strict=True):
+            owner = expanded[orig_pos][0]
             if score > best_per_passage[owner]:
                 best_per_passage[owner] = round(score, 6)
         return best_per_passage
