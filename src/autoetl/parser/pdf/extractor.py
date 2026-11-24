@@ -822,9 +822,7 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
         allow_pen_advance: bool = True,
         tj_kern_em: float = 0.0,
     ) -> float:
-        text_w = estimate_text_width(
-            piece, eff_size, font_dict, width_cache=font_width_cache
-        )
+        text_w = estimate_text_width(piece, eff_size, font_dict, width_cache=font_width_cache)
         if tj_kern_em != 0.0:
             text_w = max(eff_size * 0.25, text_w + tj_kern_em * eff_size)
         h_scale = (h_scale_stack[-1] / 100.0) if h_scale_stack else 1.0

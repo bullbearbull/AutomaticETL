@@ -565,9 +565,7 @@ def _detect_ruled_grid_tables(
             is_shaded_r = False
             fill_color_r: tuple[float, float, float] | None = None
             if row_shade_hits:
-                shade_ivs = sorted(
-                    (max(tx0, sr.x0), min(tx1, sr.x1)) for sr in row_shade_hits
-                )
+                shade_ivs = sorted((max(tx0, sr.x0), min(tx1, sr.x1)) for sr in row_shade_hits)
                 merged_sh: list[tuple[float, float]] = [shade_ivs[0]]
                 for sx0, sx1 in shade_ivs[1:]:
                     px0, px1 = merged_sh[-1]
@@ -610,9 +608,7 @@ def _detect_ruled_grid_tables(
                         for bi in hit_b:
                             band_col_counts[bi] += 1
                     cand_anchors = [
-                        raw_centers[bi]
-                        for bi, cnt in enumerate(band_col_counts)
-                        if cnt >= 2
+                        raw_centers[bi] for bi, cnt in enumerate(band_col_counts) if cnt >= 2
                     ]
                     if len(cand_anchors) >= 2:
                         multi_line_cols = 0

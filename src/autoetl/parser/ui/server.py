@@ -80,6 +80,7 @@ def _build_content_disposition(dl_name: str, file_path: Path, content_type: str)
     encoded_utf8 = quote(safe_utf8, safe="")
     return f"attachment; filename=\"{safe_ascii}\"; filename*=UTF-8''{encoded_utf8}"
 
+
 _MIME_BY_EXT: dict[str, str] = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
