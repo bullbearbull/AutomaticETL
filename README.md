@@ -7,11 +7,30 @@
 [English](README.en.md) · [파서 상세 문서](src/autoetl/parser/README.md) · [변경 이력](CHANGELOG.md)
 
 로컬에서 바로 돌리는 문서 파서 겸 ETL 도구입니다.  
-PDF, Office 문서, 한글(HWP/HWPX) 파일을 외부 API나 무거운 런타임 없이 Markdown, 표(CSV/JSON), RAG용 청크(`chunks.jsonl`)로 꺼낼 수 있습니다.
+PDF, Office 문서, 한글(HWP/HWPX) 파일에서 코드로 읽을 수 있는 본문·표는 결정론 파서로 즉시 뽑아내고, 스캔 페이지·차트·도식·수식처럼 시각 이해가 필요한 영역만 잘라서 AI 모델(ONNX 레이아웃 탐지 + OCR/VLM)에 넘깁니다.
 
 > 현재 **`v0.1.0-beta.1`** 베타 상태입니다. 아직 PyPI에는 올리지 않았고 Git으로 설치해 쓸 수 있습니다.
-> - **문서 파서 (`parse`, `ui`, `doctor`)**: 8개 포맷 파싱, 청킹, 폴더 일괄 처리, 로컬 웹 UI까지 바로 사용 가능
+> - **문서 파서 (`parse`, `ui`, `doctor`)**: 8개 포맷 파싱, RAG 청킹, 폴더 일괄 처리, 로컬 웹 UI, 선택 레이아웃·OCR/VLM 연동까지 바로 사용 가능
 > - **정형 ETL (`analyze`)**: CSV `--no-llm` 분석 프로토타입 단계 (LLM 하네스·PostgreSQL DDL 연동 작업 중)
+
+---
+
+## 동작 구조와 AI 모델 활용
+
+![AutoETL 서비스 구조](assets/architecture.svg)
+
+문서 전체를 통째로 VLM에 던지지 않습니다. 먼저 코드 파서가 페이지·시트 구조를 분류해 디지털 텍스트와 네이티브 표를 바로 추출하고, **시각 해석이 필요한 크롭 영역에만 AI 모델을 선택적으로 붙이는 2단계 구조**입니다.
+
+### 어디에 어떤 AI 모델이 쓰이나요?
+
+| 적용 구간 | 역할 | 지원하는 모델 / 백엔드 | CLI 플래그 |
+| --- | --- | --- | --- |
+| **AI ① 레이아웃 객체 탐지** | 스캔 PDF·이미지 슬라이드를 표·차트·수식·본문 영역으로 자동 분할 크롭 | **ONNX**(`onnxruntime`): `PP-DocLayoutV2`, `PP-DocLayoutV3`, `PP-DocLayout_plus-L`, `DocLayNet`, `PubLayNet`<br>**HTTP**: 로컬/사내 레이아웃 탐지 서버<br>*(모델 없이도 내장 `heuristic` 픽셀 탐지기로 동작)* | `--layout-detector onnx\|http\|heuristic`<br>`--layout-label-preset` |
+| **AI ② OCR · VLM 시각 해석** | 크롭된 스캔 영역·차트·도식·수식을 Markdown과 표로 변환 | **경량 문서 특화 OCR-VLM** *(모델명 자동 감지·전용 프롬프트 내장)*: `PaddleOCR-VL` (0.9B), `GLM-OCR` (0.9B), `DeepSeek-OCR` (3B)<br>**범용 VLM**: Ollama / vLLM / llama-server / LM Studio의 `Qwen2.5-VL` 등 모든 Vision 모델, 외부 OpenAI 호환 API (`gpt-4o` 등)<br>**하이브리드**: 단순 텍스트는 로컬 `Tesseract` OCR, 차트·도식만 VLM으로 자동 분배 | `--vision ollama\|openai-compat\|hybrid\|tesseract`<br>`--vision-model`<br>`--vision-prompt-preset auto` |
+| **AI ③ 정형 ETL LLM 하네스** *(개발 중)* | DuckDB로 계산한 통계·타입·함수종속(FD) 위에서 애매한 의미 해석·테이블 명명·후보 스키마 선택 보조 | Pydantic 계약 스키마 기반 LLM 하네스 연동 예정 *(현재 v0는 `--no-llm` 경로만 지원)* | `autoetl analyze --no-llm` |
+
+- `PaddleOCR-VL`, `GLM-OCR`, `DeepSeek-OCR` 같은 경량 문서 특화 모델은 `--vision-model` 이름만 주면 공식 짧은 태스크 프롬프트(`OCR:`, `Table Recognition:` 등)와 출력 정제 규칙이 자동으로 맞춰집니다.
+- 로컬(`127.0.0.1`)·사내 등록 서버만 기본 허용되며, 외부 API 엔드포인트로 이미지를 보내려면 `--allow-external-vision`과 API 키 환경변수 이름(`--vision-api-key-env`)을 직접 지정해야 합니다.
 
 ---
 
@@ -35,7 +54,7 @@ uv sync
 
 ## 사용법
 
-### 파일 하나 파싱하기
+### 1. 파일 하나 파싱하기 (기본 오프라인 모드)
 
 ```bash
 autoetl parse report.pdf --out ./out
@@ -45,7 +64,7 @@ autoetl parse report.pdf --out ./out
 
 ```text
 out/
-├── document.md         # 본문·표·각주·수식을 합친 Markdown
+├── document.md         # 본문·표·각주·수식·VLM 해석을 합친 Markdown
 ├── chunks.jsonl        # 제목 경로·페이지·표 헤더를 유지한 RAG 청크
 ├── parsed.json         # 전체 구조 IR (Pydantic 스키마)
 ├── routing_report.md   # 페이지·시트별 구조 판정과 파싱 전략 리포트
@@ -62,7 +81,27 @@ autoetl parse report.pdf --format markdown # Markdown을 stdout으로 출력
 autoetl parse report.pdf --format chunks   # RAG 청크(JSONL)를 stdout으로 출력
 ```
 
-### 폴더 통째로 처리하기
+### 2. 스캔 문서·차트에 AI 모델 연결하기
+
+```bash
+# 권장 2단계 로컬 구성: PP-DocLayoutV2(ONNX)로 영역 분할 → PaddleOCR-VL-1.6으로 영역별 해석
+autoetl parse scanned.pdf \
+  --layout-detector onnx --layout-model-path ./models/PP-DocLayoutV2.onnx \
+  --vision openai-compat --vision-model PaddleOCR-VL-1.6 \
+  --vision-base-url http://127.0.0.1:8080/v1 --out ./out
+
+# Ollama 로컬 GLM-OCR 또는 Qwen2.5-VL 하이브리드(텍스트=Tesseract, 차트/도식=VLM)
+autoetl parse scanned.pdf --layout-detector heuristic --vision ollama --vision-model glm-ocr --out ./out
+autoetl parse deck.pptx --vision hybrid --vision-model qwen2.5vl:7b \
+  --vision-base-url http://127.0.0.1:11434/v1 --out ./out
+
+# 외부 OpenAI 호환 API 사용 시 명시적 허용 필요
+autoetl parse report.pdf --vision openai-compat --vision-model gpt-4o \
+  --vision-base-url https://api.openai.com/v1 --vision-api-key-env OPENAI_API_KEY \
+  --allow-external-vision --out ./out
+```
+
+### 3. 폴더 통째로 처리하기
 
 입력 경로에 폴더를 넘기면 지원되는 문서를 재귀적으로 찾아 일괄 처리합니다.
 
@@ -74,7 +113,7 @@ autoetl parse ./docs --out ./batch_out --workers 4 --resume
 - `--resume`을 켜면 SHA-256 기준으로 이미 끝난 파일은 건너뜁니다.
 - 끝나면 요약 리포트(`batch_summary.md`), 실행 기록(`batch_manifest.json`), 전체 문서 청크를 합친 `all_chunks.jsonl`이 함께 만들어집니다.
 
-### 브라우저에서 바로 써보기
+### 4. 브라우저에서 바로 써보기
 
 ```bash
 autoetl ui
@@ -83,7 +122,7 @@ autoetl ui
 별도 프런트엔드 빌드나 외부 서버 없이 `http://127.0.0.1:8765`에 로컬 웹 UI가 뜹니다.  
 파일을 끌어다 놓으면 Markdown, 표(CSV/Markdown 복사), RAG 청크 검색, 크롭 이미지를 탭별로 확인하고 전체 번들을 ZIP으로 받을 수 있습니다. 기본적으로 루프백(`127.0.0.1`)에만 열립니다.
 
-### Python에서 불러 쓰기
+### 5. Python에서 불러 쓰기
 
 ```python
 import autoetl
@@ -96,7 +135,7 @@ manifest = autoetl.export_bundle(doc, "./out_hwp")
 batch = autoetl.parse_batch("./docs", "./batch_out", workers=4, resume=True)
 ```
 
-### 환경 점검
+### 6. 환경 점검
 
 ```bash
 autoetl doctor
@@ -121,26 +160,7 @@ autoetl doctor
 | `.doc`, `.ppt` | 내장 OLE2 파서 (+ LibreOffice 자동 승격) | `soffice`가 PATH에 있으면 고충실도 변환, 없으면 내장 파서로 폴백 |
 
 주석·숨은설명이 필요하면 `--include-comments`를 붙이면 됩니다.  
-암호화되거나 DRM·배포용 제한이 걸린 문서는 우회하지 않고 오류 메시지로 알려줍니다.
-
----
-
-## 스캔 문서 OCR · VLM 연동 (선택)
-
-디지털 텍스트는 기본 설정만으로 로컬에서 추출됩니다. 스캔 PDF나 이미지 위주 슬라이드만 필요할 때 선택 백엔드를 붙여서 씁니다.
-
-```bash
-# 로컬 레이아웃 분할 + Tesseract OCR
-autoetl parse scanned.pdf --layout-detector heuristic --vision tesseract --out ./out
-
-# 로컬 Ollama / OpenAI 호환 서버(vLLM, llama-server 등) 연동
-autoetl parse scanned.pdf \
-  --vision openai-compat --vision-model PaddleOCR-VL-1.6 \
-  --vision-base-url http://127.0.0.1:8080/v1 --out ./out
-```
-
-- 외부 API 엔드포인트로 이미지를 보내는 동작은 기본 차단되어 있습니다. 외부 서버를 쓰려면 `--allow-external-vision`과 API 키 환경변수 이름(`--vision-api-key-env`)을 직접 지정해야 합니다.
-- 로그와 오류 메시지에는 문서 본문이나 셀 값을 남기지 않습니다.
+암호화되거나 DRM·배포용 제한이 걸린 문서는 우회하지 않고 오류 메시지로 알려주며, 로그와 오류 메시지에는 문서 본문이나 셀 값을 남기지 않습니다.
 
 ---
 
