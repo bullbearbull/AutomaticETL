@@ -35,6 +35,11 @@ from autoetl.contracts.load import (
     LoadPlan,
     NullHandling,
 )
+from autoetl.contracts.multi_table import (
+    TableProfileBundle,
+    TableSourceInfo,
+    TableSourceKind,
+)
 from autoetl.contracts.profile import ColumnProfile, LengthStats, PatternMask
 from autoetl.contracts.quality import (
     DimensionScore,
@@ -175,6 +180,9 @@ __all__ = [
     "SourceFile",
     "StatsKind",
     "Stratum",
+    "TableProfileBundle",
+    "TableSourceInfo",
+    "TableSourceKind",
     "TargetColumn",
     "TargetTable",
     "TemporalStats",
