@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from autoetl.contracts import MultiTableAnalysisBundle, Purpose
+from autoetl.contracts import MultiTableAnalysisBundle, Purpose, SchemaOverrideSpec
 from autoetl.core.load_planner import export_multi_table_bundle, plan_multi_table_load
 from autoetl.core.multi_context import MultiTableContext, NamedTableInput, profile_all_tables
 from autoetl.core.relations_multi import MIN_INCLUSION_RATE, analyze_multi_table_relations
@@ -19,6 +19,7 @@ def analyze_tables(
     decompose_strings: bool = True,
     recursive: bool = True,
     min_inclusion_rate: float = MIN_INCLUSION_RATE,
+    overrides: SchemaOverrideSpec | None = None,
     out_dir: str | Path | None = None,
 ) -> MultiTableAnalysisBundle:
     """여러 CSV/TSV/XLSX 파일·디렉터리 또는 메모리 테이블을 일괄 결정론 분석한다.
@@ -51,6 +52,7 @@ def analyze_tables(
             purpose=resolved_purpose,
             decompose_strings=decompose_strings,
             mctx=mctx,
+            overrides=overrides,
         )
 
     warnings: list[str] = []

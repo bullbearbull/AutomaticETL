@@ -65,6 +65,12 @@ autoetl analyze ./sales_data --purpose oltp --out ./etl_plan
 autoetl analyze branches.csv customers.csv orders.xlsx --purpose analytics --out ./etl_plan
 autoetl analyze ./sales_data --format ddl   # 검증된 PostgreSQL DDL만 stdout 출력
 autoetl analyze ./sales_data --format erd   # Mermaid ERD만 stdout 출력
+
+# 실제 DB(SQLite · DuckDB · 선택 PostgreSQL)에 바로 적재 + 디폴트 데이터 관리 테이블 4종 자동 생성
+autoetl load ./sales_data --db ./warehouse.sqlite --mask-pii
+autoetl load ./sales_data --db ./analytics.duckdb --engine duckdb --purpose analytics
+autoetl catalog ./warehouse.sqlite                     # 배치 시점·데이터 고유 ID·데이터 종류·격리함 조회
+autoetl catalog ./warehouse.sqlite --rollback <batch_id> # 잘못 올린 배치 역순 안전 롤백
 ```
 
 `--out ./etl_plan` 폴더에는 아래 6개 파일이 생성됩니다.
@@ -78,6 +84,8 @@ etl_plan/
 ├── erd.mmd              # Mermaid erDiagram
 └── analysis_report.md   # 칼럼 분류·결측치·문자열 패턴 분해·적재 계획 한국어 리포트
 ```
+
+`autoetl load` 또는 웹 UI의 **DB로 저장하기**로 적재하면 업무 테이블(행마다 `_etl_batch_id`, `_etl_dataset_id`, `_etl_loaded_at` 이력 포함)과 함께 디폴트 관리 테이블 4종(`_etl_load_batches`, `_etl_datasets`, `_etl_column_registry`, `_etl_quarantine_rows`)이 자동으로 생성되어 저장 시점·고유 ID·데이터 종류·컬럼 사전·오류 격리함을 추적할 수 있습니다.
 
 ### 2. 문서 파일 하나 파싱하기 (기본 오프라인 모드)
 

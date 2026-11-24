@@ -223,6 +223,71 @@ class IndexRecommendation(ContractModel):
     reason: str
 
 
+class MaskingPolicy(str, Enum):
+    """개인정보·민감 컬럼의 DB 저장 시 보호 정책."""
+
+    NONE = "none"
+    MASK = "mask"
+    HASH = "hash"
+
+
+class OrphanPolicy(str, Enum):
+    """변환 오류·고아 FK 행 발생 시 적재 처리 정책."""
+
+    QUARANTINE = "quarantine"
+    REJECT_ALL = "reject_all"
+
+
+class DatasetKind(str, Enum):
+    """적재된 데이터셋(표)의 자동 분류 데이터 종류."""
+
+    MASTER_REFERENCE = "master_reference"
+    TRANSACTION_EVENT = "transaction_event"
+    RELATION_FACT = "relation_fact"
+    LOG_APPEND = "log_append"
+    STANDALONE = "standalone"
+
+
+class ColumnOverride(ContractModel):
+    """사용자가 UI/SDK에서 확정한 개별 컬럼 설계 변경(마지막 10% 확정)."""
+
+    table: str
+    source_column: str
+    target_column: str | None = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_]*$",
+        description="사용자가 지정한 DB 저장 컬럼명(영문 소문자·숫자·밑줄)",
+    )
+    unique: bool | None = Field(
+        default=None,
+        description="True이면 업무 규칙 확인 후 물리 UNIQUE INDEX를 명시적으로 생성",
+    )
+    masking: MaskingPolicy = Field(
+        default=MaskingPolicy.NONE,
+        description="DB 적재 시 적용할 개인정보 보호 정책(none/mask/hash)",
+    )
+
+
+class SchemaOverrideSpec(ContractModel):
+    """사용자가 확정한 스키마·개인정보·적재 옵션 묶음."""
+
+    columns: list[ColumnOverride] = Field(default_factory=list)
+    orphan_policy: OrphanPolicy = Field(
+        default=OrphanPolicy.QUARANTINE,
+        description="오류·고아 행 처리 정책(quarantine=격리함 분리, reject_all=전체 중단)",
+    )
+    include_audit_columns: bool = Field(
+        default=True,
+        description=(
+            "적재 테이블에 _etl_batch_id/_etl_dataset_id/_etl_loaded_at 이력 컬럼 포함 여부"
+        ),
+    )
+    include_management_tables: bool = Field(
+        default=True,
+        description="디폴트 데이터 관리 테이블(_etl_load_batches/_etl_datasets 등) 자동 생성 여부",
+    )
+
+
 class TableLoadStrategy(ContractModel):
     """다중 테이블 적재 계획 내 개별 대상 테이블의 적재 전략."""
 
@@ -244,6 +309,14 @@ class TableLoadStrategy(ContractModel):
     sensitive_columns: list[str] = Field(
         default_factory=list,
         description="탐지된 개인정보·민감 컬럼 목록(원본 셀 값 미포함)",
+    )
+    column_masking: dict[str, MaskingPolicy] = Field(
+        default_factory=dict,
+        description="원본 컬럼별 확정 마스킹 정책(none/mask/hash)",
+    )
+    confirmed_unique_columns: list[str] = Field(
+        default_factory=list,
+        description="사용자가 명시적으로 UNIQUE 제약을 확정한 대상 컬럼 목록",
     )
     expected_row_count: NonNegativeInt
     notes: list[str] = Field(default_factory=list)
@@ -274,4 +347,42 @@ class MultiTableAnalysisBundle(ContractModel):
     tables: list[TableProfileBundle] = Field(default_factory=list)
     relations: MultiTableRelationAnalysis
     load_plan: MultiTableLoadPlan
+    warnings: list[str] = Field(default_factory=list)
+
+
+class TableLoadOutcome(ContractModel):
+    """단일 테이블의 실제 DB 적재 결과 요약."""
+
+    dataset_id: str
+    target_table: str
+    dataset_kind: DatasetKind
+    source_name: str
+    source_sha256: str | None = None
+    schema_fingerprint: str
+    increment_mode: IncrementMode
+    rows_read: NonNegativeInt
+    rows_loaded: NonNegativeInt
+    rows_quarantined: NonNegativeInt
+    skipped_duplicate_file: bool = False
+    schema_drift_detected: bool = False
+    masked_columns: list[str] = Field(default_factory=list)
+
+
+class DbLoadResult(ContractModel):
+    """실제 DB 적재(SQLite/DuckDB/PostgreSQL) 및 관리 테이블 기록 결과."""
+
+    contract_version: str = CONTRACTS_VERSION
+    batch_id: str
+    loaded_at: str
+    db_engine: str
+    db_target: str
+    status: str = Field(pattern="^(succeeded|partial|failed|skipped_duplicate)$")
+    purpose: Purpose
+    selected_candidate_id: str
+    management_tables_created: list[str] = Field(default_factory=list)
+    tables: list[TableLoadOutcome] = Field(default_factory=list)
+    total_rows_read: NonNegativeInt
+    total_rows_loaded: NonNegativeInt
+    total_rows_quarantined: NonNegativeInt
+    elapsed_seconds: float
     warnings: list[str] = Field(default_factory=list)

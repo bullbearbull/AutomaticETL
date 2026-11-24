@@ -31,12 +31,18 @@
 
 - **S7 결정론적 PII·민감 컬럼 탐지 엔진 구현 (`core/stages/s07_sensitivity.py`)**:
   - 주민등록번호·외국인등록번호·사업자등록번호·카드번호(Luhn)·계좌번호·전화번호·이메일·성명·생년월일·주소·IP를 원본 값 노출 없이 결정론 탐지해 `analyze` 리포트·`TableLoadStrategy.sensitive_columns`·`security_isolation` 점수에 연동
+- **결정론 스키마 마지막 10% 확정(`SchemaOverrideSpec`) + 실제 DB 적재 엔진 및 디폴트 데이터 관리 테이블 4종 (`core/db_loader.py`, `load_planner.py`, `cli.py`, `parser/ui/`)**:
+  - 추가 코어 의존성 0개로 **SQLite(`.sqlite`) · DuckDB(`.duckdb`) · 선택 PostgreSQL(`psycopg`)**에 실제 변환·캐스팅·PII 마스킹/해시·위상 적재(`UPSERT`/`WATERMARK`/`APPEND`)를 수행하는 `load_tables` / `autoetl load` 구현
+  - 사용자가 UI·CLI·SDK에서 DB 저장 영문 컬럼명, 물리 `UNIQUE` 제약 확정(시험 적재 중복 검증 연동), 개인정보 보호 정책(`none`/`mask`/`hash`), 오류·고아 행 정책(`quarantine`/`reject_all`)을 확정·재검증할 수 있도록 확장
+  - 모든 DB 적재 시 기본 생성되는 **데이터 관리·리니지 테이블 4종**(`_etl_load_batches` 적재 배치 이력, `_etl_datasets` 데이터 고유 ID·데이터 종류 자동 분류·원본 SHA-256·스키마 지문, `_etl_column_registry` 원본 한글명↔DB 영문명·역할·PII 사전, `_etl_quarantine_rows` 오류·고아 행 PII 안전 격리함)과 행 단위 출처 컬럼(`_etl_batch_id`, `_etl_dataset_id`, `_etl_loaded_at`) 기본 적용
+  - 동일 파일 중복 적재 방지(SHA-256), 스키마 변경(드리프트) 감지 및 신규 컬럼 자동 진화, 카탈로그 조회(`inspect_db_catalog` / `autoetl catalog`), FK 무결성 보호 역순 배치 롤백(`rollback_batch` / `autoetl catalog --rollback`) 구현
 
 ### Changed
 
-- **로컬 웹 UI 전면 개편 — 직관적 흐름·세부 설정 접기·쉬운 한국어 네이밍 (`parser/ui/app.html`, `parser/ui/server.py`)**:
+- **로컬 웹 UI 전면 개편 — 직관적 흐름·세부 설정 접기·쉬운 한국어 네이밍·1클릭 DB 저장 (`parser/ui/app.html`, `parser/ui/server.py`)**:
   - 상단 3모드를 `문서 글·표 추출` · `엑셀·CSV 구조 분석` · `문서 내용 검색`으로 단순화하고, 파일 드래그앤드롭과 단일 실행 버튼만 전면에 배치(페이지 범위·청크 크기·코드 분리·AI 리랭커·SQL 등 고급 옵션은 `세부 설정` 접이식으로 정리)
   - `OLTP/3NF`, `기수성`, `서로게이트 키`, `워터마크`, `EvidencePack`, `BM25` 등 전문 용어를 일상 한국어(`일반 서비스용`, `표 연결 관계`, `자동 번호 키`, `날짜 기준 추가`, `관련도 %`)로 전면 개선하고, DuckDB 검증·개인정보 감지 배지·동의어 입력·문서 속 표 즉시 미리보기 추가
+  - `엑셀·CSV 구조 분석` 내 인라인 항목 확정(DB 저장 이름·중복 금지·개인정보 보호 정책, 재업로드 없는 세션 재검증) 및 `DB로 저장하기` 탭(`POST /api/etl/load-db`, `.sqlite`/`.duckdb` 내려받기, 데이터 관리 대장·격리함 실시간 조회) 추가
 
 ## [0.2.0-beta.2] — 2026-11-24 (`0.2.0b2`)
 

@@ -1,0 +1,1890 @@
+"""결정론적 실제 DB 적재 엔진(SQLite · DuckDB · 선택적 PostgreSQL) 및 기본 데이터 관리 카탈로그.
+
+핵심 기능:
+1. 0개 추가 코어 의존성: Python 표준 ``sqlite3`` 및 코어 의존성 ``duckdb``로 즉시 DB 파일을
+   생성·적재하며, ``postgres`` 엔진은 ``psycopg``가 설치되어 있을 때 지연 임포트로 지원한다.
+2. 디폴트 데이터 관리·리니지 테이블 4종(``_etl_*``) 자동 생성 및 기록:
+   - ``_etl_load_batches``: 적재 실행(배치) 단위 시점·상태·사용자 확정 오버라이드 스냅샷
+   - ``_etl_datasets``: 넣은 데이터 고유 ID(``dataset_id``)·데이터 종류(``dataset_kind``)·
+     원본 해시(``source_sha256``)·스키마 지문(``schema_fingerprint``)·적재 건수
+   - ``_etl_column_registry``: 원본 한글명 ↔ DB 영문명·역할·타입·PK/UNIQUE/FK·변환식·
+     개인정보(PII) 등급 및 적용 마스킹 정책 사전
+   - ``_etl_quarantine_rows``: 변환 오류·NULL 위반·PK/UNIQUE 중복·고아 FK 행 격리 보관함
+3. 행 단위 리니지 컬럼(``_etl_batch_id``, ``_etl_dataset_id``, ``_etl_loaded_at``) 자동 부여,
+   동일 파일 중복 적재 방지, 스키마 변경(드리프트) 감지, 배치 롤백(``rollback_batch``),
+   카탈로그 조회(``inspect_db_catalog``).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+import sqlite3
+import time
+import uuid
+from collections.abc import Mapping, Sequence
+from datetime import date, datetime, timedelta, timezone
+from datetime import time as dt_time
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any
+
+import duckdb
+
+from autoetl.contracts import (
+    ColumnClassification,
+    ColumnMapping,
+    DatasetKind,
+    DbLoadResult,
+    IncrementMode,
+    MaskingPolicy,
+    MultiTableAnalysisBundle,
+    MultiTableRelationAnalysis,
+    OrphanPolicy,
+    PhysicalType,
+    Purpose,
+    SchemaCandidate,
+    SchemaOverrideSpec,
+    SensitiveType,
+    SensitivityLevel,
+    SensitivityMap,
+    TableLoadOutcome,
+    TableLoadStrategy,
+    TableProfileBundle,
+    TargetColumn,
+    TargetTable,
+)
+from autoetl.core.context import RAW_TABLE, quote_identifier
+from autoetl.core.ddl.postgres import INT4_MAX, INT4_MIN
+from autoetl.core.errors import InputError
+from autoetl.core.load_planner import plan_multi_table_load
+from autoetl.core.multi_context import (
+    MultiTableContext,
+    NamedTableInput,
+    TableSlotContext,
+    profile_all_tables,
+)
+from autoetl.core.relations_multi import MIN_INCLUSION_RATE, analyze_multi_table_relations
+from autoetl.core.stages.s02_profile import DEFAULT_MISSING_MARKERS
+from autoetl.core.stages.s03_types import CURRENCY_DECIMAL_SHAPE
+from autoetl.core.stages.s07_sensitivity import detect_table_sensitivity
+
+DEFAULT_MANAGEMENT_TABLES: tuple[str, ...] = (
+    "_etl_load_batches",
+    "_etl_datasets",
+    "_etl_column_registry",
+    "_etl_quarantine_rows",
+)
+
+AUDIT_COLUMNS: tuple[str, ...] = (
+    "_etl_batch_id",
+    "_etl_dataset_id",
+    "_etl_loaded_at",
+)
+
+_CURRENCY_SHAPE_RE = re.compile(CURRENCY_DECIMAL_SHAPE)
+_CURRENCY_STRIP_RE = re.compile(r"[₩$원,\s]")
+_INT_RE = re.compile(r"^[+-]?\d+$")
+_VARCHAR_LEN_RE = re.compile(r"^varchar\((\d+)\)$", re.IGNORECASE)
+_DECIMAL_PS_RE = re.compile(r"^(?:numeric|decimal)\((\d+),\s*(\d+)\)$", re.IGNORECASE)
+_KOREAN_DATE_RE = re.compile(r"^(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일$")
+_YEAR_RE = re.compile(r"(19\d{2}|20\d{2})")
+_PHONE_PARTS_RE = re.compile(r"^(\+?\d{2,4})([-.\s]?)(\d{3,4})([-.\s]?)(\d{4})$")
+_RRN_SPLIT_RE = re.compile(r"^(\d{6})(-?)([1-8])(\d{6})$")
+_BRN_SPLIT_RE = re.compile(r"^(\d{3})-(\d{2})-(\d{5})$")
+
+_TRUE_TOKENS = frozenset({"y", "yes", "예", "o", "true"})
+_FALSE_TOKENS = frozenset({"n", "no", "아니오", "x", "false"})
+
+_DATASET_KIND_LABELS_KO: dict[DatasetKind, str] = {
+    DatasetKind.MASTER_REFERENCE: "기준·마스터 데이터",
+    DatasetKind.TRANSACTION_EVENT: "거래·이벤트 데이터",
+    DatasetKind.RELATION_FACT: "관계·연결 데이터",
+    DatasetKind.LOG_APPEND: "이력·로그 데이터",
+    DatasetKind.STANDALONE: "단독 데이터",
+}
+
+
+def _qi(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _normalize_engine(engine: str) -> str:
+    low = engine.strip().lower()
+    if low == "postgresql":
+        return "postgres"
+    if low in {"sqlite", "duckdb", "postgres"}:
+        return low
+    raise InputError(f"지원하지 않는 DB 엔진입니다: '{engine}' (지원: sqlite, duckdb, postgres)")
+
+
+def _sha256_path(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        while chunk := fh.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def mask_value(
+    val: str,
+    stype: SensitiveType | None,
+    policy: MaskingPolicy,
+) -> str:
+    """개인정보·민감 문자열을 정책(`none`/`mask`/`hash`)에 따라 결정론적으로 변환한다."""
+    if policy is MaskingPolicy.NONE:
+        return val
+    if policy is MaskingPolicy.HASH:
+        digest = hashlib.sha256(val.encode("utf-8")).hexdigest()[:16]
+        return f"h_{digest}"
+
+    s = val.strip()
+    if not s:
+        return s
+
+    if stype is SensitiveType.PHONE_NUMBER:
+        m = _PHONE_PARTS_RE.fullmatch(s)
+        if m:
+            sep1 = m.group(2) or "-"
+            sep2 = m.group(4) or "-"
+            return f"{m.group(1)}{sep1}{'*' * len(m.group(3))}{sep2}{m.group(5)}"
+        digits = "".join(ch for ch in s if ch.isdigit())
+        if len(digits) >= 7:
+            return f"{digits[:3]}-****-{digits[-4:]}"
+
+    if stype is SensitiveType.EMAIL and "@" in s:
+        local, domain = s.split("@", 1)
+        keep = 2 if len(local) > 2 else 1
+        return f"{local[:keep]}***@{domain}"
+
+    if stype in {
+        SensitiveType.RESIDENT_REGISTRATION_NUMBER,
+        SensitiveType.FOREIGNER_REGISTRATION_NUMBER,
+    }:
+        m_rrn = _RRN_SPLIT_RE.fullmatch(s)
+        if m_rrn:
+            sep = m_rrn.group(2) or "-"
+            return f"{m_rrn.group(1)}{sep}{m_rrn.group(3)}******"
+        if len(s) >= 7:
+            return s[:7] + "*" * max(6, len(s) - 7)
+
+    if stype is SensitiveType.CARD_NUMBER:
+        digits = "".join(ch for ch in s if ch.isdigit())
+        if len(digits) >= 12:
+            return f"{digits[:4]}-****-****-{digits[-4:]}"
+
+    if stype is SensitiveType.BANK_ACCOUNT:
+        digits = "".join(ch for ch in s if ch.isdigit())
+        if len(digits) >= 7:
+            return f"{digits[:3]}-***-***{digits[-3:]}"
+
+    if stype is SensitiveType.DATE_OF_BIRTH:
+        m_yr = _YEAR_RE.search(s)
+        return f"{m_yr.group(1)}-**-**" if m_yr else "****-**-**"
+
+    if stype is SensitiveType.NAME:
+        if len(s) == 1:
+            return "*"
+        if len(s) == 2:
+            return f"{s[0]}*"
+        return f"{s[0]}{'*' * (len(s) - 2)}{s[-1]}"
+
+    if stype is SensitiveType.ADDRESS:
+        tokens = s.split()
+        if len(tokens) >= 3:
+            return f"{tokens[0]} {tokens[1]} ***"
+        half = max(1, len(s) // 2)
+        return s[:half] + "***"
+
+    if stype is SensitiveType.IP_ADDRESS:
+        parts = s.split(".")
+        if len(parts) == 4:
+            return f"{parts[0]}.{parts[1]}.{parts[2]}.***"
+
+    if stype is SensitiveType.BUSINESS_REGISTRATION_NUMBER:
+        m_brn = _BRN_SPLIT_RE.fullmatch(s)
+        if m_brn:
+            return f"{m_brn.group(1)}-**-***{m_brn.group(3)[-2:]}"
+
+    if len(s) <= 2:
+        return "*" * len(s)
+    if len(s) <= 4:
+        return f"{s[0]}{'*' * (len(s) - 2)}{s[-1]}"
+    return f"{s[:2]}{'*' * min(len(s) - 4, 6)}{s[-2:]}"
+
+
+def classify_dataset_kind(
+    table_name: str,
+    candidate: SchemaCandidate,
+    relations: MultiTableRelationAnalysis,
+    table_plan: TableLoadStrategy,
+) -> DatasetKind:
+    """테이블의 PK/FK/시계열 구조로부터 데이터 종류(DatasetKind)를 결정론적으로 분류한다."""
+    if table_plan.uses_surrogate_key:
+        return DatasetKind.LOG_APPEND
+
+    referenced_parents: set[str] = set()
+    has_outgoing_fk = False
+    for tbl in candidate.tables:
+        for col in tbl.columns:
+            if col.foreign_key is None:
+                continue
+            parent = col.foreign_key.split("(", 1)[0]
+            referenced_parents.add(parent)
+            if tbl.name == table_name:
+                has_outgoing_fk = True
+
+    if table_name in referenced_parents:
+        return DatasetKind.MASTER_REFERENCE
+    if has_outgoing_fk and table_plan.watermark_column is not None:
+        return DatasetKind.TRANSACTION_EVENT
+    if has_outgoing_fk:
+        return DatasetKind.RELATION_FACT
+
+    # 단독 테이블이라도 PK 참조 이력·시계열 컬럼이 있으면 참고
+    pk_rec = relations.primary_keys.get(table_plan.source_table)
+    if pk_rec is not None and pk_rec.referenced_by_count > 0:
+        return DatasetKind.MASTER_REFERENCE
+    return DatasetKind.STANDALONE
+
+
+def compute_schema_fingerprint(table_plan: TableLoadStrategy) -> str:
+    """테이블 스키마(대상 컬럼·타입·NULL 정책)의 결정론적 16자리 SHA-256 지문을 반환한다."""
+    payload = [
+        [m.target_column, m.type_cast, m.null_handling.value] for m in table_plan.column_mappings
+    ]
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def render_management_tables_ddl(dialect: str = "postgres") -> str:
+    """디폴트 데이터 관리 테이블 4종(``_etl_*``)의 DDL을 반환한다."""
+    eng = _normalize_engine(dialect)
+    txt = "VARCHAR" if eng == "duckdb" else "TEXT"
+    int_t = "BIGINT" if eng in {"duckdb", "postgres"} else "INTEGER"
+    if eng == "sqlite":
+        q_id_col = '"quarantine_id" INTEGER PRIMARY KEY AUTOINCREMENT'
+    elif eng == "postgres":
+        q_id_col = '"quarantine_id" BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY'
+    else:
+        q_id_col = '"quarantine_id" BIGINT PRIMARY KEY'
+
+    stmts = [
+        (
+            'CREATE TABLE IF NOT EXISTS "_etl_load_batches" (\n'
+            f'    "batch_id" {txt} PRIMARY KEY,\n'
+            f'    "loaded_at" {txt} NOT NULL,\n'
+            f'    "purpose" {txt} NOT NULL,\n'
+            f'    "selected_candidate_id" {txt} NOT NULL,\n'
+            f'    "db_engine" {txt} NOT NULL,\n'
+            f'    "status" {txt} NOT NULL,\n'
+            f'    "table_count" {int_t} NOT NULL,\n'
+            f'    "total_rows_read" {int_t} NOT NULL,\n'
+            f'    "total_rows_loaded" {int_t} NOT NULL,\n'
+            f'    "total_rows_quarantined" {int_t} NOT NULL,\n'
+            f'    "overrides_json" {txt} NOT NULL,\n'
+            f'    "notes" {txt} NOT NULL\n'
+            ")"
+        ),
+        (
+            'CREATE TABLE IF NOT EXISTS "_etl_datasets" (\n'
+            f'    "dataset_id" {txt} PRIMARY KEY,\n'
+            f'    "batch_id" {txt} NOT NULL REFERENCES "_etl_load_batches" ("batch_id"),\n'
+            f'    "load_order_index" {int_t} NOT NULL,\n'
+            f'    "target_table" {txt} NOT NULL,\n'
+            f'    "dataset_kind" {txt} NOT NULL,\n'
+            f'    "source_name" {txt} NOT NULL,\n'
+            f'    "source_format" {txt} NOT NULL,\n'
+            f'    "source_encoding" {txt} NOT NULL,\n'
+            f'    "source_sha256" {txt},\n'
+            f'    "schema_fingerprint" {txt} NOT NULL,\n'
+            f'    "increment_mode" {txt} NOT NULL,\n'
+            f'    "primary_key_columns" {txt} NOT NULL,\n'
+            f'    "rows_read" {int_t} NOT NULL,\n'
+            f'    "rows_loaded" {int_t} NOT NULL,\n'
+            f'    "rows_quarantined" {int_t} NOT NULL,\n'
+            f'    "schema_drift_detected" {int_t} NOT NULL,\n'
+            f'    "loaded_at" {txt} NOT NULL\n'
+            ")"
+        ),
+        (
+            'CREATE TABLE IF NOT EXISTS "_etl_column_registry" (\n'
+            f'    "dataset_id" {txt} NOT NULL REFERENCES "_etl_datasets" ("dataset_id"),\n'
+            f'    "target_table" {txt} NOT NULL,\n'
+            f'    "column_order" {int_t} NOT NULL,\n'
+            f'    "source_column" {txt} NOT NULL,\n'
+            f'    "target_column" {txt} NOT NULL,\n'
+            f'    "data_role" {txt} NOT NULL,\n'
+            f'    "db_type" {txt} NOT NULL,\n'
+            f'    "is_primary_key" {int_t} NOT NULL,\n'
+            f'    "is_unique" {int_t} NOT NULL,\n'
+            f'    "foreign_key_ref" {txt},\n'
+            f'    "transform_rule" {txt} NOT NULL,\n'
+            f'    "pii_level" {txt} NOT NULL,\n'
+            f'    "pii_types" {txt} NOT NULL,\n'
+            f'    "masking_policy" {txt} NOT NULL,\n'
+            '    PRIMARY KEY ("dataset_id", "target_column")\n'
+            ")"
+        ),
+        (
+            'CREATE TABLE IF NOT EXISTS "_etl_quarantine_rows" (\n'
+            f"    {q_id_col},\n"
+            f'    "batch_id" {txt} NOT NULL,\n'
+            f'    "dataset_id" {txt} NOT NULL,\n'
+            f'    "target_table" {txt} NOT NULL,\n'
+            f'    "source_row_number" {int_t} NOT NULL,\n'
+            f'    "error_category" {txt} NOT NULL,\n'
+            f'    "error_column" {txt} NOT NULL,\n'
+            f'    "error_detail" {txt} NOT NULL,\n'
+            f'    "raw_row_json" {txt} NOT NULL,\n'
+            f'    "quarantined_at" {txt} NOT NULL\n'
+            ")"
+        ),
+    ]
+    return ";\n\n".join(stmts) + ";\n"
+
+
+class _DbAdapter:
+    """SQLite · DuckDB · 선택적 PostgreSQL(psycopg) 공통 경량 DB 어댑터."""
+
+    def __init__(self, target: str | Path, engine: str) -> None:
+        self.engine = _normalize_engine(engine)
+        self.target_str = str(target)
+        self.placeholder = "%s" if self.engine == "postgres" else "?"
+        self._conn: Any = None
+        self._in_tx = False
+
+        if self.engine == "sqlite":
+            db_p = Path(target)
+            if self.target_str != ":memory:":
+                db_p.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(db_p), isolation_level=None)
+            conn.execute("PRAGMA foreign_keys = ON")
+            self._conn = conn
+        elif self.engine == "duckdb":
+            db_p = Path(target)
+            if self.target_str != ":memory:":
+                db_p.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = duckdb.connect(str(db_p))
+        else:
+            try:
+                import psycopg  # type: ignore[import-not-found]
+            except ImportError as exc:
+                raise InputError(
+                    "PostgreSQL 직접 적재를 사용하려면 'psycopg' 패키지가 필요합니다"
+                    "(예: uv pip install 'psycopg[binary]'). "
+                    "추가 설치 없이 저장하려면 --engine sqlite 또는 duckdb를 선택하세요."
+                ) from exc
+            self._conn = psycopg.connect(self.target_str, autocommit=False)
+
+    def begin(self) -> None:
+        if self._in_tx:
+            return
+        if self.engine == "sqlite":
+            self._conn.execute("BEGIN")
+        elif self.engine == "duckdb":
+            self._conn.execute("BEGIN TRANSACTION")
+        self._in_tx = True
+
+    def commit(self) -> None:
+        if not self._in_tx:
+            return
+        if self.engine in {"sqlite", "duckdb"}:
+            self._conn.execute("COMMIT")
+        else:
+            self._conn.commit()
+        self._in_tx = False
+
+    def rollback(self) -> None:
+        if not self._in_tx:
+            return
+        try:
+            if self.engine in {"sqlite", "duckdb"}:
+                self._conn.execute("ROLLBACK")
+            else:
+                self._conn.rollback()
+        finally:
+            self._in_tx = False
+
+    def execute(self, sql: str, params: Sequence[Any] = ()) -> Any:
+        if params:
+            return self._conn.execute(sql, list(params))
+        return self._conn.execute(sql)
+
+    def executemany(self, sql: str, rows: Sequence[Sequence[Any]]) -> None:
+        if not rows:
+            return
+        if self.engine == "postgres":
+            with self._conn.cursor() as cur:
+                cur.executemany(sql, rows)
+            return
+        self._conn.executemany(sql, rows)
+
+    def fetchall(self, sql: str, params: Sequence[Any] = ()) -> list[tuple[Any, ...]]:
+        cur = self.execute(sql, params)
+        rows = cur.fetchall()
+        return [tuple(r) for r in rows]
+
+    def fetchone(self, sql: str, params: Sequence[Any] = ()) -> tuple[Any, ...] | None:
+        cur = self.execute(sql, params)
+        row = cur.fetchone()
+        return tuple(row) if row is not None else None
+
+    def table_exists(self, table_name: str) -> bool:
+        p = self.placeholder
+        if self.engine == "sqlite":
+            row = self.fetchone(
+                f"SELECT 1 FROM sqlite_master WHERE type='table' AND name={p}",
+                (table_name,),
+            )
+            return row is not None
+        if self.engine == "duckdb":
+            row = self.fetchone(
+                f"SELECT 1 FROM information_schema.tables "
+                f"WHERE table_schema='main' AND table_name={p}",
+                (table_name,),
+            )
+            return row is not None
+        row = self.fetchone(
+            f"SELECT 1 FROM information_schema.tables "
+            f"WHERE table_schema=current_schema() AND table_name={p}",
+            (table_name,),
+        )
+        return row is not None
+
+    def existing_columns(self, table_name: str) -> list[str]:
+        if not self.table_exists(table_name):
+            return []
+        if self.engine == "sqlite":
+            rows = self.fetchall(f"PRAGMA table_info({_qi(table_name)})")
+            return [str(r[1]) for r in rows]
+        p = self.placeholder
+        schema_clause = (
+            "table_schema='main'" if self.engine == "duckdb" else "table_schema=current_schema()"
+        )
+        rows = self.fetchall(
+            f"SELECT column_name FROM information_schema.columns "
+            f"WHERE {schema_clause} AND table_name={p} ORDER BY ordinal_position",
+            (table_name,),
+        )
+        return [str(r[0]) for r in rows]
+
+    def list_user_tables(self) -> list[str]:
+        if self.engine == "sqlite":
+            rows = self.fetchall(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+            return [str(r[0]) for r in rows]
+        schema_clause = (
+            "table_schema='main'" if self.engine == "duckdb" else "table_schema=current_schema()"
+        )
+        rows = self.fetchall(
+            f"SELECT table_name FROM information_schema.tables "
+            f"WHERE {schema_clause} AND table_type='BASE TABLE' ORDER BY table_name"
+        )
+        return [str(r[0]) for r in rows]
+
+    def close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+
+def _dialect_col_type(
+    col: TargetColumn,
+    mapping: ColumnMapping,
+    engine: str,
+) -> str:
+    if engine == "sqlite":
+        if col.physical_type is PhysicalType.INTEGER:
+            return "INTEGER"
+        if col.physical_type in {PhysicalType.DECIMAL, PhysicalType.FLOAT}:
+            return "REAL"
+        if col.physical_type is PhysicalType.BOOLEAN:
+            return "INTEGER"
+        if col.physical_type is PhysicalType.BINARY:
+            return "BLOB"
+        return "TEXT"
+
+    if engine == "duckdb":
+        if col.physical_type is PhysicalType.INTEGER:
+            return "BIGINT" if col.is_identity or mapping.type_cast == "bigint" else "INTEGER"
+        if col.physical_type is PhysicalType.DECIMAL:
+            m_dec = _DECIMAL_PS_RE.fullmatch(mapping.type_cast.strip())
+            if m_dec is not None:
+                return f"DECIMAL({int(m_dec.group(1))}, {int(m_dec.group(2))})"
+            if col.precision is not None and col.scale is not None:
+                return f"DECIMAL({col.precision}, {col.scale})"
+            return "DOUBLE"
+        if col.physical_type is PhysicalType.FLOAT:
+            return "DOUBLE"
+        if col.physical_type is PhysicalType.BOOLEAN:
+            return "BOOLEAN"
+        if col.physical_type is PhysicalType.DATE:
+            return "DATE"
+        if col.physical_type is PhysicalType.TIME:
+            return "TIME"
+        if col.physical_type is PhysicalType.TIMESTAMP:
+            return "TIMESTAMP"
+        if col.physical_type is PhysicalType.TIMESTAMPTZ:
+            return "TIMESTAMPTZ"
+        if col.physical_type is PhysicalType.BINARY:
+            return "BLOB"
+        return "VARCHAR"
+
+    # postgres
+    if col.is_identity:
+        return "BIGINT GENERATED ALWAYS AS IDENTITY"
+    return mapping.type_cast.upper()
+
+
+def _build_business_table_ddl(
+    target_table: TargetTable,
+    table_plan: TableLoadStrategy,
+    parent_pk_counts: Mapping[str, int],
+    *,
+    engine: str,
+    include_audit_columns: bool,
+) -> str:
+    map_by_target = {m.target_column: m for m in table_plan.column_mappings}
+    pk_cols = [c.name for c in target_table.columns if c.is_primary_key]
+    inline_sqlite_surr = (
+        engine == "sqlite"
+        and len(pk_cols) == 1
+        and any(c.name == pk_cols[0] and c.is_identity for c in target_table.columns)
+    )
+
+    col_defs: list[str] = []
+    for col in target_table.columns:
+        mapping = map_by_target[col.name]
+        dtype = _dialect_col_type(col, mapping, engine)
+        if inline_sqlite_surr and col.is_identity:
+            col_defs.append(f"{_qi(col.name)} INTEGER PRIMARY KEY AUTOINCREMENT")
+            continue
+        null_sql = "" if col.nullable else " NOT NULL"
+        col_defs.append(f"{_qi(col.name)} {dtype}{null_sql}")
+
+    if include_audit_columns:
+        audit_type = "VARCHAR" if engine == "duckdb" else "TEXT"
+        for ac in AUDIT_COLUMNS:
+            col_defs.append(f"{_qi(ac)} {audit_type} NOT NULL")
+
+    if pk_cols and not inline_sqlite_surr:
+        pk_expr = ", ".join(_qi(c) for c in pk_cols)
+        col_defs.append(f"PRIMARY KEY ({pk_expr})")
+
+    # 외래 키 제약(부모 단일 PK -> 컬럼별 FK, 복합 PK -> 부모 단위 묶음)
+    composite_groups: dict[str, list[tuple[str, str]]] = {}
+    for col in target_table.columns:
+        if col.foreign_key is None:
+            continue
+        p_tbl, rest = col.foreign_key.split("(", 1)
+        p_col = rest.rstrip(")")
+        if parent_pk_counts.get(p_tbl, 1) > 1:
+            composite_groups.setdefault(p_tbl, []).append((col.name, p_col))
+        else:
+            col_defs.append(f"FOREIGN KEY ({_qi(col.name)}) REFERENCES {_qi(p_tbl)} ({_qi(p_col)})")
+    for p_tbl, pairs in composite_groups.items():
+        if len(pairs) == parent_pk_counts.get(p_tbl, 0):
+            c_expr = ", ".join(_qi(c) for c, _ in pairs)
+            p_expr = ", ".join(_qi(p) for _, p in pairs)
+            col_defs.append(f"FOREIGN KEY ({c_expr}) REFERENCES {_qi(p_tbl)} ({p_expr})")
+
+    body = ",\n    ".join(col_defs)
+    return f"CREATE TABLE IF NOT EXISTS {_qi(target_table.name)} (\n    {body}\n)"
+
+
+def _parse_temporal_date(raw: str, *, korean: bool) -> date | None:
+    s = raw.strip()
+    if korean:
+        m_ko = _KOREAN_DATE_RE.fullmatch(s)
+        if m_ko is not None:
+            try:
+                return date(int(m_ko.group(1)), int(m_ko.group(2)), int(m_ko.group(3)))
+            except ValueError:
+                return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    if not korean and s.isdigit():
+        num = int(s)
+        if 25569 <= num <= 73050:
+            return date(1899, 12, 30) + timedelta(days=num)
+    return None
+
+
+def _parse_temporal_timestamp(raw: str) -> datetime | None:
+    s = raw.strip()
+    iso_s = s[:-1] + "+00:00" if s.endswith("Z") else s
+    try:
+        return datetime.fromisoformat(iso_s)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y.%m.%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_temporal_time(raw: str) -> dt_time | None:
+    s = raw.strip()
+    try:
+        return dt_time.fromisoformat(s)
+    except ValueError:
+        pass
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(s, fmt).time()
+        except ValueError:
+            continue
+    return None
+
+
+def _is_missing_raw(raw: Any) -> bool:
+    if raw is None:
+        return True
+    s = str(raw)
+    if not s.strip():
+        return True
+    return s in DEFAULT_MISSING_MARKERS
+
+
+def _transform_cell(
+    raw: Any,
+    *,
+    col: TargetColumn,
+    mapping: ColumnMapping,
+    slot_rx: tuple[re.Pattern[str], int] | None,
+    mask_policy: MaskingPolicy,
+    sensitive_type: SensitiveType | None,
+    engine: str,
+) -> tuple[bool, Any, str]:
+    """단일 원본 셀을 결정론적으로 변환·마스킹한다. 반환: `(ok, value, error_detail)`."""
+    if _is_missing_raw(raw):
+        return True, None, ""
+
+    s = str(raw)
+
+    # 1. 규칙 문자열 가변 슬롯 추출
+    if slot_rx is not None:
+        rx, cap_group = slot_rx
+        m = rx.search(s)
+        if m is None:
+            return False, None, "문자열 패턴 슬롯 추출 불일치"
+        extracted = m.group(cap_group)
+        if extracted is None or extracted == "":
+            return False, None, "추출된 슬롯 값이 비어 있음"
+        s = extracted
+
+    # 2. 마스킹/해시가 우선 지정된 비-PK/FK 컬럼(문자열 타입으로 승격됨)
+    if mapping.transform in {"pii_mask", "pii_hash"} or (
+        mask_policy is not MaskingPolicy.NONE and col.physical_type is PhysicalType.STRING
+    ):
+        masked = mask_value(s, sensitive_type, mask_policy)
+        return True, masked, ""
+
+    # 3. 변환식·물리 타입별 파싱
+    val: Any
+    if mapping.transform == "strip_currency_and_comma" or col.physical_type is PhysicalType.DECIMAL:
+        if not _CURRENCY_SHAPE_RE.search(s):
+            return False, None, "통화·숫자 형식 불일치"
+        cleaned = _CURRENCY_STRIP_RE.sub("", s)
+        try:
+            dec = Decimal(cleaned)
+        except InvalidOperation:
+            return False, None, "DECIMAL 변환 실패"
+        if not dec.is_finite():
+            return False, None, "유한하지 않은 수치 값"
+        if col.physical_type is PhysicalType.INTEGER:
+            if dec != int(dec):
+                return False, None, "정수 변환 불가(소수 존재)"
+            val = int(dec)
+        else:
+            val = float(dec) if engine == "sqlite" else dec
+    elif mapping.transform == "normalize_boolean" or col.physical_type is PhysicalType.BOOLEAN:
+        low = s.strip().lower()
+        if low in _TRUE_TOKENS:
+            val = 1 if engine == "sqlite" else True
+        elif low in _FALSE_TOKENS:
+            val = 0 if engine == "sqlite" else False
+        else:
+            return False, None, "불리언 값(Y/N·예/아니오·true/false) 형식 불일치"
+    elif mapping.transform == "parse_korean_date":
+        d = _parse_temporal_date(s, korean=True)
+        if d is None:
+            return False, None, "한국어 날짜 형식 변환 실패"
+        val = d.isoformat() if engine == "sqlite" else d
+    elif mapping.transform == "parse_iso_temporal" or col.physical_type in {
+        PhysicalType.DATE,
+        PhysicalType.TIME,
+        PhysicalType.TIMESTAMP,
+        PhysicalType.TIMESTAMPTZ,
+    }:
+        if col.physical_type is PhysicalType.TIME:
+            t_val = _parse_temporal_time(s)
+            if t_val is None:
+                return False, None, "시간(TIME) 변환 실패"
+            val = t_val.isoformat() if engine == "sqlite" else t_val
+        elif col.physical_type in {PhysicalType.TIMESTAMP, PhysicalType.TIMESTAMPTZ}:
+            ts_val = _parse_temporal_timestamp(s)
+            if ts_val is None:
+                return False, None, "타임스탬프(TIMESTAMP) 변환 실패"
+            val = ts_val.isoformat() if engine == "sqlite" else ts_val
+        else:
+            d = _parse_temporal_date(s, korean=False)
+            if d is None:
+                return False, None, "날짜(DATE) 변환 실패"
+            val = d.isoformat() if engine == "sqlite" else d
+    elif col.physical_type is PhysicalType.INTEGER:
+        st = s.strip()
+        if not _INT_RE.fullmatch(st):
+            return False, None, "정수(INTEGER) 형식 불일치"
+        iv = int(st)
+        if mapping.type_cast.lower() in {"int", "integer"} and not (INT4_MIN <= iv <= INT4_MAX):
+            return False, None, "INT4 허용 범위 초과"
+        val = iv
+    elif col.physical_type is PhysicalType.FLOAT:
+        try:
+            fv = float(s.strip())
+        except ValueError:
+            return False, None, "실수(FLOAT) 변환 실패"
+        if not math.isfinite(fv):
+            return False, None, "유한하지 않은 실수 값"
+        val = fv
+    else:
+        val = s
+        m_vc = _VARCHAR_LEN_RE.fullmatch(mapping.type_cast.strip())
+        if m_vc is not None and len(val) > int(m_vc.group(1)):
+            return False, None, f"VARCHAR({m_vc.group(1)}) 최대 길이 초과"
+
+    if mask_policy is not MaskingPolicy.NONE and isinstance(val, str):
+        val = mask_value(val, sensitive_type, mask_policy)
+    return True, val, ""
+
+
+def _resolve_slot_regex(
+    mapping: ColumnMapping,
+    cls_by_col: Mapping[str, ColumnClassification],
+) -> tuple[re.Pattern[str], int] | None:
+    cls = cls_by_col.get(mapping.source_column)
+    if cls is None or cls.string_pattern is None:
+        return None
+    sp = cls.string_pattern
+    for seg in sp.segments:
+        if seg.capture_group is not None and (
+            seg.extract_sql_hint == mapping.transform
+            or (
+                mapping.transform.startswith("NULLIF(regexp_extract(")
+                and f", {seg.capture_group}), '')" in mapping.transform
+            )
+        ):
+            return re.compile(sp.regex_pattern), int(seg.capture_group)
+    return None
+
+
+def _safe_quarantine_row_json(
+    headers: Sequence[str],
+    raw_row: Sequence[Any],
+    *,
+    table_masking: Mapping[str, MaskingPolicy],
+    pii_type_by_col: Mapping[str, SensitiveType],
+    pii_level_by_col: Mapping[str, SensitivityLevel],
+) -> str:
+    """격리 보관함에 기록할 원본 행 JSON을 생성하되 PII·마스킹 대상 컬럼은 항상 보호한다."""
+    payload: dict[str, Any] = {}
+    for h, cell in zip(headers, raw_row, strict=True):
+        if cell is None:
+            payload[h] = None
+            continue
+        s = str(cell)
+        policy = table_masking.get(h, MaskingPolicy.NONE)
+        stype = pii_type_by_col.get(h)
+        level = pii_level_by_col.get(h, SensitivityLevel.L0)
+        if policy is not MaskingPolicy.NONE:
+            payload[h] = mask_value(s, stype, policy)
+        elif level in {SensitivityLevel.L2, SensitivityLevel.L3}:
+            payload[h] = mask_value(s, stype, MaskingPolicy.MASK)
+        else:
+            payload[h] = s
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _normalize_key_for_lookup(val: Any) -> Any:
+    if isinstance(val, (date, datetime, dt_time)):
+        return val.isoformat()
+    if isinstance(val, Decimal):
+        return str(val)
+    return val
+
+
+def _insert_management_batch_record(
+    adapter: _DbAdapter,
+    *,
+    batch_id: str,
+    loaded_at: str,
+    purpose: Purpose,
+    selected_candidate_id: str,
+    status: str,
+    table_count: int,
+    total_rows_read: int,
+    total_rows_loaded: int,
+    total_rows_quarantined: int,
+    overrides_json: str,
+    notes: str,
+) -> None:
+    p = adapter.placeholder
+    placeholders = ", ".join([p] * 12)
+    adapter.execute(
+        f'INSERT INTO "_etl_load_batches" ('
+        f'"batch_id", "loaded_at", "purpose", "selected_candidate_id", '
+        f'"db_engine", "status", "table_count", "total_rows_read", '
+        f'"total_rows_loaded", "total_rows_quarantined", "overrides_json", "notes"'
+        f") VALUES ({placeholders})",
+        (
+            batch_id,
+            loaded_at,
+            purpose.value,
+            selected_candidate_id,
+            adapter.engine,
+            status,
+            table_count,
+            total_rows_read,
+            total_rows_loaded,
+            total_rows_quarantined,
+            overrides_json,
+            notes,
+        ),
+    )
+
+
+def _next_quarantine_id(adapter: _DbAdapter) -> int:
+    row = adapter.fetchone('SELECT COALESCE(MAX("quarantine_id"), 0) FROM "_etl_quarantine_rows"')
+    return int(row[0]) + 1 if row is not None else 1
+
+
+def _load_single_table(
+    adapter: _DbAdapter,
+    *,
+    mctx: MultiTableContext,
+    bundle: TableProfileBundle,
+    target_table: TargetTable,
+    table_plan: TableLoadStrategy,
+    smap: SensitivityMap,
+    batch_id: str,
+    dataset_id: str,
+    loaded_at: str,
+    include_audit_columns: bool,
+    orphan_policy: OrphanPolicy,
+) -> tuple[int, int, list[tuple[Any, ...]], str | None]:
+    """단일 테이블의 행 변환·제약 검증·DB INSERT/UPSERT를 수행한다."""
+    slot: TableSlotContext = mctx.get_by_name(table_plan.source_table)
+    src_rel = f"{slot.table_info.table_id}.{RAW_TABLE}"
+    raw_col_ids = [c.column_id for c in slot.columns]
+    raw_headers = [c.original_name for c in slot.columns]
+    header_pos = {name: idx for idx, name in enumerate(raw_headers)}
+
+    assert mctx.connection is not None
+    sel_sql = ", ".join(quote_identifier(cid) for cid in raw_col_ids)
+    raw_rows = mctx.connection.execute(f"SELECT {sel_sql} FROM {src_rel}").fetchall()
+
+    cls_by_col = {c.column: c for c in bundle.classifications}
+    map_by_target = {m.target_column: m for m in table_plan.column_mappings}
+    pii_type_by_col = {a.column: a.types[0] for a in smap.assignments if a.types}
+    pii_level_by_col = {a.column: a.level for a in smap.assignments}
+    table_masking = table_plan.column_masking
+
+    # 미리 정규식·슬롯 정보 준비
+    slot_rx_by_target: dict[str, tuple[re.Pattern[str], int] | None] = {}
+    for col in target_table.columns:
+        mapping = map_by_target[col.name]
+        slot_rx_by_target[col.name] = _resolve_slot_regex(mapping, cls_by_col)
+
+    # 라이브 DB에서 부모 FK 키 집합 조회
+    parent_keys: dict[str, set[Any]] = {}
+    for col in target_table.columns:
+        if col.foreign_key is None:
+            continue
+        p_tbl, rest = col.foreign_key.split("(", 1)
+        p_col = rest.rstrip(")")
+        rows_p = adapter.fetchall(
+            f"SELECT DISTINCT {_qi(p_col)} FROM {_qi(p_tbl)} WHERE {_qi(p_col)} IS NOT NULL"
+        )
+        parent_keys[col.name] = {_normalize_key_for_lookup(r[0]) for r in rows_p}
+
+    pk_cols = [c.name for c in target_table.columns if c.is_primary_key and not c.is_identity]
+    confirmed_uq_cols = [uq for uq in table_plan.confirmed_unique_columns if pk_cols != [uq]]
+
+    # 기존 DB에 저장된 UNIQUE 컬럼 값(다른 PK와 충돌 검사)
+    existing_unique_owner: dict[str, dict[Any, tuple[Any, ...]]] = {}
+    if confirmed_uq_cols and adapter.table_exists(target_table.name):
+        for uq_col in confirmed_uq_cols:
+            if pk_cols:
+                pk_sel = ", ".join(_qi(pk) for pk in pk_cols)
+                uq_rows = adapter.fetchall(
+                    f"SELECT {_qi(uq_col)}, {pk_sel} FROM {_qi(target_table.name)} "
+                    f"WHERE {_qi(uq_col)} IS NOT NULL"
+                )
+                existing_unique_owner[uq_col] = {
+                    _normalize_key_for_lookup(r[0]): tuple(
+                        _normalize_key_for_lookup(v) for v in r[1:]
+                    )
+                    for r in uq_rows
+                }
+            else:
+                uq_rows = adapter.fetchall(
+                    f"SELECT {_qi(uq_col)} FROM {_qi(target_table.name)} "
+                    f"WHERE {_qi(uq_col)} IS NOT NULL"
+                )
+                existing_unique_owner[uq_col] = {
+                    _normalize_key_for_lookup(r[0]): () for r in uq_rows
+                }
+
+    # INSERT 대상 컬럼 결정 (SQLite/PG 단일 IDENTITY는 DB 자동증가 위임, DuckDB는 명시 증가)
+    surr_col = next((c for c in target_table.columns if c.is_identity), None)
+    omit_identity_in_insert = surr_col is not None and adapter.engine in {"sqlite", "postgres"}
+    insert_cols = [
+        c for c in target_table.columns if not (omit_identity_in_insert and c.is_identity)
+    ]
+    insert_col_names = [c.name for c in insert_cols]
+    if include_audit_columns:
+        insert_col_names.extend(AUDIT_COLUMNS)
+
+    next_surr_id = 1
+    if surr_col is not None and not omit_identity_in_insert:
+        max_row = adapter.fetchone(
+            f"SELECT COALESCE(MAX({_qi(surr_col.name)}), 0) FROM {_qi(target_table.name)}"
+        )
+        next_surr_id = int(max_row[0]) + 1 if max_row is not None else 1
+
+    seen_pks: set[tuple[Any, ...]] = set()
+    seen_uqs: dict[str, set[Any]] = {uq: set() for uq in confirmed_uq_cols}
+    valid_rows: list[list[Any]] = []
+    quarantine_entries: list[tuple[Any, ...]] = []
+
+    for row_idx, raw_row in enumerate(raw_rows, start=1):
+        converted: dict[str, Any] = {}
+        err_cat: str | None = None
+        err_col = ""
+        err_detail = ""
+
+        for col in target_table.columns:
+            if col.is_identity:
+                continue
+            mapping = map_by_target[col.name]
+            src_col = mapping.source_column
+            pos = header_pos.get(src_col)
+            raw_val = raw_row[pos] if pos is not None else None
+            policy = table_masking.get(src_col, MaskingPolicy.NONE)
+            stype = pii_type_by_col.get(src_col)
+
+            ok, val, detail = _transform_cell(
+                raw_val,
+                col=col,
+                mapping=mapping,
+                slot_rx=slot_rx_by_target[col.name],
+                mask_policy=policy,
+                sensitive_type=stype,
+                engine=adapter.engine,
+            )
+            if not ok:
+                err_cat = "cast_error"
+                err_col = col.name
+                err_detail = detail
+                break
+            if val is None and not col.nullable:
+                err_cat = "not_null_violation"
+                err_col = col.name
+                err_detail = "필수(NOT NULL) 컬럼 값이 비어 있음"
+                break
+            converted[col.name] = val
+
+        # PK 중복 검사 (단일 배치 내 중복)
+        pk_tuple: tuple[Any, ...] = ()
+        if err_cat is None and pk_cols:
+            pk_tuple = tuple(_normalize_key_for_lookup(converted[c]) for c in pk_cols)
+            if pk_tuple in seen_pks:
+                err_cat = "pk_duplicate"
+                err_col = ",".join(pk_cols)
+                err_detail = "동일 파일 내 기본 키(PK) 중복"
+
+        # 확정 UNIQUE 컬럼 중복 검사
+        if err_cat is None and confirmed_uq_cols:
+            for uq_col in confirmed_uq_cols:
+                uq_val = converted.get(uq_col)
+                if uq_val is None:
+                    continue
+                norm_uq = _normalize_key_for_lookup(uq_val)
+                if norm_uq in seen_uqs[uq_col]:
+                    err_cat = "unique_violation"
+                    err_col = uq_col
+                    err_detail = "동일 파일 내 확정 UNIQUE 컬럼 중복"
+                    break
+                prev_owner = existing_unique_owner.get(uq_col, {}).get(norm_uq)
+                if prev_owner is not None and (not pk_cols or prev_owner != pk_tuple):
+                    err_cat = "unique_violation"
+                    err_col = uq_col
+                    err_detail = "기존 DB 행과 확정 UNIQUE 컬럼 중복"
+                    break
+
+        # FK 부모 존재 검사
+        if err_cat is None:
+            for col in target_table.columns:
+                if col.foreign_key is None:
+                    continue
+                fk_val = converted.get(col.name)
+                if fk_val is None:
+                    continue
+                if _normalize_key_for_lookup(fk_val) not in parent_keys.get(col.name, set()):
+                    err_cat = "fk_orphan"
+                    err_col = col.name
+                    err_detail = f"참조 부모({col.foreign_key})에 존재하지 않는 고아 외래 키"
+                    break
+
+        if err_cat is not None:
+            if orphan_policy is OrphanPolicy.REJECT_ALL:
+                return (
+                    len(raw_rows),
+                    0,
+                    [],
+                    f"`{target_table.name}` {row_idx}행 `{err_col}` ({err_cat}): {err_detail}",
+                )
+            safe_json = _safe_quarantine_row_json(
+                raw_headers,
+                raw_row,
+                table_masking=table_masking,
+                pii_type_by_col=pii_type_by_col,
+                pii_level_by_col=pii_level_by_col,
+            )
+            quarantine_entries.append(
+                (
+                    batch_id,
+                    dataset_id,
+                    target_table.name,
+                    row_idx,
+                    err_cat,
+                    err_col,
+                    err_detail,
+                    safe_json,
+                    loaded_at,
+                )
+            )
+            continue
+
+        if pk_cols:
+            seen_pks.add(pk_tuple)
+        for uq_col in confirmed_uq_cols:
+            uq_val = converted.get(uq_col)
+            if uq_val is not None:
+                seen_uqs[uq_col].add(_normalize_key_for_lookup(uq_val))
+
+        row_values: list[Any] = []
+        for col in insert_cols:
+            if col.is_identity:
+                row_values.append(next_surr_id)
+                next_surr_id += 1
+            else:
+                row_values.append(converted[col.name])
+        if include_audit_columns:
+            row_values.extend([batch_id, dataset_id, loaded_at])
+        valid_rows.append(row_values)
+
+    if valid_rows:
+        cols_sql = ", ".join(_qi(c) for c in insert_col_names)
+        placeholders = ", ".join([adapter.placeholder] * len(insert_col_names))
+        insert_sql = f"INSERT INTO {_qi(target_table.name)} ({cols_sql}) VALUES ({placeholders})"
+        if pk_cols and table_plan.increment_mode in {
+            IncrementMode.UPSERT,
+            IncrementMode.WATERMARK,
+        }:
+            pk_set = set(pk_cols)
+            non_pk_cols = [c for c in insert_col_names if c not in pk_set]
+            pk_sql = ", ".join(_qi(c) for c in pk_cols)
+            if non_pk_cols:
+                set_sql = ", ".join(f"{_qi(c)} = excluded.{_qi(c)}" for c in non_pk_cols)
+                insert_sql += f" ON CONFLICT ({pk_sql}) DO UPDATE SET {set_sql}"
+            else:
+                insert_sql += f" ON CONFLICT ({pk_sql}) DO NOTHING"
+        adapter.executemany(insert_sql, valid_rows)
+
+    return len(raw_rows), len(valid_rows), quarantine_entries, None
+
+
+def load_tables(
+    sources: Sequence[str | Path] = (),
+    *,
+    db_path: str | Path,
+    engine: str = "sqlite",
+    extra_tables: Sequence[NamedTableInput] = (),
+    purpose: Purpose | str = Purpose.OLTP,
+    decompose_strings: bool = True,
+    overrides: SchemaOverrideSpec | None = None,
+    auto_mask_pii: bool = False,
+    skip_duplicate_files: bool = True,
+    force_reload: bool = False,
+    recursive: bool = True,
+    min_inclusion_rate: float = MIN_INCLUSION_RATE,
+    notes: str = "",
+) -> tuple[MultiTableAnalysisBundle, DbLoadResult]:
+    """여러 표 파일을 결정론 분석하고 실제 DB(SQLite/DuckDB/PostgreSQL)에 적재한다.
+
+    기본적으로 4개의 데이터 관리 테이블(``_etl_load_batches``, ``_etl_datasets``,
+    ``_etl_column_registry``, ``_etl_quarantine_rows``)과 행 단위 이력 컬럼
+    (``_etl_batch_id``, ``_etl_dataset_id``, ``_etl_loaded_at``)을 함께 생성·기록한다.
+    """
+    t0 = time.perf_counter()
+    norm_engine = _normalize_engine(engine)
+    resolved_purpose = purpose if isinstance(purpose, Purpose) else Purpose(purpose)
+    spec = overrides if overrides is not None else SchemaOverrideSpec()
+
+    batch_stamp = datetime.now(timezone.utc)
+    loaded_at = batch_stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+    batch_id = f"batch_{batch_stamp.strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
+
+    inputs_arg: Sequence[str | Path] | None = list(sources) if sources else None
+    with MultiTableContext(
+        inputs=inputs_arg,
+        extra_tables=extra_tables,
+        recursive=recursive,
+    ) as mctx:
+        tables = profile_all_tables(mctx)
+        relations = analyze_multi_table_relations(
+            mctx,
+            tables,
+            min_inclusion_rate=min_inclusion_rate,
+        )
+        sensitivity_by_table: dict[str, SensitivityMap] = {}
+        for tb in tables:
+            slot = mctx.activate(tb.source.table_id)
+            sensitivity_by_table[tb.source.table_name] = detect_table_sensitivity(tb, slot)
+
+        if auto_mask_pii:
+            from autoetl.contracts import ColumnOverride
+
+            existing_keys = {(ov.table, ov.source_column) for ov in spec.columns}
+            merged_cols = list(spec.columns)
+            for t_name, smap in sensitivity_by_table.items():
+                for assign in smap.assignments:
+                    if assign.level not in {SensitivityLevel.L2, SensitivityLevel.L3}:
+                        continue
+                    key = (t_name, assign.column)
+                    if key in existing_keys:
+                        merged_cols = [
+                            ov.model_copy(update={"masking": MaskingPolicy.MASK})
+                            if (ov.table, ov.source_column) == key
+                            and ov.masking is MaskingPolicy.NONE
+                            else ov
+                            for ov in merged_cols
+                        ]
+                    else:
+                        merged_cols.append(
+                            ColumnOverride(
+                                table=t_name,
+                                source_column=assign.column,
+                                masking=MaskingPolicy.MASK,
+                            )
+                        )
+            spec = spec.model_copy(update={"columns": merged_cols})
+
+        overrides_json = spec.model_dump_json()
+
+        load_plan = plan_multi_table_load(
+            tables,
+            relations,
+            purpose=resolved_purpose,
+            decompose_strings=decompose_strings,
+            mctx=mctx,
+            overrides=spec,
+        )
+
+        analysis_warnings: list[str] = []
+        for tb in tables:
+            analysis_warnings.extend(tb.warnings)
+        analysis_warnings.extend(relations.notes)
+
+        bundle = MultiTableAnalysisBundle(
+            purpose=resolved_purpose,
+            tables=tables,
+            relations=relations,
+            load_plan=load_plan,
+            warnings=analysis_warnings,
+        )
+
+        selected_cand = next(
+            c for c in load_plan.candidates if c.id == load_plan.selected_candidate_id
+        )
+        cand_table_by_name = {t.name: t for t in selected_cand.tables}
+        bundle_by_name = {tb.source.table_name: tb for tb in tables}
+        parent_pk_counts = {
+            t.name: sum(1 for c in t.columns if c.is_primary_key) for t in selected_cand.tables
+        }
+
+        adapter = _DbAdapter(db_path, norm_engine)
+        load_warnings: list[str] = []
+        outcomes: list[TableLoadOutcome] = []
+        mgmt_created: list[str] = []
+
+        try:
+            adapter.begin()
+
+            # 1. 디폴트 관리 테이블 생성
+            if spec.include_management_tables:
+                mgmt_ddl = render_management_tables_ddl(norm_engine)
+                for stmt in mgmt_ddl.split(";"):
+                    s_clean = stmt.strip()
+                    if s_clean:
+                        adapter.execute(s_clean)
+                mgmt_created = list(DEFAULT_MANAGEMENT_TABLES)
+
+            # 2. 배치 레코드 선등록(FK 참조 대상: _etl_datasets.batch_id)
+            if spec.include_management_tables:
+                _insert_management_batch_record(
+                    adapter,
+                    batch_id=batch_id,
+                    loaded_at=loaded_at,
+                    purpose=resolved_purpose,
+                    selected_candidate_id=load_plan.selected_candidate_id,
+                    status="running",
+                    table_count=len(load_plan.table_plans),
+                    total_rows_read=0,
+                    total_rows_loaded=0,
+                    total_rows_quarantined=0,
+                    overrides_json=overrides_json,
+                    notes=notes,
+                )
+
+            total_read = 0
+            total_loaded = 0
+            total_quarantined = 0
+            all_quarantine_rows: list[tuple[Any, ...]] = []
+            reject_reason: str | None = None
+
+            # 3. 위상 적재 순서(부모 -> 자식)대로 테이블 생성·진화·적재
+            for tp in load_plan.table_plans:
+                t_name = tp.target_table
+                target_tbl = cand_table_by_name[t_name]
+                tb = bundle_by_name[tp.source_table]
+                slot = mctx.get_by_name(tp.source_table)
+                src_sha = slot.source_sha256 or _sha256_path(slot.spec.load_path)
+                schema_fp = compute_schema_fingerprint(tp)
+                dataset_kind = classify_dataset_kind(t_name, selected_cand, relations, tp)
+                dataset_id = (
+                    f"ds_{t_name}_{batch_stamp.strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:6]}"
+                )
+
+                # 3a. 동일 파일 중복 적재 및 스키마 변경(드리프트) 감지
+                duplicate_hit = False
+                schema_drift = False
+                if spec.include_management_tables and adapter.table_exists("_etl_datasets"):
+                    p = adapter.placeholder
+                    if skip_duplicate_files and not force_reload and src_sha:
+                        dup_row = adapter.fetchone(
+                            f'SELECT d."dataset_id" FROM "_etl_datasets" d '
+                            f'JOIN "_etl_load_batches" b ON d."batch_id" = b."batch_id" '
+                            f'WHERE d."target_table" = {p} AND d."source_sha256" = {p} '
+                            f"AND b.\"status\" IN ('succeeded', 'partial') LIMIT 1",
+                            (t_name, src_sha),
+                        )
+                        if dup_row is not None:
+                            duplicate_hit = True
+                            load_warnings.append(
+                                f"`{t_name}` ({tb.source.display_name}): 동일 파일(SHA-256 일치)이 "
+                                f"이미 적재되어 건너뛰었습니다(강제 재적재 시 force_reload=True)."
+                            )
+
+                    prev_fp_row = adapter.fetchone(
+                        f'SELECT d."schema_fingerprint" FROM "_etl_datasets" d '
+                        f'JOIN "_etl_load_batches" b ON d."batch_id" = b."batch_id" '
+                        f'WHERE d."target_table" = {p} '
+                        f"AND b.\"status\" IN ('succeeded', 'partial') "
+                        f'ORDER BY d."loaded_at" DESC LIMIT 1',
+                        (t_name,),
+                    )
+                    if prev_fp_row is not None and str(prev_fp_row[0]) != schema_fp:
+                        schema_drift = True
+                        load_warnings.append(
+                            f"`{t_name}` 스키마 변경(드리프트) 감지: "
+                            f"이전 지문 `{prev_fp_row[0]}` → 현재 `{schema_fp}`."
+                        )
+
+                if duplicate_hit:
+                    outcomes.append(
+                        TableLoadOutcome(
+                            dataset_id=dataset_id,
+                            target_table=t_name,
+                            dataset_kind=dataset_kind,
+                            source_name=tb.source.display_name,
+                            source_sha256=src_sha,
+                            schema_fingerprint=schema_fp,
+                            increment_mode=tp.increment_mode,
+                            rows_read=0,
+                            rows_loaded=0,
+                            rows_quarantined=0,
+                            skipped_duplicate_file=True,
+                            schema_drift_detected=schema_drift,
+                            masked_columns=sorted(tp.column_masking.keys()),
+                        )
+                    )
+                    continue
+
+                # 3b. 업무 테이블 DDL 생성(없으면 생성, 이미 있으면 신규 컬럼 진화 추가)
+                existed = adapter.table_exists(t_name)
+                if not existed:
+                    ddl_stmt = _build_business_table_ddl(
+                        target_tbl,
+                        tp,
+                        parent_pk_counts,
+                        engine=norm_engine,
+                        include_audit_columns=spec.include_audit_columns,
+                    )
+                    adapter.execute(ddl_stmt)
+                else:
+                    existing_cols = set(adapter.existing_columns(t_name))
+                    map_by_target = {m.target_column: m for m in tp.column_mappings}
+                    for col in target_tbl.columns:
+                        if col.name not in existing_cols:
+                            dtype = _dialect_col_type(col, map_by_target[col.name], norm_engine)
+                            adapter.execute(
+                                f"ALTER TABLE {_qi(t_name)} ADD COLUMN {_qi(col.name)} {dtype}"
+                            )
+                    if spec.include_audit_columns:
+                        audit_type = "VARCHAR" if norm_engine == "duckdb" else "TEXT"
+                        for ac in AUDIT_COLUMNS:
+                            if ac not in existing_cols:
+                                adapter.execute(
+                                    f"ALTER TABLE {_qi(t_name)} ADD COLUMN {_qi(ac)} {audit_type}"
+                                )
+
+                # 3c. 권고·확정 인덱스 생성
+                for idx_i, idx_rec in enumerate(tp.recommended_indexes):
+                    prefix = "uq" if idx_rec.unique else "idx"
+                    idx_name = f"{prefix}_{t_name}_{'_'.join(idx_rec.columns)}_{idx_i}"[:60]
+                    uq_kw = "UNIQUE " if idx_rec.unique else ""
+                    idx_cols_sql = ", ".join(_qi(c) for c in idx_rec.columns)
+                    adapter.execute(
+                        f"CREATE {uq_kw}INDEX IF NOT EXISTS {_qi(idx_name)} "
+                        f"ON {_qi(t_name)} ({idx_cols_sql})"
+                    )
+
+                # 3d. 실제 행 변환·검증·적재
+                smap = sensitivity_by_table[tp.source_table]
+                rows_read, rows_loaded, q_entries, err_msg = _load_single_table(
+                    adapter,
+                    mctx=mctx,
+                    bundle=tb,
+                    target_table=target_tbl,
+                    table_plan=tp,
+                    smap=smap,
+                    batch_id=batch_id,
+                    dataset_id=dataset_id,
+                    loaded_at=loaded_at,
+                    include_audit_columns=spec.include_audit_columns,
+                    orphan_policy=spec.orphan_policy,
+                )
+
+                if err_msg is not None:
+                    reject_reason = err_msg
+                    break
+
+                total_read += rows_read
+                total_loaded += rows_loaded
+                total_quarantined += len(q_entries)
+                all_quarantine_rows.extend(q_entries)
+
+                # 3e. 데이터셋 & 컬럼 사전 카탈로그 기록
+                if spec.include_management_tables:
+                    p = adapter.placeholder
+                    ds_ph = ", ".join([p] * 17)
+                    adapter.execute(
+                        f'INSERT INTO "_etl_datasets" ('
+                        f'"dataset_id", "batch_id", "load_order_index", "target_table", '
+                        f'"dataset_kind", "source_name", "source_format", "source_encoding", '
+                        f'"source_sha256", "schema_fingerprint", "increment_mode", '
+                        f'"primary_key_columns", "rows_read", "rows_loaded", "rows_quarantined", '
+                        f'"schema_drift_detected", "loaded_at"'
+                        f") VALUES ({ds_ph})",
+                        (
+                            dataset_id,
+                            batch_id,
+                            tp.load_order_index,
+                            t_name,
+                            dataset_kind.value,
+                            tb.source.display_name,
+                            tb.source.source_kind.value,
+                            tp.source_encoding,
+                            src_sha,
+                            schema_fp,
+                            tp.increment_mode.value,
+                            json.dumps(tp.primary_key, ensure_ascii=False),
+                            rows_read,
+                            rows_loaded,
+                            len(q_entries),
+                            1 if schema_drift else 0,
+                            loaded_at,
+                        ),
+                    )
+
+                    cls_by_col = {c.column: c for c in tb.classifications}
+                    s_assign_by_col = {a.column: a for a in smap.assignments}
+                    col_by_name = {c.name: c for c in target_tbl.columns}
+                    uq_set = set(tp.confirmed_unique_columns)
+                    reg_rows: list[tuple[Any, ...]] = []
+                    for col_ord, cm in enumerate(tp.column_mappings, start=1):
+                        tcol = col_by_name[cm.target_column]
+                        src_cls = cls_by_col.get(cm.source_column)
+                        if tcol.is_identity:
+                            role = "surrogate_key"
+                        elif cm.transform.startswith("NULLIF(regexp_extract("):
+                            role = "extracted_slot"
+                        elif src_cls is not None:
+                            role = src_cls.category.value
+                        else:
+                            role = "unknown"
+                        s_assign = s_assign_by_col.get(cm.source_column)
+                        pii_lvl = s_assign.level.value if s_assign is not None else "L0"
+                        pii_types_json = json.dumps(
+                            [st.value for st in s_assign.types] if s_assign is not None else [],
+                            ensure_ascii=False,
+                        )
+                        mask_pol = tp.column_masking.get(cm.source_column, MaskingPolicy.NONE).value
+                        reg_rows.append(
+                            (
+                                dataset_id,
+                                t_name,
+                                col_ord,
+                                cm.source_column,
+                                cm.target_column,
+                                role,
+                                cm.type_cast,
+                                1 if tcol.is_primary_key else 0,
+                                1 if (tcol.name in uq_set or tp.primary_key == [tcol.name]) else 0,
+                                tcol.foreign_key,
+                                cm.transform,
+                                pii_lvl,
+                                pii_types_json,
+                                mask_pol,
+                            )
+                        )
+                    reg_ph = ", ".join([p] * 14)
+                    adapter.executemany(
+                        f'INSERT INTO "_etl_column_registry" ('
+                        f'"dataset_id", "target_table", "column_order", "source_column", '
+                        f'"target_column", "data_role", "db_type", "is_primary_key", '
+                        f'"is_unique", "foreign_key_ref", "transform_rule", "pii_level", '
+                        f'"pii_types", "masking_policy"'
+                        f") VALUES ({reg_ph})",
+                        reg_rows,
+                    )
+
+                outcomes.append(
+                    TableLoadOutcome(
+                        dataset_id=dataset_id,
+                        target_table=t_name,
+                        dataset_kind=dataset_kind,
+                        source_name=tb.source.display_name,
+                        source_sha256=src_sha,
+                        schema_fingerprint=schema_fp,
+                        increment_mode=tp.increment_mode,
+                        rows_read=rows_read,
+                        rows_loaded=rows_loaded,
+                        rows_quarantined=len(q_entries),
+                        skipped_duplicate_file=False,
+                        schema_drift_detected=schema_drift,
+                        masked_columns=sorted(tp.column_masking.keys()),
+                    )
+                )
+
+            # 4. REJECT_ALL 중단 시 전체 롤백 + 실패 배치 이력만 별도 감사 기록
+            if reject_reason is not None:
+                adapter.rollback()
+                load_warnings.append(f"적재 중단(reject_all): {reject_reason}")
+                if spec.include_management_tables:
+                    adapter.begin()
+                    mgmt_ddl = render_management_tables_ddl(norm_engine)
+                    for stmt in mgmt_ddl.split(";"):
+                        s_clean = stmt.strip()
+                        if s_clean:
+                            adapter.execute(s_clean)
+                    _insert_management_batch_record(
+                        adapter,
+                        batch_id=batch_id,
+                        loaded_at=loaded_at,
+                        purpose=resolved_purpose,
+                        selected_candidate_id=load_plan.selected_candidate_id,
+                        status="failed",
+                        table_count=len(load_plan.table_plans),
+                        total_rows_read=total_read,
+                        total_rows_loaded=0,
+                        total_rows_quarantined=0,
+                        overrides_json=overrides_json,
+                        notes=reject_reason,
+                    )
+                    adapter.commit()
+                elapsed = round(time.perf_counter() - t0, 4)
+                return bundle, DbLoadResult(
+                    batch_id=batch_id,
+                    loaded_at=loaded_at,
+                    db_engine=norm_engine,
+                    db_target=str(db_path),
+                    status="failed",
+                    purpose=resolved_purpose,
+                    selected_candidate_id=load_plan.selected_candidate_id,
+                    management_tables_created=mgmt_created,
+                    tables=[],
+                    total_rows_read=total_read,
+                    total_rows_loaded=0,
+                    total_rows_quarantined=0,
+                    elapsed_seconds=elapsed,
+                    warnings=load_warnings,
+                )
+
+            # 5. 격리 행 기록 및 최종 배치 상태 갱신
+            if spec.include_management_tables and all_quarantine_rows:
+                p = adapter.placeholder
+                if norm_engine == "duckdb":
+                    next_qid = _next_quarantine_id(adapter)
+                    q_with_id = [(next_qid + i, *row) for i, row in enumerate(all_quarantine_rows)]
+                    q_ph = ", ".join([p] * 10)
+                    adapter.executemany(
+                        f'INSERT INTO "_etl_quarantine_rows" ('
+                        f'"quarantine_id", "batch_id", "dataset_id", "target_table", '
+                        f'"source_row_number", "error_category", "error_column", '
+                        f'"error_detail", "raw_row_json", "quarantined_at"'
+                        f") VALUES ({q_ph})",
+                        q_with_id,
+                    )
+                else:
+                    q_ph = ", ".join([p] * 9)
+                    adapter.executemany(
+                        f'INSERT INTO "_etl_quarantine_rows" ('
+                        f'"batch_id", "dataset_id", "target_table", "source_row_number", '
+                        f'"error_category", "error_column", "error_detail", '
+                        f'"raw_row_json", "quarantined_at"'
+                        f") VALUES ({q_ph})",
+                        all_quarantine_rows,
+                    )
+
+            if outcomes and all(o.skipped_duplicate_file for o in outcomes):
+                final_status = "skipped_duplicate"
+            elif total_quarantined > 0:
+                final_status = "partial"
+                load_warnings.append(
+                    f"변환·제약 오류 행 {total_quarantined}건을 `_etl_quarantine_rows` 격리함에 "
+                    "분리 저장했습니다."
+                )
+            else:
+                final_status = "succeeded"
+
+            if spec.include_management_tables:
+                p = adapter.placeholder
+                final_notes = notes or ("; ".join(load_warnings) if load_warnings else "")
+                adapter.execute(
+                    f'UPDATE "_etl_load_batches" '
+                    f'SET "status" = {p}, "total_rows_read" = {p}, '
+                    f'"total_rows_loaded" = {p}, "total_rows_quarantined" = {p}, '
+                    f'"notes" = {p} WHERE "batch_id" = {p}',
+                    (
+                        final_status,
+                        total_read,
+                        total_loaded,
+                        total_quarantined,
+                        final_notes,
+                        batch_id,
+                    ),
+                )
+
+            adapter.commit()
+        except Exception:
+            adapter.rollback()
+            raise
+        finally:
+            adapter.close()
+
+    elapsed = round(time.perf_counter() - t0, 4)
+    return bundle, DbLoadResult(
+        batch_id=batch_id,
+        loaded_at=loaded_at,
+        db_engine=norm_engine,
+        db_target=str(db_path),
+        status=final_status,
+        purpose=resolved_purpose,
+        selected_candidate_id=load_plan.selected_candidate_id,
+        management_tables_created=mgmt_created,
+        tables=outcomes,
+        total_rows_read=total_read,
+        total_rows_loaded=total_loaded,
+        total_rows_quarantined=total_quarantined,
+        elapsed_seconds=elapsed,
+        warnings=load_warnings,
+    )
+
+
+def inspect_db_catalog(
+    db_path: str | Path,
+    *,
+    engine: str = "sqlite",
+    limit: int = 50,
+) -> dict[str, Any]:
+    """적재된 DB의 기본 데이터 관리 테이블(배치·데이터셋·컬럼 사전·격리함)과 표 현황을 조회한다."""
+    norm_engine = _normalize_engine(engine)
+    adapter = _DbAdapter(db_path, norm_engine)
+    try:
+        p = adapter.placeholder
+        all_tables = adapter.list_user_tables()
+        mgmt_set = set(DEFAULT_MANAGEMENT_TABLES)
+        business_tables: list[dict[str, Any]] = []
+        for tbl in all_tables:
+            if tbl in mgmt_set:
+                continue
+            cnt_row = adapter.fetchone(f"SELECT COUNT(*) FROM {_qi(tbl)}")
+            business_tables.append(
+                {
+                    "table": tbl,
+                    "row_count": int(cnt_row[0]) if cnt_row is not None else 0,
+                    "columns": adapter.existing_columns(tbl),
+                }
+            )
+
+        batches: list[dict[str, Any]] = []
+        if adapter.table_exists("_etl_load_batches"):
+            rows = adapter.fetchall(
+                f'SELECT "batch_id", "loaded_at", "purpose", "selected_candidate_id", '
+                f'"db_engine", "status", "table_count", "total_rows_read", '
+                f'"total_rows_loaded", "total_rows_quarantined", "notes" '
+                f'FROM "_etl_load_batches" ORDER BY "loaded_at" DESC LIMIT {p}',
+                (limit,),
+            )
+            for r in rows:
+                batches.append(
+                    {
+                        "batch_id": r[0],
+                        "loaded_at": r[1],
+                        "purpose": r[2],
+                        "selected_candidate_id": r[3],
+                        "db_engine": r[4],
+                        "status": r[5],
+                        "table_count": int(r[6]),
+                        "total_rows_read": int(r[7]),
+                        "total_rows_loaded": int(r[8]),
+                        "total_rows_quarantined": int(r[9]),
+                        "notes": r[10],
+                    }
+                )
+
+        datasets: list[dict[str, Any]] = []
+        if adapter.table_exists("_etl_datasets"):
+            rows = adapter.fetchall(
+                f'SELECT "dataset_id", "batch_id", "load_order_index", "target_table", '
+                f'"dataset_kind", "source_name", "source_format", "source_encoding", '
+                f'"source_sha256", "schema_fingerprint", "increment_mode", "primary_key_columns", '
+                f'"rows_read", "rows_loaded", "rows_quarantined", '
+                f'"schema_drift_detected", "loaded_at" '
+                f'FROM "_etl_datasets" ORDER BY "loaded_at" DESC, "load_order_index" ASC '
+                f"LIMIT {p}",
+                (limit,),
+            )
+            for r in rows:
+                kind_str = str(r[4])
+                try:
+                    kind_ko = _DATASET_KIND_LABELS_KO[DatasetKind(kind_str)]
+                except ValueError:
+                    kind_ko = kind_str
+                datasets.append(
+                    {
+                        "dataset_id": r[0],
+                        "batch_id": r[1],
+                        "load_order_index": int(r[2]),
+                        "target_table": r[3],
+                        "dataset_kind": kind_str,
+                        "dataset_kind_label": kind_ko,
+                        "source_name": r[5],
+                        "source_format": r[6],
+                        "source_encoding": r[7],
+                        "source_sha256": r[8],
+                        "schema_fingerprint": r[9],
+                        "increment_mode": r[10],
+                        "primary_key_columns": json.loads(str(r[11])) if r[11] else [],
+                        "rows_read": int(r[12]),
+                        "rows_loaded": int(r[13]),
+                        "rows_quarantined": int(r[14]),
+                        "schema_drift_detected": bool(r[15]),
+                        "loaded_at": r[16],
+                    }
+                )
+
+        columns: list[dict[str, Any]] = []
+        if adapter.table_exists("_etl_column_registry"):
+            rows = adapter.fetchall(
+                f'SELECT "dataset_id", "target_table", "column_order", "source_column", '
+                f'"target_column", "data_role", "db_type", "is_primary_key", '
+                f'"is_unique", "foreign_key_ref", "transform_rule", "pii_level", '
+                f'"pii_types", "masking_policy" '
+                f'FROM "_etl_column_registry" ORDER BY "dataset_id" DESC, "column_order" ASC '
+                f"LIMIT {p}",
+                (limit * 10,),
+            )
+            for r in rows:
+                columns.append(
+                    {
+                        "dataset_id": r[0],
+                        "target_table": r[1],
+                        "column_order": int(r[2]),
+                        "source_column": r[3],
+                        "target_column": r[4],
+                        "data_role": r[5],
+                        "db_type": r[6],
+                        "is_primary_key": bool(r[7]),
+                        "is_unique": bool(r[8]),
+                        "foreign_key_ref": r[9],
+                        "transform_rule": r[10],
+                        "pii_level": r[11],
+                        "pii_types": json.loads(str(r[12])) if r[12] else [],
+                        "masking_policy": r[13],
+                    }
+                )
+
+        quarantine: list[dict[str, Any]] = []
+        if adapter.table_exists("_etl_quarantine_rows"):
+            rows = adapter.fetchall(
+                f'SELECT "quarantine_id", "batch_id", "dataset_id", "target_table", '
+                f'"source_row_number", "error_category", "error_column", '
+                f'"error_detail", "raw_row_json", "quarantined_at" '
+                f'FROM "_etl_quarantine_rows" ORDER BY "quarantine_id" DESC LIMIT {p}',
+                (limit,),
+            )
+            for r in rows:
+                quarantine.append(
+                    {
+                        "quarantine_id": int(r[0]),
+                        "batch_id": r[1],
+                        "dataset_id": r[2],
+                        "target_table": r[3],
+                        "source_row_number": int(r[4]),
+                        "error_category": r[5],
+                        "error_column": r[6],
+                        "error_detail": r[7],
+                        "raw_row_json": r[8],
+                        "quarantined_at": r[9],
+                    }
+                )
+
+        return {
+            "db_engine": norm_engine,
+            "db_target": str(db_path),
+            "management_tables": [t for t in DEFAULT_MANAGEMENT_TABLES if t in set(all_tables)],
+            "business_tables": business_tables,
+            "batches": batches,
+            "datasets": datasets,
+            "columns": columns,
+            "quarantine": quarantine,
+        }
+    finally:
+        adapter.close()
+
+
+def rollback_batch(
+    db_path: str | Path,
+    batch_id: str,
+    *,
+    engine: str = "sqlite",
+) -> dict[str, Any]:
+    """지정 ``batch_id``로 적재된 행을 역순 삭제하고 상태를 ``rolled_back``으로 변경한다."""
+    norm_engine = _normalize_engine(engine)
+    adapter = _DbAdapter(db_path, norm_engine)
+    try:
+        p = adapter.placeholder
+        if not adapter.table_exists("_etl_load_batches") or not adapter.table_exists(
+            "_etl_datasets"
+        ):
+            raise InputError(
+                "데이터 관리 테이블(_etl_load_batches/_etl_datasets)이 없어 롤백할 수 없습니다."
+            )
+
+        batch_row = adapter.fetchone(
+            f'SELECT "status" FROM "_etl_load_batches" WHERE "batch_id" = {p}',
+            (batch_id,),
+        )
+        if batch_row is None:
+            raise InputError(f"존재하지 않는 batch_id입니다: {batch_id}")
+        if str(batch_row[0]) == "rolled_back":
+            raise InputError(f"이미 롤백된 배치입니다: {batch_id}")
+
+        ds_rows = adapter.fetchall(
+            f'SELECT "target_table" FROM "_etl_datasets" WHERE "batch_id" = {p} '
+            f'ORDER BY "load_order_index" DESC',
+            (batch_id,),
+        )
+        # 위상 적재 역순(자식 테이블 먼저, 부모 테이블 나중)으로 삭제해 FK 제약을 지킨다.
+        seen_tables: list[str] = []
+        for (tbl_name,) in ds_rows:
+            t_str = str(tbl_name)
+            if t_str not in seen_tables:
+                seen_tables.append(t_str)
+
+        adapter.begin()
+        deleted_by_table: dict[str, int] = {}
+        total_deleted = 0
+        for tbl in seen_tables:
+            if not adapter.table_exists(tbl):
+                continue
+            cols = adapter.existing_columns(tbl)
+            if "_etl_batch_id" not in cols:
+                raise InputError(
+                    f"`{tbl}` 테이블에 `_etl_batch_id` 이력 컬럼이 없어 "
+                    "배치 롤백을 수행할 수 없습니다."
+                )
+            cnt_row = adapter.fetchone(
+                f'SELECT COUNT(*) FROM {_qi(tbl)} WHERE "_etl_batch_id" = {p}',
+                (batch_id,),
+            )
+            n_del = int(cnt_row[0]) if cnt_row is not None else 0
+            try:
+                adapter.execute(
+                    f'DELETE FROM {_qi(tbl)} WHERE "_etl_batch_id" = {p}',
+                    (batch_id,),
+                )
+            except (sqlite3.IntegrityError, duckdb.ConstraintException) as exc:
+                raise InputError(
+                    f"`{tbl}` 테이블의 행을 다른 자식 테이블이 참조하고 있어 배치 `{batch_id}`를 "
+                    "롤백할 수 없습니다. 참조하는 자식 배치를 먼저 롤백해 주세요."
+                ) from exc
+            deleted_by_table[tbl] = n_del
+            total_deleted += n_del
+
+        adapter.execute(
+            f'UPDATE "_etl_load_batches" SET "status" = \'rolled_back\' WHERE "batch_id" = {p}',
+            (batch_id,),
+        )
+        adapter.commit()
+        return {
+            "batch_id": batch_id,
+            "status": "rolled_back",
+            "deleted_by_table": deleted_by_table,
+            "total_deleted": total_deleted,
+        }
+    except Exception:
+        adapter.rollback()
+        raise
+    finally:
+        adapter.close()
+
+
+__all__ = [
+    "AUDIT_COLUMNS",
+    "DEFAULT_MANAGEMENT_TABLES",
+    "classify_dataset_kind",
+    "compute_schema_fingerprint",
+    "inspect_db_catalog",
+    "load_tables",
+    "mask_value",
+    "render_management_tables_ddl",
+    "rollback_batch",
+]

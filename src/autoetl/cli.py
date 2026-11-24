@@ -106,6 +106,146 @@ def _run_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_load(args: argparse.Namespace) -> int:
+    import json
+
+    from autoetl.contracts import OrphanPolicy, SchemaOverrideSpec
+    from autoetl.core.db_loader import load_tables
+
+    inputs: list[Path] = list(args.files)
+    for src in inputs:
+        if not src.exists():
+            print(f"입력 파일 또는 폴더가 없다: {src}", file=sys.stderr)
+            return 2
+
+    try:
+        if args.overrides is not None:
+            if not args.overrides.is_file():
+                print(f"오버라이드 JSON 파일이 없다: {args.overrides}", file=sys.stderr)
+                return 2
+            raw_ov = json.loads(args.overrides.read_text(encoding="utf-8"))
+            spec = SchemaOverrideSpec.model_validate(raw_ov)
+        else:
+            spec = SchemaOverrideSpec()
+
+        spec = spec.model_copy(
+            update={
+                "orphan_policy": OrphanPolicy(args.on_error),
+                "include_audit_columns": not args.no_audit_columns,
+                "include_management_tables": not args.no_management_tables,
+            }
+        )
+
+        _bundle, result = load_tables(
+            sources=inputs,
+            db_path=args.db,
+            engine=args.engine,
+            purpose=Purpose(args.purpose),
+            decompose_strings=not args.no_decompose_strings,
+            overrides=spec,
+            auto_mask_pii=args.mask_pii,
+            force_reload=args.force,
+            recursive=not args.no_recursive,
+            notes=args.notes,
+        )
+    except InputError as exc:
+        print(f"DB 적재를 진행할 수 없다: {exc}", file=sys.stderr)
+        return 1
+    except Exception:
+        print(
+            "DB 적재 파이프라인이 내부 오류로 끝났다"
+            "(데이터 보호를 위해 상세 원문은 표시하지 않는다).",
+            file=sys.stderr,
+        )
+        return 3
+
+    if args.json:
+        print(result.model_dump_json(indent=2))
+    else:
+        print(
+            f"DB 적재 완료 [{result.status}]: {result.db_target} ({result.db_engine}) "
+            f"| 배치 ID: {result.batch_id} | 시점: {result.loaded_at}"
+        )
+        print(
+            f"- 읽은 행: {result.total_rows_read:,}건 | 저장: {result.total_rows_loaded:,}건 | "
+            f"격리: {result.total_rows_quarantined:,}건 ({result.elapsed_seconds:.2f}s)"
+        )
+        if result.management_tables_created:
+            print(f"- 기본 관리 테이블: {', '.join(result.management_tables_created)}")
+        for tbl in result.tables:
+            skip_lbl = " [중복 파일 건너뜀]" if tbl.skipped_duplicate_file else ""
+            drift_lbl = " [스키마 변경 감지]" if tbl.schema_drift_detected else ""
+            mask_lbl = (
+                f" [개인정보 보호: {', '.join(tbl.masked_columns)}]" if tbl.masked_columns else ""
+            )
+            print(
+                f"  * {tbl.target_table} ({tbl.dataset_kind.value}, ID={tbl.dataset_id}): "
+                f"저장 {tbl.rows_loaded:,}건 / 격리 {tbl.rows_quarantined:,}건"
+                f"{skip_lbl}{drift_lbl}{mask_lbl}"
+            )
+        for warn in result.warnings:
+            print(f"- 주의: {warn}")
+    return 1 if result.status == "failed" else 0
+
+
+def _run_catalog(args: argparse.Namespace) -> int:
+    import json
+
+    from autoetl.core.db_loader import inspect_db_catalog, rollback_batch
+
+    if args.engine in {"sqlite", "duckdb"} and not Path(args.db).is_file():
+        print(f"DB 파일이 없다: {args.db}", file=sys.stderr)
+        return 2
+
+    try:
+        if args.rollback:
+            res = rollback_batch(args.db, args.rollback, engine=args.engine)
+            if args.json:
+                print(json.dumps(res, ensure_ascii=False, indent=2))
+            else:
+                print(
+                    f"배치 롤백 완료: {res['batch_id']} "
+                    f"(총 {res['total_deleted']:,}행 삭제, 상태=rolled_back)"
+                )
+                for tbl, cnt in res["deleted_by_table"].items():
+                    print(f"  * {tbl}: {cnt:,}행 삭제")
+            return 0
+
+        catalog = inspect_db_catalog(args.db, engine=args.engine, limit=max(1, args.limit))
+    except InputError as exc:
+        print(f"카탈로그 조회/롤백 실패: {exc}", file=sys.stderr)
+        return 1
+    except Exception:
+        print(
+            "카탈로그 조회 중 내부 오류가 발생했다(데이터 보호를 위해 상세 원문 생략).",
+            file=sys.stderr,
+        )
+        return 3
+
+    if args.json:
+        print(json.dumps(catalog, ensure_ascii=False, indent=2))
+    else:
+        print(f"DB 카탈로그: {catalog['db_target']} ({catalog['db_engine']})")
+        print(f"- 업무 표: {len(catalog['business_tables'])}개")
+        for bt in catalog["business_tables"]:
+            print(f"  * {bt['table']}: {bt['row_count']:,}행 ({len(bt['columns'])}컬럼)")
+        print(f"- 최근 적재 배치: {len(catalog['batches'])}건")
+        for b in catalog["batches"][:10]:
+            print(
+                f"  * {b['batch_id']} [{b['status']}] {b['loaded_at']} — "
+                f"저장 {b['total_rows_loaded']:,} / 격리 {b['total_rows_quarantined']:,}"
+            )
+        print(f"- 등록 데이터셋: {len(catalog['datasets'])}건")
+        for ds in catalog["datasets"][:10]:
+            print(
+                f"  * {ds['dataset_id']} | {ds['target_table']} ({ds['dataset_kind_label']}) "
+                f"| 원본={ds['source_name']} | 저장 {ds['rows_loaded']:,}건"
+            )
+        if catalog["quarantine"]:
+            print(f"- 격리함 오류 행: {len(catalog['quarantine'])}건")
+    return 0
+
+
 def _run_parse(args: argparse.Namespace) -> int:
     # 무거운 파서 의존성은 parse 명령이 실행될 때만 지연 import한다.
     from autoetl.parser import (
@@ -906,9 +1046,133 @@ def main(argv: list[str] | None = None) -> int:
         help="출력 형식(기본: markdown)",
     )
 
+    load_cmd = subparsers.add_parser(
+        "load",
+        help=(
+            "정형 파일·폴더(CSV·TSV·XLSX)를 결정론 분석 후 SQLite/DuckDB/PostgreSQL DB에 "
+            "직접 적재하고 기본 데이터 관리 테이블(_etl_*)을 기록한다"
+        ),
+    )
+    load_cmd.add_argument(
+        "files",
+        nargs="+",
+        type=Path,
+        help="적재할 파일(CSV·TSV·XLSX) 또는 폴더(복수 지정 가능)",
+    )
+    load_cmd.add_argument(
+        "--db",
+        type=str,
+        required=True,
+        help="대상 DB 파일 경로(예: ./warehouse.sqlite, ./analytics.duckdb) 또는 PostgreSQL DSN",
+    )
+    load_cmd.add_argument(
+        "--engine",
+        choices=["sqlite", "duckdb", "postgres"],
+        default="sqlite",
+        help="DB 엔진(기본: sqlite — 무의존성 로컬 파일 DB)",
+    )
+    load_cmd.add_argument(
+        "--purpose",
+        choices=[purpose.value for purpose in Purpose],
+        default=Purpose.OLTP.value,
+        help="DB 적재 용도(기본: oltp)",
+    )
+    load_cmd.add_argument(
+        "--mask-pii",
+        action="store_true",
+        help="탐지된 주요 개인정보(L2/L3 PII) 컬럼을 적재 시 자동 마스킹",
+    )
+    load_cmd.add_argument(
+        "--on-error",
+        choices=["quarantine", "reject_all"],
+        default="quarantine",
+        help="변환 오류·고아 FK 행 처리 정책(기본: quarantine=격리함 분리, reject_all=전체 중단)",
+    )
+    load_cmd.add_argument(
+        "--overrides",
+        type=Path,
+        default=None,
+        help="컬럼명·UNIQUE·마스킹 확정 JSON 파일 경로(SchemaOverrideSpec 형식)",
+    )
+    load_cmd.add_argument(
+        "--no-audit-columns",
+        action="store_true",
+        help="업무 테이블의 행 단위 이력 컬럼(_etl_batch_id/_etl_dataset_id/_etl_loaded_at) 생략",
+    )
+    load_cmd.add_argument(
+        "--no-management-tables",
+        action="store_true",
+        help="디폴트 데이터 관리 테이블(_etl_load_batches/_etl_datasets 등) 생성 생략",
+    )
+    load_cmd.add_argument(
+        "--no-decompose-strings",
+        action="store_true",
+        help="규칙성 문자열의 가변 슬롯 컬럼 분리 비활성화",
+    )
+    load_cmd.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="폴더 입력 시 하위 디렉터리 재귀 탐색 비활성화",
+    )
+    load_cmd.add_argument(
+        "--force",
+        action="store_true",
+        help="동일 파일(SHA-256 일치)이 이미 적재되어 있어도 강제로 다시 적재",
+    )
+    load_cmd.add_argument(
+        "--notes",
+        type=str,
+        default="",
+        help="배치 적재 이력(_etl_load_batches.notes)에 남길 메모",
+    )
+    load_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="적재 결과 요약을 JSON 형식으로 출력",
+    )
+
+    catalog_cmd = subparsers.add_parser(
+        "catalog",
+        help=(
+            "적재된 DB의 데이터 관리 대장(_etl_load_batches/_etl_datasets/격리함) 조회 및 배치 롤백"
+        ),
+    )
+    catalog_cmd.add_argument(
+        "db",
+        type=str,
+        help="조회할 DB 파일 경로(.sqlite/.duckdb) 또는 PostgreSQL DSN",
+    )
+    catalog_cmd.add_argument(
+        "--engine",
+        choices=["sqlite", "duckdb", "postgres"],
+        default="sqlite",
+        help="DB 엔진(기본: sqlite)",
+    )
+    catalog_cmd.add_argument(
+        "--rollback",
+        type=str,
+        default=None,
+        help="지정한 batch_id로 적재된 모든 행을 자식→부모 역순으로 되돌리기",
+    )
+    catalog_cmd.add_argument(
+        "--limit",
+        type=int,
+        default=30,
+        help="최근 조회할 배치·데이터셋·격리 행 최대 건수(기본: 30)",
+    )
+    catalog_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="카탈로그/롤백 결과를 JSON 형식으로 출력",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "analyze":
         return _run_analyze(args)
+    if args.command == "load":
+        return _run_load(args)
+    if args.command == "catalog":
+        return _run_catalog(args)
     if args.command == "parse":
         return _run_parse(args)
     if args.command == "index":

@@ -174,3 +174,120 @@ def test_ui_server_analyze_tables_e2e_and_zip_download(tmp_path: Path) -> None:
         with pytest.raises(urllib.error.HTTPError) as exc_info:
             opener.open(bad_req)
         assert exc_info.value.code == 400
+
+
+def test_ui_server_overrides_reanalyze_and_load_db_e2e(tmp_path: Path) -> None:
+    """웹 UI `session_id` 기반 컬럼 확정 재분석 + `/api/etl/load-db` SQLite/DuckDB 다운로드 검증."""
+    import sqlite3
+
+    data_dir = tmp_path / "ui_db_tables"
+    branches, customers, orders = _write_sample_dataset(data_dir)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    with create_ui_server(host="127.0.0.1", port=0) as srv:
+        # 1. 초기 분석 -> session_id 발급 확인
+        files_payload = [
+            {
+                "filename": p.name,
+                "content_base64": base64.b64encode(p.read_bytes()).decode("ascii"),
+            }
+            for p in (branches, customers, orders)
+        ]
+        req1 = urllib.request.Request(
+            f"{srv.url}/api/analyze-tables",
+            data=json.dumps({"files": files_payload}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with opener.open(req1) as resp:
+            body1 = json.loads(resp.read().decode("utf-8"))
+        session_id = body1["session_id"]
+        assert session_id
+        assert "_etl_load_batches" in body1["management_ddl_sql"]
+
+        # 2. session_id 재분석(재업로드 없이 컬럼명 변경 + UNIQUE + PII 마스킹 확정)
+        overrides_payload = {
+            "columns": [
+                {
+                    "table": "customers",
+                    "source_column": "customer_name",
+                    "target_column": "cust_full_name",
+                    "masking": "mask",
+                },
+                {
+                    "table": "orders",
+                    "source_column": "order_code",
+                    "unique": True,
+                },
+            ],
+            "orphan_policy": "quarantine",
+            "include_audit_columns": True,
+            "include_management_tables": True,
+        }
+        req2 = urllib.request.Request(
+            f"{srv.url}/api/analyze-tables",
+            data=json.dumps({"session_id": session_id, "overrides": overrides_payload}).encode(
+                "utf-8"
+            ),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with opener.open(req2) as resp:
+            body2 = json.loads(resp.read().decode("utf-8"))
+        assert '"cust_full_name"' in body2["load_plan"]["ddl_sql"]
+        assert "CREATE UNIQUE INDEX" in body2["load_plan"]["index_ddl_sql"]
+
+        # 3. POST /api/etl/load-db (SQLite) -> DB 파일 다운로드 & 실제 테이블/관리 대장 검증
+        req3 = urllib.request.Request(
+            f"{srv.url}/api/etl/load-db",
+            data=json.dumps(
+                {
+                    "session_id": session_id,
+                    "db_engine": "sqlite",
+                    "overrides": overrides_payload,
+                    "notes": "웹 UI 저장 테스트",
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with opener.open(req3) as resp:
+            body3 = json.loads(resp.read().decode("utf-8"))
+        assert body3["load_result"]["status"] == "succeeded"
+        assert body3["load_result"]["total_rows_loaded"] == 10
+        assert len(body3["catalog"]["datasets"]) == 3
+        dl_token = body3["download_token"]
+        assert dl_token
+
+        with opener.open(f"{srv.url}/api/download/{dl_token}") as resp:
+            sqlite_bytes = resp.read()
+        dl_path = tmp_path / "downloaded.sqlite"
+        dl_path.write_bytes(sqlite_bytes)
+        con = sqlite3.connect(str(dl_path))
+        try:
+            row = con.execute(
+                "SELECT cust_full_name FROM customers WHERE customer_id = 101"
+            ).fetchone()
+            assert row is not None and row[0] == "김*수"
+            ds_cnt = con.execute("SELECT COUNT(*) FROM _etl_datasets").fetchone()
+            assert ds_cnt is not None and ds_cnt[0] == 3
+        finally:
+            con.close()
+
+        # 4. POST /api/etl/load-db (DuckDB)
+        req4 = urllib.request.Request(
+            f"{srv.url}/api/etl/load-db",
+            data=json.dumps(
+                {
+                    "session_id": session_id,
+                    "db_engine": "duckdb",
+                    "overrides": overrides_payload,
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with opener.open(req4) as resp:
+            body4 = json.loads(resp.read().decode("utf-8"))
+        assert body4["load_result"]["status"] == "succeeded"
+        assert body4["download_filename"] == "autoetl_data.duckdb"

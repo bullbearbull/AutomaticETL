@@ -20,6 +20,7 @@ from sqlglot import exp
 from autoetl.contracts import (
     ColumnClassification,
     ColumnMapping,
+    ColumnOverride,
     ColumnProfile,
     ColumnRoleCategory,
     ColumnStats,
@@ -30,6 +31,7 @@ from autoetl.contracts import (
     IndexRecommendation,
     LengthStats,
     LoadOrder,
+    MaskingPolicy,
     MultiTableAnalysisBundle,
     MultiTableLoadPlan,
     MultiTableRelationAnalysis,
@@ -42,9 +44,11 @@ from autoetl.contracts import (
     SamplingMethod,
     SamplingPlan,
     SchemaCandidate,
+    SchemaOverrideSpec,
     SchemaPattern,
     Scorecard,
     SemanticType,
+    SensitivityAssignment,
     SensitivityLevel,
     SensitivityMap,
     StatsKind,
@@ -250,6 +254,10 @@ class _BuiltCandidate:
     partition_notes: dict[str, list[str]]
     # decomposed string slot columns count
     materialized_slot_count: int
+    # target_table -> {source_column: MaskingPolicy}
+    column_masking: dict[str, dict[str, MaskingPolicy]]
+    # target_table -> [target_column, ...] explicitly confirmed UNIQUE by user
+    confirmed_unique_cols: dict[str, list[str]]
 
 
 def _materializable_slots(
@@ -299,9 +307,15 @@ def _build_candidate(
     decompose_strings: bool,
     omit_derivations: bool,
     analytics_mode: bool,
+    overrides: SchemaOverrideSpec | None = None,
 ) -> _BuiltCandidate:
     """단일 후보 SchemaCandidate와 변환/원본 매핑 메타데이터를 결정론적으로 조립한다."""
     pk_map = relations.primary_keys
+    override_by_col: dict[tuple[str, str], ColumnOverride] = (
+        {(ov.table, ov.source_column): ov for ov in overrides.columns}
+        if overrides is not None
+        else {}
+    )
 
     # 테이블별 원본 컬럼명 -> SQL 식별자 맵을 먼저 확정(FK가 부모 SQL 컬럼명을 참조해야 함)
     col_sql_map: dict[str, dict[str, str]] = {}
@@ -313,7 +327,16 @@ def _build_candidate(
         pk_rec = pk_map.get(t_name)
         if pk_rec is not None and pk_rec.recommend_surrogate and pk_rec.surrogate_column_name:
             _to_sql_ident(pk_rec.surrogate_column_name, used=used, fallback_prefix="id")
+        # 사용자가 명시적으로 지정한 영문 컬럼명을 우선 배정해 불필요한 _2 접미 충돌을 방지한다.
         for col_info in bundle.ingest.columns:
+            ov = override_by_col.get((t_name, col_info.name))
+            if ov is not None and ov.target_column:
+                mapping[col_info.name] = _to_sql_ident(
+                    ov.target_column, used=used, fallback_prefix=f"c{col_info.index}"
+                )
+        for col_info in bundle.ingest.columns:
+            if col_info.name in mapping:
+                continue
             mapping[col_info.name] = _to_sql_ident(
                 col_info.name, used=used, fallback_prefix=f"c{col_info.index}"
             )
@@ -357,6 +380,8 @@ def _build_candidate(
     surrogate_tables: set[str] = set()
     omitted_derivations: dict[str, list[str]] = {}
     partition_notes: dict[str, list[str]] = {}
+    column_masking: dict[str, dict[str, MaskingPolicy]] = {}
+    confirmed_unique_cols: dict[str, list[str]] = {}
     materialized_slot_count = 0
 
     for bundle in bundles:
@@ -416,6 +441,7 @@ def _build_candidate(
             prof = prof_by_col[col_name]
             stat = stat_by_col.get(col_name)
             t_assign = assign_by_col[col_name]
+            ov = override_by_col.get((t_name, col_name))
 
             is_pk = col_name in pk_set and not (
                 table_pk is not None and table_pk.recommend_surrogate
@@ -436,6 +462,18 @@ def _build_candidate(
                     transform = f"cast_to_{p_phys.value}"
                 fk_spec = f"{p_table}({p_col_sql})"
 
+            if ov is not None and ov.masking is not MaskingPolicy.NONE:
+                column_masking.setdefault(t_name, {})[col_name] = ov.masking
+                if not is_pk and direct_fk is None:
+                    # 마스킹(예: 1988-**-**)·해시(h_...) 값은 문자열 타입으로 안전하게 저장
+                    phys = PhysicalType.STRING
+                    transform = f"pii_{ov.masking.value}"
+
+            if ov is not None and ov.unique is True:
+                uq_list = confirmed_unique_cols.setdefault(t_name, [])
+                if sql_col not in uq_list:
+                    uq_list.append(sql_col)
+
             prec: int | None = None
             scale: int | None = None
             if phys is PhysicalType.DECIMAL:
@@ -447,6 +485,8 @@ def _build_candidate(
                 desc_parts.append(f"원본: {col_name}")
             if cls.string_pattern is not None:
                 desc_parts.append(f"패턴: {cls.string_pattern.template}")
+            if ov is not None and ov.masking is not MaskingPolicy.NONE:
+                desc_parts.append(f"개인정보보호: {ov.masking.value}")
 
             target_cols.append(
                 TargetColumn(
@@ -469,6 +509,7 @@ def _build_candidate(
                 cls.category is ColumnRoleCategory.TEMPORAL
                 and not nullable
                 and temporal_partition_col is None
+                and (ov is None or ov.masking is MaskingPolicy.NONE)
             ):
                 temporal_partition_col = sql_col
             if (
@@ -596,6 +637,8 @@ def _build_candidate(
         omitted_derivations=omitted_derivations,
         partition_notes=partition_notes,
         materialized_slot_count=materialized_slot_count,
+        column_masking=column_masking,
+        confirmed_unique_cols=confirmed_unique_cols,
     )
 
 
@@ -964,6 +1007,20 @@ def _run_trial_load(
                 pk_dups = int(pk_dup_row[0]) if pk_dup_row is not None else 0
                 pk_violation_count += pk_nulls + pk_dups
 
+            # 사용자 확정 UNIQUE 컬럼 중복 검사 (NULL 제외)
+            for uq_col in built.confirmed_unique_cols.get(t_name, ()):
+                if pk_cols == [uq_col]:
+                    continue
+                uq_alias = col_aliases.get(uq_col)
+                if uq_alias is None:
+                    continue
+                uq_dup_row = conn.execute(
+                    f"SELECT COALESCE(SUM(cnt - 1), 0) FROM ("
+                    f"SELECT COUNT(*) AS cnt FROM temp.main.{temp_tbl} "
+                    f"WHERE {uq_alias} IS NOT NULL GROUP BY {uq_alias} HAVING COUNT(*) > 1)"
+                ).fetchone()
+                pk_violation_count += int(uq_dup_row[0]) if uq_dup_row is not None else 0
+
         # FK 참조 무결성 검사 (실제 변환된 임시 테이블 간 anti-join)
         for target_table in cand.tables:
             child_temp = trial_name_by_table[target_table.name]
@@ -1122,23 +1179,62 @@ def _score_candidate(
         75.0 + min(15.0, fk_count * 3.5) + min(10.0, built.materialized_slot_count * 3.5),
     )
 
-    # 보안·민감정보 격리 점수(S7 PII 탐지 결과 반영)
-    all_pii = [a for smap in sensitivity_by_table.values() for a in smap.assignments]
-    if not all_pii:
+    # 보안·민감정보 격리 점수(S7 PII 탐지 결과 + 사용자 확정 마스킹 정책 반영)
+    all_pii_pairs: list[tuple[str, SensitivityAssignment]] = [
+        (t_name, a) for t_name, smap in sensitivity_by_table.items() for a in smap.assignments
+    ]
+    if not all_pii_pairs:
         security_val = 92.0
         security_detail = "민감(PII) 컬럼 미탐지 · 원본 셀 값 비노출 결정론적 스키마 생성"
     else:
-        max_level = max((a.level for a in all_pii), key=lambda lv: _LEVEL_RANK[lv])
-        if max_level is SensitivityLevel.L3:
-            security_val = 60.0
-        elif max_level is SensitivityLevel.L2:
-            security_val = 72.0
+        masked_pii = [
+            (t_name, a)
+            for t_name, a in all_pii_pairs
+            if built.column_masking.get(t_name, {}).get(a.column, MaskingPolicy.NONE)
+            is not MaskingPolicy.NONE
+        ]
+        unmasked_high = [
+            a
+            for t_name, a in all_pii_pairs
+            if a.level in {SensitivityLevel.L2, SensitivityLevel.L3}
+            and built.column_masking.get(t_name, {}).get(a.column, MaskingPolicy.NONE)
+            is MaskingPolicy.NONE
+        ]
+        if masked_pii and not unmasked_high:
+            security_val = 95.0
+            security_detail = (
+                f"민감(PII) 컬럼 {len(all_pii_pairs)}건 중 보호 대상 전체"
+                f"({len(masked_pii)}건)에 마스킹·해시 정책 확정됨"
+            )
         else:
-            security_val = 82.0
-        security_detail = (
-            f"민감(PII) 컬럼 {len(all_pii)}건 탐지(최고 등급 {max_level.value}) — "
-            "적재 시 암호화·마스킹 및 접근 통제 적용 권고"
-        )
+            unmasked_all = [
+                a
+                for t_name, a in all_pii_pairs
+                if built.column_masking.get(t_name, {}).get(a.column, MaskingPolicy.NONE)
+                is MaskingPolicy.NONE
+            ]
+            max_level = max(
+                (a.level for a in (unmasked_all or [a for _, a in all_pii_pairs])),
+                key=lambda lv: _LEVEL_RANK[lv],
+            )
+            if max_level is SensitivityLevel.L3:
+                base_sec = 60.0
+            elif max_level is SensitivityLevel.L2:
+                base_sec = 72.0
+            else:
+                base_sec = 82.0
+            if masked_pii:
+                security_val = min(88.0, base_sec + 8.0)
+                security_detail = (
+                    f"민감(PII) 컬럼 {len(all_pii_pairs)}건 중 {len(masked_pii)}건 보호 적용"
+                    f"(미보호 최고 등급 {max_level.value})"
+                )
+            else:
+                security_val = base_sec
+                security_detail = (
+                    f"민감(PII) 컬럼 {len(all_pii_pairs)}건 탐지(최고 등급 {max_level.value}) — "
+                    "적재 시 암호화·마스킹 및 접근 통제 적용 권고"
+                )
 
     weights = _PURPOSE_WEIGHTS[purpose]
     weighted = round(
@@ -1372,6 +1468,34 @@ def _build_table_load_strategies(
                 if alt_key != pk_rec.columns:
                     alt_key_advisories.append(", ".join(alt_key))
 
+        # 사용자가 명시적으로 확정한 UNIQUE 제약은 물리 UNIQUE INDEX로 생성한다.
+        confirmed_uq_cols = list(built.confirmed_unique_cols.get(t_name, ()))
+        for uq_col in confirmed_uq_cols:
+            if pk_cols == [uq_col]:
+                continue
+            if (uq_col,) in indexed_tuples:
+                table_indexes = [
+                    idx.model_copy(
+                        update={
+                            "unique": True,
+                            "reason": f"{idx.reason} · 사용자 확정 유일 제약(UNIQUE)",
+                        }
+                    )
+                    if idx.columns == [uq_col]
+                    else idx
+                    for idx in table_indexes
+                ]
+            else:
+                indexed_tuples.add((uq_col,))
+                table_indexes.append(
+                    IndexRecommendation(
+                        table=t_name,
+                        columns=[uq_col],
+                        unique=True,
+                        reason="사용자 확정 유일 제약(UNIQUE)",
+                    )
+                )
+
         # 분석 목적일 때 범주형 필터 컬럼 인덱스 추가
         if purpose is Purpose.ANALYTICS:
             for col in target_table.columns:
@@ -1432,11 +1556,23 @@ def _build_table_load_strategies(
             )
         if t_name in built.partition_notes:
             notes.extend(built.partition_notes[t_name])
+        if confirmed_uq_cols:
+            notes.append(
+                "사용자 확정 유일(UNIQUE) 제약 반영: "
+                + ", ".join(f"`{c}`" for c in confirmed_uq_cols)
+            )
         if alt_key_advisories:
             notes.append(
                 "표본 관측 유일 후보(비즈니스 규칙 확인 후 UNIQUE 제약 적용 검토): "
                 + "; ".join(alt_key_advisories)
             )
+
+        table_masking = dict(built.column_masking.get(t_name, {}))
+        if table_masking:
+            mask_summary = ", ".join(
+                f"`{col_k}`={pol.value}" for col_k, pol in table_masking.items()
+            )
+            notes.append(f"사용자 확정 개인정보 보호 정책: {mask_summary}")
 
         smap = sensitivity_by_table.get(src_name)
         sensitive_cols: list[str] = []
@@ -1467,6 +1603,8 @@ def _build_table_load_strategies(
                 column_mappings=mappings,
                 recommended_indexes=table_indexes,
                 sensitive_columns=sensitive_cols,
+                column_masking=table_masking,
+                confirmed_unique_columns=confirmed_uq_cols,
                 expected_row_count=bundle.source.row_count,
                 notes=notes,
             )
@@ -1562,6 +1700,7 @@ def plan_multi_table_load(
     purpose: Purpose = Purpose.OLTP,
     decompose_strings: bool = True,
     mctx: MultiTableContext | None = None,
+    overrides: SchemaOverrideSpec | None = None,
 ) -> MultiTableLoadPlan:
     """Milestone E4 통합 실행: PII 탐지 → 후보 합성 → DDL+DuckDB 시험 적재 채점 → 플랜·ERD."""
     acyclic_fks, cycle_warnings = _select_acyclic_fks(relations)
@@ -1607,6 +1746,7 @@ def plan_multi_table_load(
         decompose_strings=decompose_strings,
         omit_derivations=False,
         analytics_mode=False,
+        overrides=overrides,
     )
     built_candidates.append(c1)
 
@@ -1625,6 +1765,7 @@ def plan_multi_table_load(
             decompose_strings=decompose_strings,
             omit_derivations=True,
             analytics_mode=False,
+            overrides=overrides,
         )
         built_candidates.append(c2)
 
@@ -1642,6 +1783,7 @@ def plan_multi_table_load(
             decompose_strings=False,
             omit_derivations=False,
             analytics_mode=False,
+            overrides=overrides,
         )
         built_candidates.append(c2_raw)
 
@@ -1659,6 +1801,7 @@ def plan_multi_table_load(
         decompose_strings=decompose_strings,
         omit_derivations=False,
         analytics_mode=True,
+        overrides=overrides,
     )
     built_candidates.append(c3)
 

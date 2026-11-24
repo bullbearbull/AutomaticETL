@@ -204,8 +204,52 @@ class _DocIndexStore:
         shutil.rmtree(self._dir, ignore_errors=True)
 
 
+_MAX_CACHED_ETL_SESSIONS = 6
+
+
+class _EtlSessionStore:
+    """엑셀·CSV 구조 확정 및 1클릭 DB 저장을 위한 업로드 세션 파일 LRU 캐시."""
+
+    def __init__(self, max_items: int = _MAX_CACHED_ETL_SESSIONS) -> None:
+        self._dir = Path(tempfile.mkdtemp(prefix="autoetl_ui_etlsess_"))
+        self._max_items = max_items
+        self._lock = threading.Lock()
+        self._items: OrderedDict[str, Path] = OrderedDict()
+
+    def create(self, files: list[tuple[str, bytes]]) -> tuple[str, Path]:
+        token = secrets.token_hex(12)
+        sess_dir = self._dir / token
+        sess_dir.mkdir(parents=True, exist_ok=True)
+        for fname, fbytes in files:
+            (sess_dir / fname).write_bytes(fbytes)
+        with self._lock:
+            self._items[token] = sess_dir
+            while len(self._items) > self._max_items:
+                _old_tok, old_dir = self._items.popitem(last=False)
+                shutil.rmtree(old_dir, ignore_errors=True)
+        return token, sess_dir
+
+    def get(self, token: str) -> Path | None:
+        if not token or not all(ch in "0123456789abcdef" for ch in token):
+            return None
+        with self._lock:
+            sess_dir = self._items.get(token)
+            if sess_dir is None:
+                return None
+            if not sess_dir.is_dir():
+                self._items.pop(token, None)
+                return None
+            self._items.move_to_end(token)
+            return sess_dir
+
+    def close(self) -> None:
+        with self._lock:
+            self._items.clear()
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+
 class _ParserUiHttpServer(ThreadingHTTPServer):
-    """번들 스토어·문서 인덱스 스토어·HTML 캐시를 보유하는 `ThreadingHTTPServer` 확장."""
+    """번들·문서 인덱스·ETL 세션 스토어와 HTML 캐시를 보유하는 `ThreadingHTTPServer` 확장."""
 
     allow_reuse_address = True
 
@@ -213,6 +257,7 @@ class _ParserUiHttpServer(ThreadingHTTPServer):
         self.ui_html_bytes = _load_ui_html()
         self.bundle_store = _BundleStore()
         self.docindex_store = _DocIndexStore()
+        self.etl_session_store = _EtlSessionStore()
         super().__init__(server_address, handler_cls)
 
     def server_close(self) -> None:
@@ -221,6 +266,7 @@ class _ParserUiHttpServer(ThreadingHTTPServer):
         finally:
             self.bundle_store.close()
             self.docindex_store.close()
+            self.etl_session_store.close()
 
 
 class _ParserUiRequestHandler(BaseHTTPRequestHandler):
@@ -329,6 +375,11 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
             req = self._read_json_body()
             if req is not None:
                 self._handle_analyze_tables(req)
+            return
+        if path_only == "/api/etl/load-db":
+            req = self._read_json_body()
+            if req is not None:
+                self._handle_etl_load_db(req)
             return
         if path_only == "/api/docindex/build":
             req = self._read_json_body()
@@ -591,18 +642,202 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
                 {"error": "표 SQL 실행 중 내부 오류가 발생했다."},
             )
 
+    def _parse_schema_overrides(self, raw_overrides: Any) -> Any:
+        from pydantic import ValidationError
+
+        from autoetl.contracts import SchemaOverrideSpec
+
+        if raw_overrides is None:
+            return None
+        if not isinstance(raw_overrides, dict):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "컬럼 설정(`overrides`)은 JSON 객체 형식이어야 합니다."},
+            )
+            return False
+        try:
+            return SchemaOverrideSpec.model_validate(raw_overrides)
+        except ValidationError:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": (
+                        "DB 저장 항목 이름은 영문 소문자·숫자·밑줄(_)만 사용할 수 있으며 "
+                        "영문 소문자로 시작해야 합니다(예: customer_id)."
+                    )
+                },
+            )
+            return False
+
     def _handle_analyze_tables(self, req: dict[str, Any]) -> None:
         from autoetl.contracts import Purpose
+        from autoetl.core.db_loader import render_management_tables_ddl
         from autoetl.core.load_planner import render_analysis_report
         from autoetl.core.multi_analyze import analyze_tables
         from autoetl.core.multi_context import SUPPORTED_TABLE_EXTENSIONS
         from autoetl.core.pipeline import InputError
 
-        raw_files = req.get("files")
-        if not isinstance(raw_files, list) or not raw_files:
+        raw_opts = req.get("options")
+        opts_in: dict[str, Any] = raw_opts if isinstance(raw_opts, dict) else {}
+        purpose_raw = str(opts_in.get("purpose", Purpose.OLTP.value) or Purpose.OLTP.value).lower()
+        try:
+            purpose = Purpose(purpose_raw)
+        except ValueError:
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
-                {"error": "분석할 테이블 파일 목록(`files`)이 1개 이상 필요하다."},
+                {"error": f"지원하지 않는 분석 목적(`purpose`)이다: '{purpose_raw}'"},
+            )
+            return
+        decompose_strings = bool(opts_in.get("decompose_strings", True))
+
+        overrides_spec = self._parse_schema_overrides(req.get("overrides"))
+        if overrides_spec is False:
+            return
+
+        session_id = str(req.get("session_id", "") or "").strip()
+        raw_files = req.get("files")
+        in_dir: Path | None = None
+
+        if isinstance(raw_files, list) and raw_files:
+            decoded_files: list[tuple[str, bytes]] = []
+            total_bytes = 0
+            seen_names: set[str] = set()
+            allowed_exts = sorted(SUPPORTED_TABLE_EXTENSIONS)
+
+            for idx, item in enumerate(raw_files):
+                if not isinstance(item, dict):
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": "각 파일 항목은 `filename`과 `content_base64` 객체여야 한다."},
+                    )
+                    return
+                filename = Path(str(item.get("filename", "")).strip()).name
+                b64_data = item.get("content_base64")
+                if not filename or not isinstance(b64_data, str) or not b64_data:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": (
+                                "각 항목에 파일명(`filename`)과 내용(`content_base64`)이 필요하다."
+                            )
+                        },
+                    )
+                    return
+                ext = Path(filename).suffix.lower()
+                if ext not in SUPPORTED_TABLE_EXTENSIONS:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": f"지원하지 않는 테이블 파일 형식이다: '{ext or '(없음)'}' "
+                            f"(지원: {', '.join(allowed_exts)})"
+                        },
+                    )
+                    return
+                try:
+                    fbytes = base64.b64decode(b64_data, validate=True)
+                except ValueError:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST, {"error": "파일 Base64 디코딩에 실패했다."}
+                    )
+                    return
+                total_bytes += len(fbytes)
+                if total_bytes > _MAX_UPLOAD_BYTES:
+                    self._send_json(
+                        HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                        {"error": "업로드 파일 합계 크기가 50MB 상한을 초과했다."},
+                    )
+                    return
+                safe_name = filename
+                if safe_name in seen_names:
+                    safe_name = f"{idx + 1}_{filename}"
+                seen_names.add(safe_name)
+                decoded_files.append((safe_name, fbytes))
+
+            session_id, in_dir = self.server.etl_session_store.create(decoded_files)
+        elif session_id:
+            in_dir = self.server.etl_session_store.get(session_id)
+            if in_dir is None:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": "분석 세션을 찾을 수 없습니다. 파일을 다시 올려 주세요."},
+                )
+                return
+        else:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "분석할 테이블 파일 목록(`files`) 또는 `session_id`가 필요합니다."},
+            )
+            return
+
+        t0 = time.perf_counter()
+        try:
+            with tempfile.TemporaryDirectory(prefix="autoetl_ui_tables_") as td:
+                bundle_dir = Path(td) / "bundle"
+                bundle = analyze_tables(
+                    sources=[in_dir],
+                    purpose=purpose,
+                    decompose_strings=decompose_strings,
+                    overrides=overrides_spec,
+                    out_dir=bundle_dir,
+                )
+                mgmt_ddl = render_management_tables_ddl("postgres")
+                (bundle_dir / "management_tables.sql").write_text(mgmt_ddl, encoding="utf-8")
+                bundle_id = self.server.bundle_store.put_zip(
+                    bundle_dir,
+                    "autoetl_multi_table_plan.zip",
+                )
+                report_md = render_analysis_report(bundle)
+
+                payload: dict[str, Any] = {
+                    "session_id": session_id,
+                    "bundle_id": bundle_id,
+                    "elapsed_seconds": round(time.perf_counter() - t0, 3),
+                    "purpose": bundle.purpose.value,
+                    "selected_candidate_id": bundle.load_plan.selected_candidate_id,
+                    "tables": [tb.model_dump(mode="json") for tb in bundle.tables],
+                    "relations": bundle.relations.model_dump(mode="json"),
+                    "load_plan": bundle.load_plan.model_dump(mode="json"),
+                    "management_ddl_sql": mgmt_ddl,
+                    "analysis_report_markdown": report_md,
+                    "warnings": list(bundle.warnings),
+                }
+            self._send_json(HTTPStatus.OK, payload)
+        except (InputError, ValueError) as exc:
+            self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
+        except Exception:
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {
+                    "error": (
+                        "다중 테이블 분석 중 내부 오류가 발생했다"
+                        "(데이터 보호를 위해 상세 원문 생략)."
+                    )
+                },
+            )
+
+    def _handle_etl_load_db(self, req: dict[str, Any]) -> None:
+        from autoetl.contracts import Purpose
+        from autoetl.core.db_loader import (
+            inspect_db_catalog,
+            load_tables,
+            render_management_tables_ddl,
+        )
+        from autoetl.core.pipeline import InputError
+
+        session_id = str(req.get("session_id", "") or "").strip()
+        in_dir = self.server.etl_session_store.get(session_id)
+        if in_dir is None:
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": "분석 세션을 찾을 수 없습니다. 파일을 먼저 분석해 주세요."},
+            )
+            return
+
+        db_engine = str(req.get("db_engine", "sqlite") or "sqlite").strip().lower()
+        if db_engine not in {"sqlite", "duckdb"}:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "웹 UI DB 파일 생성은 `sqlite` 또는 `duckdb` 엔진만 지원합니다."},
             )
             return
 
@@ -618,89 +853,50 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
             )
             return
         decompose_strings = bool(opts_in.get("decompose_strings", True))
+        notes = str(req.get("notes", "") or "").strip()[:300]
 
-        decoded_files: list[tuple[str, bytes]] = []
-        total_bytes = 0
-        seen_names: set[str] = set()
-        allowed_exts = sorted(SUPPORTED_TABLE_EXTENSIONS)
+        overrides_spec = self._parse_schema_overrides(req.get("overrides"))
+        if overrides_spec is False:
+            return
 
-        for idx, item in enumerate(raw_files):
-            if not isinstance(item, dict):
-                self._send_json(
-                    HTTPStatus.BAD_REQUEST,
-                    {"error": "각 파일 항목은 `filename`과 `content_base64` 객체여야 한다."},
-                )
-                return
-            filename = Path(str(item.get("filename", "")).strip()).name
-            b64_data = item.get("content_base64")
-            if not filename or not isinstance(b64_data, str) or not b64_data:
-                self._send_json(
-                    HTTPStatus.BAD_REQUEST,
-                    {"error": "각 항목에 파일명(`filename`)과 내용(`content_base64`)이 필요하다."},
-                )
-                return
-            ext = Path(filename).suffix.lower()
-            if ext not in SUPPORTED_TABLE_EXTENSIONS:
-                self._send_json(
-                    HTTPStatus.BAD_REQUEST,
-                    {
-                        "error": f"지원하지 않는 테이블 파일 형식이다: '{ext or '(없음)'}' "
-                        f"(지원: {', '.join(allowed_exts)})"
-                    },
-                )
-                return
-            try:
-                fbytes = base64.b64decode(b64_data, validate=True)
-            except ValueError:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "파일 Base64 디코딩에 실패했다."})
-                return
-            total_bytes += len(fbytes)
-            if total_bytes > _MAX_UPLOAD_BYTES:
-                self._send_json(
-                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                    {"error": "업로드 파일 합계 크기가 50MB 상한을 초과했다."},
-                )
-                return
-            safe_name = filename
-            if safe_name in seen_names:
-                safe_name = f"{idx + 1}_{filename}"
-            seen_names.add(safe_name)
-            decoded_files.append((safe_name, fbytes))
+        ext = "sqlite" if db_engine == "sqlite" else "duckdb"
+        content_type = (
+            "application/vnd.sqlite3" if db_engine == "sqlite" else "application/octet-stream"
+        )
+        dl_name = f"autoetl_data.{ext}"
 
-        t0 = time.perf_counter()
         try:
-            with tempfile.TemporaryDirectory(prefix="autoetl_ui_tables_") as td:
-                td_path = Path(td)
-                in_dir = td_path / "inputs"
-                in_dir.mkdir()
-                bundle_dir = td_path / "bundle"
-                for fname, fbytes in decoded_files:
-                    (in_dir / fname).write_bytes(fbytes)
-
-                bundle = analyze_tables(
+            with tempfile.TemporaryDirectory(prefix="autoetl_ui_dbload_") as td:
+                db_file = Path(td) / dl_name
+                _bundle, load_res = load_tables(
                     sources=[in_dir],
+                    db_path=db_file,
+                    engine=db_engine,
                     purpose=purpose,
                     decompose_strings=decompose_strings,
-                    out_dir=bundle_dir,
+                    overrides=overrides_spec,
+                    notes=notes,
                 )
-                bundle_id = self.server.bundle_store.put_zip(
-                    bundle_dir,
-                    "autoetl_multi_table_plan.zip",
+                catalog = inspect_db_catalog(db_file, engine=db_engine, limit=50)
+                download_token = (
+                    self.server.bundle_store.put_file(
+                        db_file,
+                        dl_name,
+                        content_type=content_type,
+                    )
+                    if db_file.is_file()
+                    else None
                 )
-                report_md = render_analysis_report(bundle)
-
-                payload: dict[str, Any] = {
-                    "bundle_id": bundle_id,
-                    "elapsed_seconds": round(time.perf_counter() - t0, 3),
-                    "purpose": bundle.purpose.value,
-                    "selected_candidate_id": bundle.load_plan.selected_candidate_id,
-                    "tables": [tb.model_dump(mode="json") for tb in bundle.tables],
-                    "relations": bundle.relations.model_dump(mode="json"),
-                    "load_plan": bundle.load_plan.model_dump(mode="json"),
-                    "analysis_report_markdown": report_md,
-                    "warnings": list(bundle.warnings),
-                }
-            self._send_json(HTTPStatus.OK, payload)
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "download_token": download_token,
+                    "download_filename": dl_name,
+                    "load_result": load_res.model_dump(mode="json"),
+                    "catalog": catalog,
+                    "management_ddl_sql": render_management_tables_ddl(db_engine),
+                },
+            )
         except (InputError, ValueError) as exc:
             self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
         except Exception:
@@ -708,8 +904,7 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 {
                     "error": (
-                        "다중 테이블 분석 중 내부 오류가 발생했다"
-                        "(데이터 보호를 위해 상세 원문 생략)."
+                        "DB 저장 중 내부 오류가 발생했습니다(데이터 보호를 위해 상세 원문 생략)."
                     )
                 },
             )

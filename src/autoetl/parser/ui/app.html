@@ -933,6 +933,71 @@
     margin: 0 0 12px;
   }
 
+  .status-banner.ok {
+    display: block;
+    background: var(--ok-bg);
+    color: var(--ok);
+    border: 1px solid var(--ok-border);
+  }
+
+  .apply-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 10px 14px;
+    margin-bottom: 12px;
+    border-radius: var(--radius-md);
+    background: var(--accent-soft);
+    border: 1px solid var(--accent-border);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--ink);
+  }
+
+  .inline-ident {
+    width: 142px;
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--ink);
+    background: var(--surface);
+    transition: border-color 0.14s ease, box-shadow 0.14s ease;
+  }
+
+  .inline-ident:hover { border-color: var(--border-strong); }
+
+  .inline-ident:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+  }
+
+  .inline-ident.needs-rename {
+    border-color: var(--warn-border);
+    background: var(--warn-bg);
+  }
+
+  .inline-select {
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 12.5px;
+    color: var(--ink);
+    background: var(--surface);
+  }
+
+  .inline-select.pii-alert {
+    border-color: var(--warn-border);
+    background: var(--warn-bg);
+    color: var(--warn);
+    font-weight: 600;
+  }
+
   .doctor-box { display: none; }
   .doctor-box.open { display: block; }
   .hidden { display: none !important; }
@@ -1148,6 +1213,7 @@
         <button class="tab-btn active" data-etl-tab="etlTabColumns" type="button">표 구조 요약</button>
         <button class="tab-btn" data-etl-tab="etlTabRelations" type="button">표 연결 관계 (<span id="etlFkCnt">0</span>)</button>
         <button class="tab-btn" data-etl-tab="etlTabLoadPlan" type="button">DB 저장 순서</button>
+        <button class="tab-btn" data-etl-tab="etlTabSaveDb" type="button">DB로 저장하기</button>
         <button class="tab-btn" data-etl-tab="etlTabDdl" type="button">DB 생성 코드 (SQL)</button>
         <button class="tab-btn" data-etl-tab="etlTabReport" type="button">관계도 · 보고서</button>
       </div>
@@ -1156,6 +1222,13 @@
         <div class="toolbar">
           <select id="etlTableSelect" class="search-input"></select>
           <span id="etlTableMeta" class="muted-note" style="margin:0;"></span>
+        </div>
+        <div class="apply-bar hidden" id="etlApplyBar">
+          <span id="etlApplyBarText">항목 설정을 수정했습니다.</span>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="btn btn-sm btn-primary" id="etlApplyOverridesBtn" type="button">변경 내용 반영 (재검증)</button>
+            <button class="btn btn-sm btn-ghost" id="etlResetOverridesBtn" type="button">원래대로</button>
+          </div>
         </div>
         <div class="table-wrap"><table class="data-table" id="etlColumnsTable"></table></div>
         <div id="etlPatternsBox"></div>
@@ -1182,12 +1255,80 @@
         </details>
       </div>
 
+      <div class="tab-panel" id="etlTabSaveDb">
+        <div class="section-head" style="margin-bottom:14px;">
+          <h3 class="sub-heading" style="margin:0 0 4px;">분석한 표를 실제 DB 파일로 바로 저장합니다</h3>
+          <p class="muted-note" style="margin:0;">데이터 저장 시점, 고유 ID, 데이터 종류, 컬럼 사전, 오류 격리함을 관리하는 기본 관리 테이블 4종이 자동으로 함께 생성됩니다.</p>
+        </div>
+
+        <div class="purpose-strip" style="margin-top:0;">
+          <span class="purpose-label">저장할 DB 파일 종류</span>
+          <div class="purpose-pills" id="etlEnginePills">
+            <button type="button" class="purpose-pill active" data-engine="sqlite">SQLite 파일 (.sqlite · 범용)</button>
+            <button type="button" class="purpose-pill" data-engine="duckdb">DuckDB 파일 (.duckdb · 분석용)</button>
+          </div>
+        </div>
+
+        <div class="action-row">
+          <button class="btn btn-primary" id="etlSaveDbBtn" type="button">지금 DB 파일로 저장하기</button>
+          <a class="btn hidden" id="etlDbDownloadBtn" href="#">완성된 DB 파일 내려받기</a>
+        </div>
+
+        <details class="adv-drawer" style="margin-bottom:16px;">
+          <summary>세부 저장 옵션 (기본값 권장)</summary>
+          <div class="adv-body">
+            <div class="check-row">
+              <label><input type="checkbox" id="etlIncludeMgmtTables" checked> 기본 데이터 관리 테이블 4종 함께 만들기 (저장 시점·고유 ID·컬럼 사전·격리함)</label>
+              <label><input type="checkbox" id="etlIncludeAuditCols" checked> 모든 행에 저장 배치·데이터 고유 ID 이력 남기기</label>
+            </div>
+            <div class="opts-grid">
+              <label class="field">
+                오류·연결 누락 행 처리 방식
+                <select id="etlOrphanPolicy">
+                  <option value="quarantine" selected>오류 행만 격리함에 분리 저장하고 나머지 저장 (권장)</option>
+                  <option value="reject_all">오류가 1건이라도 있으면 전체 저장 취소</option>
+                </select>
+              </label>
+              <label class="field">
+                이번 저장 메모 (선택)
+                <input type="text" id="etlDbNotes" placeholder="예: 2026년 11월 정산 데이터">
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <div class="status-banner" id="etlDbStatusBanner"></div>
+
+        <div id="etlDbResultBox" class="hidden">
+          <div class="summary-row" id="etlDbKpiRow"></div>
+          <div id="etlDbWarnBox"></div>
+
+          <h3 class="sub-heading">데이터 관리 대장 (저장 시점 · 데이터 고유 ID · 데이터 종류)</h3>
+          <div class="table-wrap"><table class="data-table" id="etlDbCatalogTable"></table></div>
+
+          <div id="etlDbQuarantineSection" class="hidden">
+            <h3 class="sub-heading">오류 격리함 (수정 후 다시 넣을 수 있는 행)</h3>
+            <div class="table-wrap"><table class="data-table" id="etlDbQuarantineTable"></table></div>
+          </div>
+        </div>
+      </div>
+
       <div class="tab-panel" id="etlTabDdl">
         <div class="toolbar">
           <span class="muted-note" style="margin:0;">PostgreSQL에서 바로 실행할 수 있게 검증된 생성 코드입니다.</span>
           <button class="btn btn-sm" id="copyEtlDdlBtn" type="button">SQL 복사</button>
         </div>
         <pre class="code-box" id="etlDdlPre"></pre>
+        <details class="adv-drawer" style="margin-top:14px;">
+          <summary>기본 데이터 관리 테이블 생성 코드 보기 (_etl_load_batches 등 4종)</summary>
+          <div style="margin-top:12px;">
+            <div class="toolbar">
+              <span class="muted-note" style="margin:0;">외부 PostgreSQL 서버에 적재할 때도 동일한 데이터 관리 대장을 만들 수 있습니다.</span>
+              <button class="btn btn-sm" id="copyEtlMgmtDdlBtn" type="button">관리 테이블 SQL 복사</button>
+            </div>
+            <pre class="code-box" id="etlMgmtDdlPre" style="max-height:320px;"></pre>
+          </div>
+        </details>
       </div>
 
       <div class="tab-panel" id="etlTabReport">
@@ -1420,6 +1561,8 @@ function friendlyTransform(t) {
   if (t === "parse_korean_date") return "한글 날짜 → 표준 날짜 변환";
   if (t === "parse_iso_temporal") return "날짜·시간 표준화";
   if (t === "generated_always_as_identity") return "자동 증가 번호 생성";
+  if (t === "pii_mask") return "개인정보 마스킹 (예: 홍*동)";
+  if (t === "pii_hash") return "개인정보 익명 해시 변환";
   if (t.includes("regexp_extract")) return "코드 속 값 자동 추출";
   if (t.startsWith("cast_to_")) return "연결 표 형식에 맞춰 변환";
   return t;
@@ -1809,9 +1952,35 @@ document.getElementById("parseBtn").addEventListener("click", async () => {
   }
 });
 
-// ==================== 2. 엑셀·CSV 구조 분석 ====================
+// ==================== 2. 엑셀·CSV 구조 분석 & DB 저장 ====================
 let etlSelectedFiles = [];
 let etlLastResult = null;
+let etlSessionId = null;
+let etlOverridesMap = {}; // key: `${table}::${source_column}` -> {table, source_column, target_column, unique, masking}
+let etlSelectedEngine = "sqlite";
+
+const DATASET_KIND_KO = {
+  master_reference: "기준·마스터",
+  transaction_event: "거래·이벤트",
+  relation_fact: "관계·연결",
+  log_append: "이력·로그",
+  standalone: "단독 표",
+};
+
+const QUARANTINE_CAT_KO = {
+  cast_error: "형식 오류",
+  not_null_violation: "필수 값 누락",
+  pk_duplicate: "대표 키 중복",
+  unique_violation: "중복 금지 위반",
+  fk_orphan: "연결 대상 없음",
+};
+
+const LOAD_STATUS_KO = {
+  succeeded: "저장 완료",
+  partial: "일부 격리 후 저장 완료",
+  failed: "오류로 전체 취소됨",
+  skipped_duplicate: "동일 파일 건너뜀",
+};
 
 function renderEtlFileChips() {
   const box = document.getElementById("etlSelectedFiles");
@@ -1854,6 +2023,45 @@ function addEtlFiles(fileList) {
   renderEtlFileChips();
 }
 
+function buildOverridesPayload() {
+  const cols = [];
+  Object.values(etlOverridesMap).forEach(ov => {
+    const item = {table: ov.table, source_column: ov.source_column};
+    let hasChange = false;
+    if (ov.target_column && ov.target_column !== ov.default_target_column) {
+      item.target_column = ov.target_column;
+      hasChange = true;
+    }
+    if (ov.unique === true) {
+      item.unique = true;
+      hasChange = true;
+    }
+    if (ov.masking && ov.masking !== "none") {
+      item.masking = ov.masking;
+      hasChange = true;
+    }
+    if (hasChange) cols.push(item);
+  });
+  return {
+    columns: cols,
+    orphan_policy: document.getElementById("etlOrphanPolicy").value || "quarantine",
+    include_audit_columns: document.getElementById("etlIncludeAuditCols").checked,
+    include_management_tables: document.getElementById("etlIncludeMgmtTables").checked,
+  };
+}
+
+function updateEtlApplyBar() {
+  const bar = document.getElementById("etlApplyBar");
+  const cnt = buildOverridesPayload().columns.length;
+  if (cnt > 0) {
+    document.getElementById("etlApplyBarText").textContent =
+      `항목 설정 ${cnt}건을 수정했습니다. 변경 내용을 SQL과 데이터 검증에 바로 반영할 수 있어요.`;
+    bar.classList.remove("hidden");
+  } else {
+    bar.classList.add("hidden");
+  }
+}
+
 const etlDz = document.getElementById("etlDropzone");
 const etlFi = document.getElementById("etlFileInput");
 makeDropzoneInteractive(etlDz, etlFi, addEtlFiles);
@@ -1866,6 +2074,14 @@ document.getElementById("etlPurposePills").addEventListener("click", e => {
   document.querySelectorAll("#etlPurposePills .purpose-pill").forEach(p => p.classList.remove("active"));
   pill.classList.add("active");
   document.getElementById("etlPurpose").value = pill.getAttribute("data-purpose");
+});
+
+document.getElementById("etlEnginePills").addEventListener("click", e => {
+  const pill = e.target.closest(".purpose-pill");
+  if (!pill) return;
+  document.querySelectorAll("#etlEnginePills .purpose-pill").forEach(p => p.classList.remove("active"));
+  pill.classList.add("active");
+  etlSelectedEngine = pill.getAttribute("data-engine") || "sqlite";
 });
 
 document.getElementById("etlTabsBar").addEventListener("click", e => {
@@ -1881,11 +2097,25 @@ function renderEtlTableColumns(idx) {
   const tables = (etlLastResult && etlLastResult.tables) || [];
   const tb = tables[idx];
   if (!tb) return;
+  const tName = tb.source.table_name;
   const lp = etlLastResult.load_plan || {};
-  const tp = (lp.table_plans || []).find(p => p.source_table === tb.source.table_name);
+  const tp = (lp.table_plans || []).find(p => p.source_table === tName);
   const sensitiveSet = new Set((tp && tp.sensitive_columns) || []);
+  const confirmedUqSet = new Set((tp && tp.confirmed_unique_columns) || []);
+  const serverMaskMap = (tp && tp.column_masking) || {};
   const pkMap = (etlLastResult.relations && etlLastResult.relations.primary_keys) || {};
-  const pk = pkMap[tb.source.table_name];
+  const pk = pkMap[tName];
+  const solePkCol = pk && !pk.recommend_surrogate && (pk.columns || []).length === 1 ? pk.columns[0] : null;
+  const altKeySingleCols = new Set(
+    ((pk && pk.alternative_keys) || []).filter(ak => ak.length === 1).map(ak => ak[0])
+  );
+  const mappingBySrc = {};
+  ((tp && tp.column_mappings) || []).forEach(m => {
+    if (!mappingBySrc[m.source_column] && !(m.transform || "").includes("regexp_extract")) {
+      mappingBySrc[m.source_column] = m;
+    }
+  });
+
   const pkText = pk
     ? (pk.recommend_surrogate ? `자동 번호 키(${pk.surrogate_column_name})` : `대표 키: ${(pk.columns || []).join(", ")}`)
     : "대표 키 없음";
@@ -1894,9 +2124,96 @@ function renderEtlTableColumns(idx) {
     `${tb.source.display_name} · ${tb.source.row_count.toLocaleString()}행 × ${tb.source.column_count}항목 · ${pkText}${encText}`;
 
   const rows = (tb.classifications || []).map(c => {
+    const key = `${tName}::${c.column}`;
+    const mapEntry = mappingBySrc[c.column];
+    const currentTarget = mapEntry ? mapEntry.target_column : c.column;
+    const savedOv = etlOverridesMap[key] || {
+      table: tName,
+      source_column: c.column,
+      default_target_column: currentTarget,
+      target_column: currentTarget,
+      unique: confirmedUqSet.has(currentTarget),
+      masking: serverMaskMap[c.column] || "none",
+    };
+
+    // 1. DB 저장 이름 인라인 입력
+    const isAutoHash = /^c\d+_[0-9a-f]{6}$/.test(savedOv.target_column || "");
+    const nameInput = el("input", {
+      type: "text",
+      class: "inline-ident" + (isAutoHash ? " needs-rename" : ""),
+      value: savedOv.target_column || currentTarget,
+      title: isAutoHash ? "영문 소문자·숫자·밑줄 이름으로 바꾸면 DB에서 다루기 편해요" : "DB에 저장될 영문 컬럼명",
+      "aria-label": `${c.column} DB 저장 이름`,
+    });
+    nameInput.addEventListener("input", () => {
+      const cleaned = nameInput.value.trim();
+      etlOverridesMap[key] = Object.assign({}, savedOv, etlOverridesMap[key] || {}, {
+        table: tName,
+        source_column: c.column,
+        default_target_column: savedOv.default_target_column,
+        target_column: cleaned,
+      });
+      nameInput.classList.toggle("needs-rename", /^c\d+_[0-9a-f]{6}$/.test(cleaned));
+      updateEtlApplyBar();
+    });
+
+    // 2. 중복 금지(UNIQUE) 확인 컨트롤
+    const uqWrap = el("div", {style: "display:flex; gap:6px; align-items:center; flex-wrap:wrap;"});
+    if (solePkCol === c.column) {
+      uqWrap.appendChild(el("span", {class: "badge badge-ok"}, "대표 키"));
+    } else {
+      const uqCb = el("input", {
+        type: "checkbox",
+        "aria-label": `${c.column} 중복 금지`,
+      });
+      uqCb.checked = Boolean(savedOv.unique);
+      uqCb.addEventListener("change", () => {
+        etlOverridesMap[key] = Object.assign({}, savedOv, etlOverridesMap[key] || {}, {
+          table: tName,
+          source_column: c.column,
+          default_target_column: savedOv.default_target_column,
+          unique: uqCb.checked,
+        });
+        updateEtlApplyBar();
+      });
+      uqWrap.appendChild(uqCb);
+      if (altKeySingleCols.has(c.column)) {
+        uqWrap.appendChild(el("span", {class: "badge", title: "현재 파일에서 모든 값이 서로 다릅니다"}, "유일 후보"));
+      }
+    }
+
+    // 3. 개인정보 보호 정책 선택
+    const isPii = sensitiveSet.has(c.column);
+    const maskSel = el("select", {
+      class: "inline-select" + (isPii && (savedOv.masking || "none") === "none" ? " pii-alert" : ""),
+      "aria-label": `${c.column} 개인정보 보호`,
+    });
+    [
+      ["none", "그대로"],
+      ["mask", "마스킹 (홍*동)"],
+      ["hash", "익명 해시"],
+    ].forEach(([val, lbl]) => {
+      const opt = el("option", {value: val}, lbl);
+      if ((savedOv.masking || "none") === val) opt.selected = true;
+      maskSel.appendChild(opt);
+    });
+    maskSel.addEventListener("change", () => {
+      etlOverridesMap[key] = Object.assign({}, savedOv, etlOverridesMap[key] || {}, {
+        table: tName,
+        source_column: c.column,
+        default_target_column: savedOv.default_target_column,
+        masking: maskSel.value,
+      });
+      maskSel.classList.toggle("pii-alert", isPii && maskSel.value === "none");
+      updateEtlApplyBar();
+    });
+
     const notesWrap = el("div", {style: "display:flex; gap:6px; flex-wrap:wrap; align-items:center;"});
-    if (sensitiveSet.has(c.column)) {
-      notesWrap.appendChild(el("span", {class: "badge badge-warn"}, "개인정보 주의"));
+    if (isPii) {
+      notesWrap.appendChild(
+        el("span", {class: "badge " + ((savedOv.masking || "none") === "none" ? "badge-warn" : "badge-ok")},
+          (savedOv.masking || "none") === "none" ? "개인정보 주의" : "보호 설정됨")
+      );
     }
     if (c.index_meta && c.index_meta.likely_surrogate_index) {
       notesWrap.appendChild(el("span", {class: "badge badge-neutral"}, "순차 번호"));
@@ -1910,20 +2227,22 @@ function renderEtlTableColumns(idx) {
     if (!notesWrap.childNodes.length) notesWrap.textContent = "-";
 
     const missText = c.missing_count > 0
-      ? `${c.missing_count.toLocaleString()}건 (${(c.missing_rate * 100).toFixed(1)}%)`
-      : "없음";
+      ? `빈 값 ${c.missing_count.toLocaleString()}건 · 고유 ${c.unique_count.toLocaleString()}개`
+      : `고유 ${c.unique_count.toLocaleString()}개`;
 
     return [
       c.column,
+      nameInput,
       `${labelOf(ROLE_LABELS, c.category)} (${labelOf(PHYS_LABELS, c.physical_type)})`,
       missText,
-      `${c.unique_count.toLocaleString()}개`,
+      uqWrap,
+      maskSel,
       notesWrap,
     ];
   });
   buildSimpleTable(
     document.getElementById("etlColumnsTable"),
-    ["항목 이름", "데이터 종류", "빈 값", "서로 다른 값", "특징"],
+    ["원본 항목", "DB 저장 이름", "데이터 종류", "값 분포", "중복 금지", "개인정보 보호", "특징"],
     rows
   );
 
@@ -1958,8 +2277,9 @@ function renderEtlTableColumns(idx) {
   }
 }
 
-function renderEtlResult(data) {
+function renderEtlResult(data, preserveTableIdx) {
   etlLastResult = data;
+  if (data.session_id) etlSessionId = data.session_id;
   document.getElementById("etlResultSection").classList.remove("hidden");
   const dl = document.getElementById("etlDownloadBtn");
   if (data.bundle_id) {
@@ -1974,6 +2294,10 @@ function renderEtlResult(data) {
   const selectedSc = (lp.scorecards || []).find(s => s.candidate_id === lp.selected_candidate_id) || (lp.scorecards || [])[0];
   const val = selectedSc && selectedSc.validation ? selectedSc.validation : null;
   const totalPii = (lp.table_plans || []).reduce((acc, tp) => acc + ((tp.sensitive_columns || []).length), 0);
+  const maskedPii = (lp.table_plans || []).reduce((acc, tp) => {
+    const cm = tp.column_masking || {};
+    return acc + (tp.sensitive_columns || []).filter(c => cm[c] && cm[c] !== "none").length;
+  }, 0);
 
   let verifyLabel = "확인 전";
   let verifyTone = "";
@@ -1988,11 +2312,26 @@ function renderEtlResult(data) {
     }
   }
 
+  let piiLabel = "감지 안 됨";
+  let piiTone = "ok";
+  if (totalPii > 0) {
+    if (maskedPii >= totalPii) {
+      piiLabel = `${totalPii}개 모두 보호됨`;
+      piiTone = "ok";
+    } else if (maskedPii > 0) {
+      piiLabel = `${maskedPii}/${totalPii}개 보호됨`;
+      piiTone = "warn";
+    } else {
+      piiLabel = `${totalPii}개 감지`;
+      piiTone = "warn";
+    }
+  }
+
   renderSummaryTiles("etlKpiRow", [
     {label: "분석한 표", value: `${tables.length}개 (${totalRows.toLocaleString()}행)`},
     {label: "찾은 표 연결", value: `${fks.length}건`},
     {label: "실제 데이터 검증", value: verifyLabel, tone: verifyTone},
-    {label: "개인정보 항목", value: totalPii > 0 ? `${totalPii}개 감지` : "감지 안 됨", tone: totalPii > 0 ? "warn" : "ok"},
+    {label: "개인정보 항목", value: piiLabel, tone: piiTone},
     {label: "추천 저장 방식", value: labelOf(CANDIDATE_LABELS, lp.selected_candidate_id).split(" (")[0]},
   ]);
   document.getElementById("etlFkCnt").textContent = String(fks.length);
@@ -2013,7 +2352,10 @@ function renderEtlResult(data) {
   tables.forEach((tb, idx) => {
     tSel.appendChild(el("option", {value: String(idx)}, `${tb.source.table_name} (${tb.source.row_count.toLocaleString()}행 × ${tb.source.column_count}항목)`));
   });
-  if (tables.length > 0) renderEtlTableColumns(0);
+  const targetIdx = typeof preserveTableIdx === "number" && preserveTableIdx < tables.length ? preserveTableIdx : 0;
+  tSel.value = String(targetIdx);
+  if (tables.length > 0) renderEtlTableColumns(targetIdx);
+  updateEtlApplyBar();
 
   // FK table
   buildSimpleTable(
@@ -2134,12 +2476,164 @@ function renderEtlResult(data) {
     fullDdl += "\n\n-- Column Comments\n" + lp.comment_ddl_sql.trim();
   }
   document.getElementById("etlDdlPre").textContent = fullDdl;
+  document.getElementById("etlMgmtDdlPre").textContent = data.management_ddl_sql || "";
   document.getElementById("etlErdPre").textContent = lp.erd_mermaid || "";
   document.getElementById("etlReportPre").textContent = data.analysis_report_markdown || "";
 }
 
+function renderEtlDbResult(data) {
+  const lr = data.load_result || {};
+  const cat = data.catalog || {};
+  document.getElementById("etlDbResultBox").classList.remove("hidden");
+
+  const dl = document.getElementById("etlDbDownloadBtn");
+  if (data.download_token && lr.status !== "failed") {
+    dl.href = "/api/download/" + encodeURIComponent(data.download_token);
+    dl.textContent = `완성된 DB 파일 내려받기 (${data.download_filename || "autoetl_data.sqlite"})`;
+    dl.classList.remove("hidden");
+  } else {
+    dl.classList.add("hidden");
+  }
+
+  const tone = lr.status === "succeeded" ? "ok" : (lr.status === "failed" ? "warn" : "warn");
+  renderSummaryTiles("etlDbKpiRow", [
+    {label: "저장 상태", value: labelOf(LOAD_STATUS_KO, lr.status), tone: tone},
+    {label: "저장된 행", value: `${Number(lr.total_rows_loaded || 0).toLocaleString()}건`, tone: lr.total_rows_loaded > 0 ? "ok" : ""},
+    {label: "오류 격리 행", value: `${Number(lr.total_rows_quarantined || 0).toLocaleString()}건`, tone: lr.total_rows_quarantined > 0 ? "warn" : "ok"},
+    {label: "저장 시각 (UTC)", value: String(lr.loaded_at || "-").replace("T", " ").replace("Z", "")},
+    {label: "배치 고유 ID", value: String(lr.batch_id || "-").slice(0, 22)},
+  ]);
+
+  const warnBox = document.getElementById("etlDbWarnBox");
+  warnBox.textContent = "";
+  if (lr.warnings && lr.warnings.length > 0) {
+    const b = el("div", {class: "status-banner " + (lr.status === "failed" ? "error" : "warn")});
+    b.textContent = lr.warnings.join(" · ");
+    warnBox.appendChild(b);
+  }
+
+  // 데이터 관리 대장 (_etl_datasets)
+  const dsRows = (cat.datasets || []).map(ds => [
+    ds.target_table,
+    el("span", {class: "badge"}, ds.dataset_kind_label || labelOf(DATASET_KIND_KO, ds.dataset_kind)),
+    el("code", {style: "font-family:var(--mono); font-size:12px;"}, ds.dataset_id),
+    ds.source_name,
+    `${Number(ds.rows_loaded || 0).toLocaleString()}건`,
+    ds.rows_quarantined > 0
+      ? el("span", {class: "badge badge-warn"}, `${ds.rows_quarantined}건`)
+      : el("span", {class: "badge badge-ok"}, "0건"),
+    String(ds.loaded_at || "").replace("T", " ").replace("Z", ""),
+  ]);
+  buildSimpleTable(
+    document.getElementById("etlDbCatalogTable"),
+    ["표 이름", "데이터 종류", "데이터 고유 ID", "원본 파일", "저장 건수", "격리 건수", "저장 시각"],
+    dsRows,
+    "등록된 데이터셋 이력이 없습니다."
+  );
+
+  // 격리함 (_etl_quarantine_rows)
+  const qWrap = document.getElementById("etlDbQuarantineSection");
+  const qItems = cat.quarantine || [];
+  if (qItems.length > 0) {
+    qWrap.classList.remove("hidden");
+    buildSimpleTable(
+      document.getElementById("etlDbQuarantineTable"),
+      ["표 이름", "원본 행", "문제 항목", "오류 종류", "설명"],
+      qItems.map(q => [
+        q.target_table,
+        `${q.source_row_number}행`,
+        q.error_column,
+        el("span", {class: "badge badge-warn"}, labelOf(QUARANTINE_CAT_KO, q.error_category)),
+        q.error_detail,
+      ])
+    );
+  } else {
+    qWrap.classList.add("hidden");
+  }
+}
+
+async function applyEtlOverrides() {
+  if (!etlSessionId) return;
+  const applyBtn = document.getElementById("etlApplyOverridesBtn");
+  applyBtn.disabled = true;
+  const curIdx = Number(document.getElementById("etlTableSelect").value) || 0;
+  showBanner("etlStatusBanner", "수정한 항목 이름·중복 금지·개인정보 정책을 반영해 다시 검증하는 중입니다...", "info", true);
+  try {
+    const res = await fetch("/api/analyze-tables", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        session_id: etlSessionId,
+        options: {
+          purpose: document.getElementById("etlPurpose").value,
+          decompose_strings: document.getElementById("etlDecomposeStrings").checked,
+        },
+        overrides: buildOverridesPayload(),
+      }),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      showBanner("etlStatusBanner", body.error || "변경 내용 반영 중 문제가 생겼습니다.", "error");
+    } else {
+      showBanner("etlStatusBanner", "변경한 항목 설정을 SQL과 검증 결과에 반영했습니다.", "ok");
+      renderEtlResult(body, curIdx);
+    }
+  } catch (_) {
+    showBanner("etlStatusBanner", "로컬 서버와 연결하지 못했습니다.", "error");
+  } finally {
+    applyBtn.disabled = false;
+  }
+}
+
+document.getElementById("etlApplyOverridesBtn").addEventListener("click", applyEtlOverrides);
+document.getElementById("etlResetOverridesBtn").addEventListener("click", () => {
+  etlOverridesMap = {};
+  updateEtlApplyBar();
+  if (etlSessionId) applyEtlOverrides();
+});
+
+document.getElementById("etlSaveDbBtn").addEventListener("click", async () => {
+  if (!etlSessionId) return;
+  const btn = document.getElementById("etlSaveDbBtn");
+  btn.disabled = true;
+  showBanner("etlDbStatusBanner", `${etlSelectedEngine.toUpperCase()} DB 파일과 기본 데이터 관리 대장을 생성하는 중입니다...`, "info", true);
+  try {
+    const res = await fetch("/api/etl/load-db", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        session_id: etlSessionId,
+        db_engine: etlSelectedEngine,
+        options: {
+          purpose: document.getElementById("etlPurpose").value,
+          decompose_strings: document.getElementById("etlDecomposeStrings").checked,
+        },
+        overrides: buildOverridesPayload(),
+        notes: document.getElementById("etlDbNotes").value.trim(),
+      }),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      showBanner("etlDbStatusBanner", body.error || "DB 파일 저장 중 문제가 생겼습니다.", "error");
+    } else {
+      const st = (body.load_result && body.load_result.status) || "succeeded";
+      if (st === "failed") {
+        showBanner("etlDbStatusBanner", "오류가 발견되어 전체 저장이 안전하게 취소되었습니다. 아래 상세 사유를 확인해 주세요.", "error");
+      } else {
+        showBanner("etlDbStatusBanner", "DB 파일 저장이 완료되었습니다. 아래 버튼으로 바로 내려받을 수 있어요.", "ok");
+      }
+      renderEtlDbResult(body);
+    }
+  } catch (_) {
+    showBanner("etlDbStatusBanner", "로컬 서버와 연결하지 못했습니다.", "error");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 document.getElementById("etlTableSelect").addEventListener("change", e => renderEtlTableColumns(Number(e.target.value)));
 document.getElementById("copyEtlDdlBtn").addEventListener("click", e => copyText(document.getElementById("etlDdlPre").textContent || "", e.target));
+document.getElementById("copyEtlMgmtDdlBtn").addEventListener("click", e => copyText(document.getElementById("etlMgmtDdlPre").textContent || "", e.target));
 document.getElementById("copyEtlErdBtn").addEventListener("click", e => copyText(document.getElementById("etlErdPre").textContent || "", e.target));
 document.getElementById("copyEtlReportBtn").addEventListener("click", e => copyText(document.getElementById("etlReportPre").textContent || "", e.target));
 
@@ -2147,6 +2641,10 @@ document.getElementById("etlRunBtn").addEventListener("click", async () => {
   if (etlSelectedFiles.length === 0) return;
   const btn = document.getElementById("etlRunBtn");
   btn.disabled = true;
+  etlOverridesMap = {};
+  document.getElementById("etlDbResultBox").classList.add("hidden");
+  document.getElementById("etlDbDownloadBtn").classList.add("hidden");
+  hideBanner("etlDbStatusBanner");
   showBanner("etlStatusBanner", `${etlSelectedFiles.length}개 파일의 구조와 연결 관계를 분석하고 검증하는 중입니다...`, "info", true);
   try {
     const filesPayload = [];

@@ -65,6 +65,12 @@ autoetl analyze ./sales_data --purpose oltp --out ./etl_plan
 autoetl analyze branches.csv customers.csv orders.xlsx --purpose analytics --out ./etl_plan
 autoetl analyze ./sales_data --format ddl   # verified PostgreSQL DDL to stdout
 autoetl analyze ./sales_data --format erd   # Mermaid ERD to stdout
+
+# Load directly into SQLite / DuckDB / optional PostgreSQL with 4 default _etl_* lineage tables
+autoetl load ./sales_data --db ./warehouse.sqlite --mask-pii
+autoetl load ./sales_data --db ./analytics.duckdb --engine duckdb --purpose analytics
+autoetl catalog ./warehouse.sqlite                       # inspect batches, dataset IDs, kinds & quarantine
+autoetl catalog ./warehouse.sqlite --rollback <batch_id> # safely roll back a batch in reverse FK order
 ```
 
 Writing to `--out ./etl_plan` produces 6 files:
@@ -78,6 +84,8 @@ etl_plan/
 ├── erd.mmd              # Mermaid erDiagram
 └── analysis_report.md   # full analysis report in Markdown
 ```
+
+Loading via `autoetl load` or the Web UI **Save to DB** tab automatically creates 4 default management/lineage tables (`_etl_load_batches`, `_etl_datasets`, `_etl_column_registry`, `_etl_quarantine_rows`) and attaches per-row audit columns (`_etl_batch_id`, `_etl_dataset_id`, `_etl_loaded_at`) for full load-time tracking, dataset IDs, dataset kind classification, duplicate-file skipping, schema drift detection, quarantine isolation, and safe batch rollback.
 
 ### 2. Parse a single document (default offline mode)
 
