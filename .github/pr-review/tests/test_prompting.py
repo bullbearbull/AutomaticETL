@@ -54,3 +54,18 @@ def test_schema_requires_summary_and_findings():
     item = REVIEW_SCHEMA["properties"]["findings"]["items"]
     assert set(item["required"]) == {"path", "line", "severity", "title", "body"}
     assert item["properties"]["severity"]["enum"] == ["critical", "major", "minor", "nit"]
+
+
+def test_system_prompt_ignores_symlink_to_sensitive_or_outside_files(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".env").write_text("SECRET_TOKEN=leaked", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("OUTSIDE_SECRET=leaked", encoding="utf-8")
+
+    (repo / "CLAUDE.md").symlink_to(repo / ".env")
+    (repo / "CONTRIBUTING.md").symlink_to(outside)
+
+    prompt = load_system_prompt(repo)
+    assert "SECRET_TOKEN" not in prompt
+    assert "OUTSIDE_SECRET" not in prompt

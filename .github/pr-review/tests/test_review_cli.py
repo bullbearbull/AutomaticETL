@@ -120,6 +120,7 @@ def setup(monkeypatch, tmp_path, result=None, **client_kw):
     }.items():
         monkeypatch.setenv(k, v)
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    monkeypatch.delenv("PR_HEAD_SHA", raising=False)
     return calls
 
 
@@ -436,3 +437,12 @@ def test_local_git_diff_does_not_fall_back_to_two_dot_when_merge_base_missing(tm
     ).stdout.strip()
 
     assert review._local_git_diff(repo, sha1, sha2) is None
+
+
+def test_skips_when_event_head_sha_mismatches_pr_head_sha(monkeypatch, tmp_path):
+    calls = setup(monkeypatch, tmp_path, head_sha="newsha9999")
+    monkeypatch.setenv("PR_HEAD_SHA", "oldsha1111")
+    assert review.main([]) == 0
+    assert calls == []
+    assert FakeClient.instances[0].summaries == []
+    assert FakeClient.instances[0].reviews == []

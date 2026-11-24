@@ -119,6 +119,14 @@ def _run(argv: list[str] | None) -> int:
         )
         pr = client.get_pr()
         sha = str(pr["head"]["sha"])
+        event_head_sha = os.environ.get("PR_HEAD_SHA", "").strip()
+        if event_head_sha and event_head_sha != sha:
+            print(
+                f"PR head moved since workflow event ({event_head_sha[:7]} -> {sha[:7]}); "
+                "skipping stale workspace review",
+                file=sys.stderr,
+            )
+            return 0
         base_obj = pr.get("base")
         base_sha = (
             str(base_obj["sha"]) if isinstance(base_obj, dict) and base_obj.get("sha") else None

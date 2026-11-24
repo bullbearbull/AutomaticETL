@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from diffutil import FileDiff
+from diffutil import FileDiff, is_sensitive_path
 
 GUIDELINE_FILES = ("CLAUDE.md", "CONTRIBUTING.md")
 GUIDELINE_CHAR_LIMIT = 20_000
@@ -36,12 +36,17 @@ REVIEW_SCHEMA: dict[str, Any] = {
 
 def load_system_prompt(repo_dir: Path) -> str:
     """고정 리뷰 규칙과 저장소 가이드라인 문서를 결정론적으로 결합한다(프롬프트 캐시 재사용)."""
+    repo_root = Path(repo_dir).resolve()
     parts = [_PROMPT_FILE.read_text(encoding="utf-8").rstrip()]
     for name in GUIDELINE_FILES:
-        path = Path(repo_dir) / name
-        if path.is_file():
-            text = path.read_text(encoding="utf-8", errors="replace")[:GUIDELINE_CHAR_LIMIT]
-            parts.append(f"## 저장소 가이드라인 ({name})\n{text.rstrip()}")
+        candidate = (repo_root / name).resolve()
+        if not candidate.is_relative_to(repo_root) or not candidate.is_file():
+            continue
+        rel = candidate.relative_to(repo_root).as_posix()
+        if rel and rel != "." and is_sensitive_path(rel):
+            continue
+        text = candidate.read_text(encoding="utf-8", errors="replace")[:GUIDELINE_CHAR_LIMIT]
+        parts.append(f"## 저장소 가이드라인 ({name})\n{text.rstrip()}")
     return "\n\n".join(parts) + "\n"
 
 

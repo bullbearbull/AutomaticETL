@@ -898,15 +898,18 @@ def test_rollback_edge_cases_unique_order_generated_col_nocase_cap_and_without_r
     b2.parent.mkdir()
     b1.write_text("code,name\nKR,Seoul\nUS,NewYork\n", encoding="utf-8")
     b2.write_text("code,name\nkr,Seoul-v2\nJP,Tokyo\n", encoding="utf-8")
-    load_tables([b1], db_path=nc_db, engine="sqlite")
+    _, nc_res1 = load_tables([b1], db_path=nc_db, engine="sqlite")
     _, nc_res2 = load_tables([b2], db_path=nc_db, engine="sqlite")
     assert any("PK 비교 규칙 차이" in w for w in nc_res2.warnings)
     with pytest.raises(InputError, match="스냅샷이 없어"):
         rollback_batch(nc_db, nc_res2.batch_id, engine="sqlite")
+    # 선행 배치 미확정 상태의 후속 갱신 배치가 있으면 선행 배치(nc_res1) 롤백도 보수적으로 차단
+    with pytest.raises(InputError, match="후속 갱신 배치"):
+        rollback_batch(nc_db, nc_res1.batch_id, engine="sqlite")
 
-    # 5. MAX_ROLLBACK_SNAPSHOT_ROWS 초과 시 스냅샷 생략 + 경고 + 롤백 차단
+    # 5. MAX_ROLLBACK_SNAPSHOT_ROWS 초과 시 스냅샷 생략 + 경고 + 선행 배치 링크 보존
     cap_db = tmp_path / "cap.sqlite"
-    load_tables([b1], db_path=cap_db, engine="sqlite")
+    _, cap_base = load_tables([b1], db_path=cap_db, engine="sqlite")
     b_cap = tmp_path / "nc3" / "branches.csv"
     b_cap.parent.mkdir()
     b_cap.write_text("code,name\nKR,Seoul-3\nUS,NY-3\n", encoding="utf-8")
@@ -915,6 +918,91 @@ def test_rollback_edge_cases_unique_order_generated_col_nocase_cap_and_without_r
     assert any("스냅샷 상한" in w for w in cap_res.warnings)
     with pytest.raises(InputError, match="스냅샷이 없어"):
         rollback_batch(cap_db, cap_res.batch_id, engine="sqlite")
+    # 스냅샷 본문이 없어도 선행 배치 링크가 보존되어 cap_base 롤백이 차단되어야 한다.
+    with pytest.raises(InputError, match="후속 배치"):
+        rollback_batch(cap_db, cap_base.batch_id, engine="sqlite")
+    monkeypatch.setattr(db_loader, "MAX_ROLLBACK_SNAPSHOT_ROWS", 50_000)
+
+    # 6. MAX_ROLLBACK_SNAPSHOT_BYTES 초과 시 스냅샷 생략 + 바이트 경고 + 선행 배치 링크 보존
+    byte_db = tmp_path / "bytes.sqlite"
+    _, byte_base = load_tables([b1], db_path=byte_db, engine="sqlite")
+    b_byte = tmp_path / "nc4" / "branches.csv"
+    b_byte.parent.mkdir()
+    b_byte.write_text("code,name\nKR,Seoul-big\nUS,NY-big\n", encoding="utf-8")
+    monkeypatch.setattr(db_loader, "MAX_ROLLBACK_SNAPSHOT_BYTES", 50)
+    _, byte_res = load_tables([b_byte], db_path=byte_db, engine="sqlite")
+    assert any("바이트 상한" in w for w in byte_res.warnings)
+    with pytest.raises(InputError, match="스냅샷이 없어"):
+        rollback_batch(byte_db, byte_res.batch_id, engine="sqlite")
+    with pytest.raises(InputError, match="후속 배치"):
+        rollback_batch(byte_db, byte_base.batch_id, engine="sqlite")
+    monkeypatch.setattr(db_loader, "MAX_ROLLBACK_SNAPSHOT_BYTES", 32 * 1024 * 1024)
+
+    # 7. 컬럼 수준 TEXT COLLATE NOCASE PRIMARY KEY + UNIQUE 값 이동 시 역순 복원 순서 보존
+    nocase_swap_db = tmp_path / "nocase_swap.sqlite"
+    con = sqlite3.connect(str(nocase_swap_db))
+    try:
+        con.execute(
+            'CREATE TABLE "slots" ('
+            '"code" TEXT COLLATE NOCASE PRIMARY KEY, '
+            '"tag" TEXT UNIQUE NOT NULL, '
+            '"_etl_batch_id" TEXT NOT NULL, '
+            '"_etl_dataset_id" TEXT NOT NULL, '
+            '"_etl_loaded_at" TEXT NOT NULL'
+            ")"
+        )
+        con.commit()
+    finally:
+        con.close()
+    s1 = tmp_path / "sw1" / "slots.csv"
+    s2 = tmp_path / "sw2" / "slots.csv"
+    s1.parent.mkdir()
+    s2.parent.mkdir()
+    s1.write_text("code,tag\nKR,X\nUS,Y\n", encoding="utf-8")
+    s2.write_text("code,tag\nkr,Z\nUS,X\n", encoding="utf-8")
+    load_tables([s1], db_path=nocase_swap_db, engine="sqlite")
+    _, sw_res2 = load_tables([s2], db_path=nocase_swap_db, engine="sqlite")
+    assert sw_res2.status == "succeeded"
+    sw_rb = rollback_batch(nocase_swap_db, sw_res2.batch_id, engine="sqlite")
+    assert sw_rb["total_restored"] == 2
+    con = sqlite3.connect(str(nocase_swap_db))
+    try:
+        sw_rows = con.execute('SELECT "code", "tag" FROM "slots" ORDER BY "code"').fetchall()
+    finally:
+        con.close()
+    assert sw_rows == [("KR", "X"), ("US", "Y")]
+
+    # 8. SQLite INTEGER PRIMARY KEY DESC NOT NULL은 rowid 별칭이 아니므로 명시적 대리키 할당
+    desc_db = tmp_path / "desc_pk.sqlite"
+    con = sqlite3.connect(str(desc_db))
+    try:
+        con.execute(
+            'CREATE TABLE "events" ('
+            '"event_id" INTEGER PRIMARY KEY DESC NOT NULL, '
+            '"event_date" TEXT NOT NULL, '
+            '"user_id" INTEGER NOT NULL, '
+            '"_etl_batch_id" TEXT NOT NULL, '
+            '"_etl_dataset_id" TEXT NOT NULL, '
+            '"_etl_loaded_at" TEXT NOT NULL'
+            ")"
+        )
+        con.commit()
+    finally:
+        con.close()
+    adapter = db_loader._DbAdapter(desc_db, "sqlite")
+    try:
+        assert adapter.sqlite_single_identity_pk("events", "event_id") is False
+    finally:
+        adapter.close()
+    ev_csv = tmp_path / "desc_ev" / "events.csv"
+    ev_csv.parent.mkdir()
+    ev_csv.write_text(
+        "event_date,user_id\n2025-01-01,101\n2025-01-01,101\n2025-01-02,102\n",
+        encoding="utf-8",
+    )
+    _, desc_res = load_tables([ev_csv], db_path=desc_db, engine="sqlite", purpose=Purpose.ANALYTICS)
+    assert desc_res.status == "succeeded"
+    assert desc_res.total_rows_loaded == 3
 
 
 def test_mask_value_formats_and_management_ddl_dialects() -> None:
