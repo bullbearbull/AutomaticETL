@@ -203,12 +203,17 @@ def _run_catalog(args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps(res, ensure_ascii=False, indent=2))
             else:
+                restored_total = int(res.get("total_restored", 0))
+                restored_suffix = f", {restored_total:,}행 복원" if restored_total else ""
                 print(
                     f"배치 롤백 완료: {res['batch_id']} "
-                    f"(총 {res['total_deleted']:,}행 삭제, 상태=rolled_back)"
+                    f"(총 {res['total_deleted']:,}행 삭제{restored_suffix}, 상태=rolled_back)"
                 )
+                restored_by_tbl = res.get("restored_by_table", {})
                 for tbl, cnt in res["deleted_by_table"].items():
-                    print(f"  * {tbl}: {cnt:,}행 삭제")
+                    r_cnt = int(restored_by_tbl.get(tbl, 0))
+                    r_part = f" / {r_cnt:,}행 복원" if r_cnt else ""
+                    print(f"  * {tbl}: {cnt:,}행 삭제{r_part}")
             return 0
 
         catalog = inspect_db_catalog(args.db, engine=args.engine, limit=max(1, args.limit))
