@@ -263,3 +263,75 @@ def test_string_pattern_rejects_title_case_words_and_two_word_names() -> None:
     assert analyze_string_pattern(bands) is None
     assert analyze_string_pattern(cities) is None
     assert analyze_string_pattern(names) is None
+
+
+def test_single_year_code_keeps_year_slot_variable_and_extracts_future_years() -> None:
+    """2026년 단일 연도 표본에서도 연도를 리터럴 고정하지 않고 2027년·미매칭 행을 안전 추출한다."""
+    import duckdb
+
+    codes = [
+        "ORD-2026-SEL-00001",
+        "ORD-2026-BSN-00002",
+        "ORD-2026-ICN-00003",
+        "ORD-2026-SEL-00004",
+        "ORD-2026-DJN-00005",
+        "ORD-2026-BSN-00006",
+    ]
+    decomp = analyze_string_pattern(codes)
+    assert decomp is not None
+    # '2026'이 고정 리터럴로 굳지 않고 가변 연도 슬롯으로 유지되어야 함
+    assert "2026" not in decomp.regex_pattern
+    assert "([0-9]{4})" in decomp.regex_pattern
+
+    slots = [s for s in decomp.segments if s.kind is StringSegmentKind.SLOT]
+    assert len(slots) == 3
+    assert slots[0].slot_name == "year"
+    region_slot = slots[1]
+    assert region_slot.extract_sql_hint is not None
+    assert "NULLIF(" in region_slot.extract_sql_hint
+
+    # 생성된 DuckDB 추출식이 2026년, 2027년 미래 코드, 미매칭 코드(NULL) 모두 정확히 처리
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("CREATE TABLE t (col VARCHAR)")
+        con.executemany(
+            "INSERT INTO t VALUES (?)",
+            [("ORD-2026-SEL-00001",), ("ORD-2027-SEL-00099",), ("MALFORMED",)],
+        )
+        rows = con.execute(f"SELECT {region_slot.extract_sql_hint} FROM t").fetchall()
+        assert [r[0] for r in rows] == ["SEL", "SEL", None]
+    finally:
+        con.close()
+
+
+def test_two_value_two_digit_slot_not_misnamed_month_and_phones_not_decomposed() -> None:
+    """고유값 2개뿐인 2자리 코드('01'/'02')는 month로 오명명하지 않고 전화번호는 분해하지 않는다."""
+    acct_codes = [
+        "ACC-01-0001",
+        "ACC-02-0002",
+        "ACC-01-0003",
+        "ACC-02-0004",
+        "ACC-01-0005",
+        "ACC-02-0006",
+    ]
+    decomp = analyze_string_pattern(acct_codes)
+    assert decomp is not None
+    slot_names = [s.slot_name for s in decomp.segments if s.kind is StringSegmentKind.SLOT]
+    assert "month" not in slot_names
+
+    tbl = NamedTableInput(
+        name="contacts",
+        headers=("contact_id", "kr_phone", "us_phone"),
+        rows=(
+            ("1", "010-1234-5678", "(206) 555-9857"),
+            ("2", "010-2345-6789", "(206) 555-3412"),
+            ("3", "010-3456-7890", "(206) 555-8122"),
+            ("4", "010-4567-8901", "(206) 555-1189"),
+            ("5", "010-5678-9012", "(206) 555-9482"),
+        ),
+    )
+    with MultiTableContext(extra_tables=[tbl]) as mctx:
+        bundle = profile_all_tables(mctx)[0]
+        cls_by = {c.column: c for c in bundle.classifications}
+        assert cls_by["kr_phone"].string_pattern is None
+        assert cls_by["us_phone"].string_pattern is None

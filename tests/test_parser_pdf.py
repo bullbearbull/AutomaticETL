@@ -1119,3 +1119,112 @@ def test_cjk_two_column_prose_not_misclassified_as_borderless_table() -> None:
     )
     res = extract_page_tables(raw_page, detect_borderless=True)
     assert res.tables == []
+
+
+def test_pdf_colored_header_with_zebra_fill_does_not_drop_first_data_row() -> None:
+    """배경색 헤더 + 얼룩말(zebra) 음영 PDF 표에서 첫 데이터 행이 헤더로 흡수되지 않는다."""
+    from autoetl.parser.pdf.geometry import RawPageData, RawTextSpan, RawVectorLine, RawVectorRect
+    from autoetl.parser.pdf.tables import extract_page_tables
+
+    # 3열 x 4행 (행 0: 진한 네이비 헤더, 행 1: 연회색 zebra, 행 2: 흰색, 행 3: 연회색)
+    xs = [60.0, 200.0, 340.0, 480.0]
+    ys = [100.0, 124.0, 148.0, 172.0, 196.0]
+
+    lines: list[RawVectorLine] = []
+    for y in ys:
+        lines.append(RawVectorLine(x0=xs[0], top=y, x1=xs[-1], bottom=y, stroke_width=0.6))
+    for x in xs:
+        lines.append(RawVectorLine(x0=x, top=ys[0], x1=x, bottom=ys[-1], stroke_width=0.6))
+
+    rects = [
+        # 전체 표 배경(흰색) — 헤더 음영으로 오인 금지
+        RawVectorRect(
+            x0=xs[0],
+            top=ys[0],
+            x1=xs[-1],
+            bottom=ys[-1],
+            is_filled=True,
+            is_stroked=False,
+            stroke_width=0.0,
+            fill_color=(1.0, 1.0, 1.0),
+        ),
+        # 행 0: 네이비 헤더 음영
+        RawVectorRect(
+            x0=xs[0],
+            top=ys[0],
+            x1=xs[-1],
+            bottom=ys[1],
+            is_filled=True,
+            is_stroked=False,
+            stroke_width=0.0,
+            fill_color=(0.12, 0.25, 0.45),
+        ),
+        # 행 1: 연회색 zebra 데이터 행 음영 (헤더와 색상이 다름)
+        RawVectorRect(
+            x0=xs[0],
+            top=ys[1],
+            x1=xs[-1],
+            bottom=ys[2],
+            is_filled=True,
+            is_stroked=False,
+            stroke_width=0.0,
+            fill_color=(0.92, 0.94, 0.96),
+        ),
+        # 행 2: 흰색 데이터 행
+        RawVectorRect(
+            x0=xs[0],
+            top=ys[2],
+            x1=xs[-1],
+            bottom=ys[3],
+            is_filled=True,
+            is_stroked=False,
+            stroke_width=0.0,
+            fill_color=(1.0, 1.0, 1.0),
+        ),
+    ]
+
+    grid_text = [
+        ("지점명", "매출액(억원)", "달성률"),
+        ("강남본점", "125.4", "112%"),
+        ("부산센텀", "88.2", "98%"),
+        ("대구동성로", "64.0", "105%"),
+    ]
+    spans: list[RawTextSpan] = []
+    for r_idx, row in enumerate(grid_text):
+        top = ys[r_idx] + 6.0
+        for c_idx, cell in enumerate(row):
+            spans.append(
+                RawTextSpan(
+                    text=cell,
+                    x0=xs[c_idx] + 8.0,
+                    top=top,
+                    x1=xs[c_idx + 1] - 8.0,
+                    bottom=top + 11.0,
+                    font_name="MalgunGothic-Bold" if r_idx == 0 else "MalgunGothic",
+                    font_size=10.0,
+                    is_bold=(r_idx == 0),
+                    is_italic=False,
+                    orientation=0,
+                )
+            )
+
+    raw_page = RawPageData(
+        page=1,
+        width=595.0,
+        height=842.0,
+        rotation=0,
+        spans=spans,
+        lines=lines,
+        rects=rects,
+        curves=[],
+        images=[],
+    )
+    res = extract_page_tables(raw_page)
+    assert len(res.tables) == 1
+    tbl = res.tables[0]
+    assert tbl.headers == ["지점명", "매출액(억원)", "달성률"]
+    assert tbl.row_count == 4
+    assert len(tbl.rows) == 3
+    assert tbl.rows[0] == ["강남본점", "125.4", "112%"]
+    assert tbl.rows[1] == ["부산센텀", "88.2", "98%"]
+    assert tbl.rows[2] == ["대구동성로", "64.0", "105%"]

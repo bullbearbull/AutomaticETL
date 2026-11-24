@@ -267,3 +267,37 @@ def test_resilient_csv_fallback_and_international_postcode_header(tmp_path: Path
             "postalCode",
             "country",
         ]
+
+
+def test_header_only_empty_csv_raises_friendly_input_error(tmp_path: Path) -> None:
+    """헤더만 있고 데이터 행이 0건인 CSV는 명확한 한국어 InputError를 반환한다."""
+    empty_csv = tmp_path / "header_only.csv"
+    empty_csv.write_text("id,name,amount\n", encoding="utf-8")
+
+    with pytest.raises(InputError, match="데이터 행이 0건"):
+        MultiTableContext([empty_csv])
+
+
+def test_strict_boolean_pair_matching_and_dollar_decimal() -> None:
+    """BOOLEAN은 정규 쌍({Y,N}/{O,X} 등)만 허용하고 {Y,N,x}/{x,y}는 문자열로 유지한다."""
+    from autoetl.contracts import PhysicalType
+
+    tbl = NamedTableInput(
+        name="flags",
+        headers=("yn_flag", "ox_flag", "bad_3val", "xy_axis", "usd_amt"),
+        rows=(
+            ("Y", "O", "Y", "x", "$1,200.50"),
+            ("N", "X", "N", "y", "$3,450.00"),
+            ("Y", "O", "x", "x", "$980.25"),
+            ("N", "X", "Y", "y", "$12,500.00"),
+            ("Y", "O", "N", "x", "$420.00"),
+        ),
+    )
+    with MultiTableContext(extra_tables=[tbl]) as mctx:
+        bundle = profile_all_tables(mctx)[0]
+        type_by = {t.column: t.physical_type for t in bundle.types}
+        assert type_by["yn_flag"] is PhysicalType.BOOLEAN
+        assert type_by["ox_flag"] is PhysicalType.BOOLEAN
+        assert type_by["bad_3val"] is PhysicalType.STRING
+        assert type_by["xy_axis"] is PhysicalType.STRING
+        assert type_by["usd_amt"] is PhysicalType.DECIMAL

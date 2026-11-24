@@ -303,8 +303,24 @@ def classify_table_columns(
                     sem = SemanticType.ORDINAL_CATEGORY
                     reasons.append(f"서열 범주 순서 감지({len(ordinal_order)}단계)")
                 else:
-                    str_pattern = analyze_string_pattern(sample_strs)
-                    if str_pattern is not None:
+                    # 전화번호·휴대전화 형식은 업무상 분해 의미가 없으므로 규칙 문자열 분해에서 제외
+                    is_phone_col = bool(sample_strs) and (
+                        sum(
+                            re.fullmatch(
+                                r"^(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?)\d{3,4}[\s.-]\d{4}$",
+                                v.strip(),
+                            )
+                            is not None
+                            for v in sample_strs
+                        )
+                        / len(sample_strs)
+                        >= 0.85
+                    )
+                    str_pattern = None if is_phone_col else analyze_string_pattern(sample_strs)
+                    if is_phone_col:
+                        category = ColumnRoleCategory.CODE_IDENTIFIER
+                        reasons.append("전화번호 형식(도메인 단일 값으로 보존, 분해 생략)")
+                    elif str_pattern is not None:
                         category = ColumnRoleCategory.STRUCTURED_STRING
                         reasons.append(
                             f"내부 규칙 문자열({str_pattern.strategy}: `{str_pattern.template}`, "

@@ -402,3 +402,113 @@ def test_reranker_parent_tokenizer_resolution_and_query_guided_windows(tmp_path:
     )
     assert len(windows) == 3
     assert any("중국어선 불법조업" in w for w in windows)
+
+
+def _write_custom_docx(path: Path, heading: str, body: str) -> None:
+    doc_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body>"
+        '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>'
+        f"<w:r><w:t>{heading}</w:t></w:r></w:p>"
+        f"<w:p><w:r><w:t>{body}</w:t></w:r></w:p>"
+        "</w:body>"
+        "</w:document>"
+    )
+    styles_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style>'
+        "</w:styles>"
+    )
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("word/document.xml", doc_xml)
+        zf.writestr("word/styles.xml", styles_xml)
+
+
+def test_docindex_replace_replaces_same_source_path_atomically_and_preserves_on_parse_error(
+    tmp_path: Path,
+) -> None:
+    """리뷰3 #5: 동일 경로 --replace 재색인 시 구버전 제거 및 파싱 실패 시 기존 색인 보존."""
+    policy_path = tmp_path / "policy.docx"
+    db_path = tmp_path / "policy.sqlite"
+
+    # v1: 3일 전 제출
+    _write_custom_docx(
+        policy_path, "제3조 경비 정산 기한", "출장 경비 영수증은 귀국 후 3일 전 제출한다."
+    )
+    s1 = build_document_index(policy_path, db_path)
+    assert s1.documents_indexed == 1
+
+    # v2: 동일 파일 경로로 7일 전 제출로 개정 + replace=True
+    _write_custom_docx(
+        policy_path, "제3조 경비 정산 기한", "출장 경비 영수증은 귀국 후 7일 전 제출한다."
+    )
+    s2 = build_document_index(policy_path, db_path, replace=True)
+    assert s2.documents_indexed == 1
+
+    with DocumentIndex(db_path) as idx:
+        docs = idx.list_documents()
+        assert len(docs) == 1
+        pack = idx.search("경비 영수증 제출 기한")
+        assert len(pack.hits) == 1
+        assert "7일 전" in pack.hits[0].full_text
+        assert "3일 전" not in pack.hits[0].full_text
+
+    # v3: 파일이 손상되어 파싱 실패해도 기존 v2 색인은 유지되어야 함
+    policy_path.write_bytes(b"corrupted-not-a-zip")
+    s3 = build_document_index(policy_path, db_path, replace=True)
+    assert s3.documents_indexed == 0
+    assert len(s3.warnings) == 1
+
+    with DocumentIndex(db_path) as idx:
+        docs = idx.list_documents()
+        assert len(docs) == 1
+        pack = idx.search("경비 영수증 제출 기한")
+        assert len(pack.hits) == 1
+        assert "7일 전" in pack.hits[0].full_text
+
+
+def test_docindex_synonyms_tiny_corpus_score_and_zero_candidate_transparency(
+    tmp_path: Path,
+) -> None:
+    """리뷰2 P-08 + 리뷰3 #7: 소규모 코퍼스 점수 보정·BM25 4자리·동의어 확장·후보 0건 투명성."""
+    from autoetl.docindex import render_evidence_pack_markdown
+
+    doc1 = tmp_path / "hr_leave.docx"
+    doc2 = tmp_path / "hr_expense.docx"
+    _write_custom_docx(
+        doc1, "연차 신청 방법", "사내 포털에서 연차 신청서를 작성해 팀장 승인을 받는다."
+    )
+    _write_custom_docx(doc2, "법인카드 사용 규정", "법인카드 영수증은 월말까지 재무팀에 제출한다.")
+
+    db_path = tmp_path / "hr.sqlite"
+    build_document_index([doc1, doc2], db_path)
+
+    with DocumentIndex(db_path) as idx:
+        # 1. 문서 2건 소규모 코퍼스에서도 정확 일치 검색 시 final_score > 0 및 4자리 bm25 표기
+        exact = idx.search("연차 신청 방법")
+        assert len(exact.hits) >= 1
+        assert exact.hits[0].final_score > 0.0
+        md_exact = render_evidence_pack_markdown(exact)
+        assert "bm25=" in md_exact
+
+        # 2. 어휘가 겹치지 않는 질의('휴가 등록')는 후보 0건 모드('fts5_no_candidates') 보고
+        miss = idx.search("휴가 등록")
+        assert miss.total_candidates == 0
+        assert miss.mode == "fts5_no_candidates"
+        md_miss = render_evidence_pack_markdown(miss)
+        assert "리랭커는 실행되지 않았습니다" in md_miss
+
+        # 3. 동의어 사전(synonyms) 제공 시 '휴가 등록'으로도 '연차 신청 방법' 원문 섹션 탐색
+        hit = idx.search(
+            "휴가 등록",
+            synonyms={"휴가": ["연차"], "등록": ["신청"]},
+        )
+        assert len(hit.hits) >= 1
+        assert "연차 신청" in hit.hits[0].title
+        assert hit.hits[0].final_score > 0.0
+
+    # 4. CLI --synonyms 플래그도 동일하게 동작 검증
+    rc = main(["query", str(db_path), "휴가 등록", "--synonyms", "휴가=연차,등록=신청"])
+    assert rc == 0

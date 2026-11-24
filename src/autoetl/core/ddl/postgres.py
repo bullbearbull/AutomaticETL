@@ -84,6 +84,12 @@ _FK_SPEC = re.compile(r"^([a-z][a-z0-9_]*)\(([a-z][a-z0-9_]*)\)$")
 """계약의 FK 지정 '테이블(컬럼)' — 컬럼 하나(복합 FK는 같은 부모를 참조하는
 컬럼 여러 개가 묶여 만든다)."""
 
+_PARTITION_SPEC = re.compile(
+    r"^(RANGE|LIST|HASH)\s*\(\s*([a-z][a-z0-9_]*(?:\s*,\s*[a-z][a-z0-9_]*)*)\s*\)$",
+    re.IGNORECASE,
+)
+"""선언적 파티셔닝 지정 형식(예: 'RANGE (order_date)')."""
+
 
 def _quoted(name: str) -> exp.Identifier:
     """항상 인용된 식별자. 안의 큰따옴표는 sqlglot이 이중으로 이스케이프한다."""
@@ -136,6 +142,16 @@ def _parse_foreign_key(spec: str) -> tuple[str, str]:
     if matched is None:
         raise ValueError(f"FK 지정 형식이 아니다(테이블(컬럼) 필요): {spec!r}")
     return matched.group(1), matched.group(2)
+
+
+def _parse_partition_spec(spec: str) -> tuple[str, list[str]]:
+    """계약 파티셔닝 지정 'RANGE (col[, ...])'을 (전략, 컬럼 목록)으로 나눈다."""
+    matched = _PARTITION_SPEC.match(spec.strip())
+    if matched is None:
+        raise ValueError(f"파티셔닝 지정 형식이 아니다(예: RANGE (col)): {spec!r}")
+    strategy = matched.group(1).upper()
+    cols = [part.strip() for part in matched.group(2).split(",") if part.strip()]
+    return strategy, cols
 
 
 def _fk_references(
@@ -202,8 +218,8 @@ def _postgres_type(
     있어 VARCHAR(n)·INT 한도로 쓰면 적재가 깨진다(T-0025 '표본은 판정에만
     쓴다'와 같은 규칙).
 
-    - integer: 전수 관측 범위가 int4 안이면 INT, 벗어나거나 범위 미상이거나
-      관측이 표본이면 BIGINT(안전 쪽 — 데이터 손실 없음).
+    - integer: 서로게이트 IDENTITY이거나 전수 관측 범위가 int4 밖/미상/표본이면
+      BIGINT, int4 안이면 INT(안전 쪽 — 데이터 손실 없음).
     - decimal: precision+2·scale+1 여유의 NUMERIC(p, s). 상한 38에 걸리면
       scale 여유를 먼저 포기해 정수부 자릿수(p-s)와 scale이 원래 값보다
       줄지 않게 한다(줄면 관측값이 적재 때 넘친다). precision이 없으면 무제한
@@ -213,6 +229,8 @@ def _postgres_type(
     """
     kind = column.physical_type
     if kind is PhysicalType.INTEGER:
+        if column.is_identity:
+            return exp.DataType.build("BIGINT", dialect="postgres")
         if (
             full_scan
             and numeric_range is not None
@@ -275,6 +293,77 @@ def _topological_tables(tables: Sequence[TargetTable]) -> list[TargetTable]:
     return ordered
 
 
+def resolve_postgres_column_types(
+    candidate: SchemaCandidate,
+    *,
+    profiles: Sequence[ColumnProfile] = (),
+    stats: Sequence[ColumnStats] = (),
+    sampling: SamplingPlan | None = None,
+) -> dict[tuple[str, str], exp.DataType]:
+    """후보 스키마의 `(테이블, 컬럼) -> 최종 PostgreSQL DataType` 단일 진실 원천(SSOT).
+
+    ``generate_ddl``, ``load_plan.json``의 ``type_cast``, ``erd.mmd``가 모두 이 함수를
+    공유해 타입·정밀도·길이가 산출물 간에 100% 일치하도록 보장한다.
+    """
+    full_scan = sampling is not None and sampling.strategy == "full"
+    length_by_source = {profile.column: profile.length.maximum for profile in profiles}
+    range_by_source: dict[str, tuple[float, float]] = {}
+    for stat in stats:
+        if stat.numeric is not None:
+            range_by_source[stat.column] = (stat.numeric.minimum, stat.numeric.maximum)
+
+    tables = _topological_tables(candidate.tables)
+    raw_types: dict[tuple[str, str], exp.DataType] = {}
+    for table in tables:
+        for column in table.columns:
+            source = column.source_columns[0]
+            raw_types[(table.name, column.name)] = _postgres_type(
+                column,
+                length_by_source.get(source),
+                range_by_source.get(source),
+                full_scan=full_scan,
+            )
+
+    # 부모가 먼저 오는 위상 순서로 FK 자식 컬럼 타입을 부모 타입에 맞춘다.
+    resolved: dict[tuple[str, str], exp.DataType] = {}
+    for table in tables:
+        for column in table.columns:
+            kind = raw_types[(table.name, column.name)]
+            if column.foreign_key is not None:
+                parent_name, parent_column = _parse_foreign_key(column.foreign_key)
+                kind = resolved.get(
+                    (parent_name, parent_column),
+                    raw_types[(parent_name, parent_column)],
+                )
+            resolved[(table.name, column.name)] = kind
+    return resolved
+
+
+def build_column_comment_ddl(
+    comments: Sequence[tuple[str, str, str]],
+    *,
+    schema: str | None = None,
+) -> str:
+    """원본 컬럼명 보존용 PostgreSQL ``COMMENT ON COLUMN`` 문을 sqlglot AST로 생성한다.
+
+    ``comments``는 ``(table_name, target_column, comment_text)`` 튜플 목록이다.
+    """
+    stmts: list[str] = []
+    for table_name, column_name, comment_text in comments:
+        col_ref = exp.Column(
+            this=_quoted(column_name),
+            table=_quoted(table_name),
+            db=_quoted(schema) if schema is not None else None,
+        )
+        stmt = exp.Comment(
+            this=col_ref,
+            kind="COLUMN",
+            expression=exp.Literal.string(comment_text),
+        )
+        stmts.append(stmt.sql(dialect="postgres", identify=True))
+    return ";\n".join(stmts) + (";" if stmts else "")
+
+
 def generate_ddl(
     candidate: SchemaCandidate,
     *,
@@ -291,26 +380,14 @@ def generate_ddl(
     TargetColumn.source_columns의 첫 컬럼(단일 원본) 기준으로 찾는다. 같은
     후보·프로파일·통계면 같은 바이트를 낸다.
     """
-    full_scan = sampling is not None and sampling.strategy == "full"
-    length_by_source = {profile.column: profile.length.maximum for profile in profiles}
-    range_by_source: dict[str, tuple[float, float]] = {}
-    for stat in stats:
-        if stat.numeric is not None:
-            range_by_source[stat.column] = (stat.numeric.minimum, stat.numeric.maximum)
-
     tables = _topological_tables(candidate.tables)
     parents = {table.name: table for table in tables}
-    # 컬럼별 PostgreSQL 타입 — FK 자식 컬럼은 부모 컬럼과 같은 타입으로 낸다.
-    type_by_key: dict[tuple[str, str], exp.DataType] = {}
-    for table in tables:
-        for column in table.columns:
-            source = column.source_columns[0]
-            type_by_key[(table.name, column.name)] = _postgres_type(
-                column,
-                length_by_source.get(source),
-                range_by_source.get(source),
-                full_scan=full_scan,
-            )
+    type_by_key = resolve_postgres_column_types(
+        candidate,
+        profiles=profiles,
+        stats=stats,
+        sampling=sampling,
+    )
     # 식별자 안전 맵: 테이블(스키마 포함)·컬럼 전부에서 유일해야 한다.
     all_names: list[str] = [table.name for table in tables]
     for table in tables:
@@ -326,15 +403,17 @@ def generate_ddl(
     for table in tables:
         column_defs: list[exp.Expression] = []
         seen_columns: set[str] = set()
+        col_by_name = {column.name: column for column in table.columns}
         for column in table.columns:
             if column.name in seen_columns:
                 raise ValueError(f"테이블 {table.name}에 같은 이름의 컬럼이 있다: {column.name}")
             seen_columns.add(column.name)
             kind = type_by_key[(table.name, column.name)]
-            if column.foreign_key is not None:  # 부모와 같은 타입(관측이 섞이지 않게)
-                parent_name, parent_column = _parse_foreign_key(column.foreign_key)
-                kind = type_by_key[(parent_name, parent_column)]
-            constraints = []
+            constraints: list[exp.Expression] = []
+            if column.is_identity:
+                constraints.append(
+                    exp.ColumnConstraint(kind=exp.GeneratedAsIdentityColumnConstraint(this=True))
+                )
             if not column.nullable:
                 constraints.append(exp.NotNullColumnConstraint())
             column_defs.append(
@@ -362,10 +441,35 @@ def generate_ddl(
                     ),
                 )
             )
+        properties: exp.Properties | None = None
+        if table.partition is not None:
+            part_strategy, part_cols = _parse_partition_spec(table.partition)
+            for pcol in part_cols:
+                if pcol not in col_by_name:
+                    raise ValueError(f"파티션 키 컬럼이 테이블에 없다: {table.name}.{pcol}")
+                if pk_columns and pcol not in pk_columns:
+                    raise ValueError(
+                        f"PostgreSQL 파티션 키는 PRIMARY KEY에 포함되어야 한다: "
+                        f"{table.name}.{pcol} not in PK {pk_columns}"
+                    )
+            properties = exp.Properties(
+                expressions=[
+                    exp.PartitionedByProperty(
+                        this=exp.Anonymous(
+                            this=part_strategy,
+                            expressions=[_quoted_column(safe[pcol]) for pcol in part_cols],
+                        )
+                    )
+                ]
+            )
         target = exp.Table(this=_quoted(safe[table.name]))
         if schema is not None:
             target = exp.Table(this=target.this, db=_quoted(schema))
-        create = exp.Create(this=exp.Schema(this=target, expressions=column_defs), kind="TABLE")
+        create = exp.Create(
+            this=exp.Schema(this=target, expressions=column_defs),
+            kind="TABLE",
+            properties=properties,
+        )
         statements.append(create.sql(dialect="postgres", identify=True))
     return ";\n".join(statements) + (";" if statements else "")
 
@@ -379,7 +483,8 @@ def verify_ddl(
     """생성한 DDL을 sqlglot으로 다시 파싱해 후보와 대조한다(실패 닫힘).
 
     문장 수(테이블 수), 테이블·컬럼 이름(축소 맵 적용), PK 컬럼, FK(자식 →
-    참조, 스키마 한정 포함), 컬럼별 NOT NULL이 하나라도 어긋나면 ValueError.
+    참조, 스키마 한정 포함), 컬럼별 NOT NULL·IDENTITY, 파티셔닝 정의가 하나라도
+    어긋나면 ValueError.
     PK 컬럼은 PostgreSQL이 NOT NULL로 다루므로 명시 여부는 물지 않는다.
     통과하면 테이블별 요약을 돌려준다(S10 검증이 쓴다).
     """
@@ -416,6 +521,12 @@ def verify_ddl(
         if actual_columns != expected_columns:
             raise ValueError(f"컬럼 불일치({table.name}): {actual_columns} vs {expected_columns}")
         for column, column_def in zip(table.columns, column_defs, strict=True):
+            actual_identity = column_def.find(exp.GeneratedAsIdentityColumnConstraint) is not None
+            if actual_identity != column.is_identity:
+                raise ValueError(
+                    f"IDENTITY 불일치({table.name}.{column_def.name}): "
+                    f"{actual_identity} vs is_identity={column.is_identity}"
+                )
             if column.is_primary_key:
                 continue  # PK는 PostgreSQL이 NOT NULL로 다룬다(명시 여부 자유)
             actual_not_null = column_def.find(exp.NotNullColumnConstraint) is not None
@@ -455,12 +566,31 @@ def verify_ddl(
         ]
         if sorted(actual_fks) != sorted(expected_fks):
             raise ValueError(f"FK 불일치({table.name}): {actual_fks} vs {expected_fks}")
+
+        part_prop = create.find(exp.PartitionedByProperty)
+        if table.partition is None:
+            if part_prop is not None:
+                raise ValueError(f"예상치 못한 PARTITION BY 존재: {table.name}")
+        else:
+            exp_strategy, exp_cols = _parse_partition_spec(table.partition)
+            exp_safe_cols = [safe[c] for c in exp_cols]
+            if part_prop is None or not isinstance(part_prop.this, exp.Anonymous):
+                raise ValueError(f"PARTITION BY 누락({table.name}): {table.partition}")
+            act_strategy = part_prop.this.name.upper()
+            act_cols = [expr.name for expr in part_prop.this.expressions]
+            if act_strategy != exp_strategy or act_cols != exp_safe_cols:
+                raise ValueError(
+                    f"PARTITION BY 불일치({table.name}): "
+                    f"{act_strategy}({act_cols}) vs {exp_strategy}({exp_safe_cols})"
+                )
+
         summaries.append(
             {
                 "table": safe[table.name],
                 "columns": len(column_defs),
                 "primary_key": actual_pk,
                 "foreign_keys": len(actual_fks),
+                "partition": table.partition,
             }
         )
     return summaries

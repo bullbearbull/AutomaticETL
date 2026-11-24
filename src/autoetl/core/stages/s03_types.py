@@ -64,7 +64,7 @@ AMBIGUOUS_NOTE = (
     "상위 두 후보의 격차가 임계치 미달이라 LLM 확인 대상이다(--no-llm에서는 최상위 후보로 확정했다)"
 )
 
-CURRENCY_DECIMAL_SHAPE = "^[₩\\s]*[+-]?(\\d{1,3}(,\\d{3})+|\\d+)(\\.\\d+)?[원]?[\\s]*$"
+CURRENCY_DECIMAL_SHAPE = "^[₩$\\s]*[+-]?(\\d{1,3}(,\\d{3})+|\\d+)(\\.\\d+)?[원]?[\\s]*$"
 """탐지기(builtin._DECIMAL)와 같은 통화·콤마 허용 형태(위치 포함).
 
 정규화·전수 산정이 이 기준을 공유한다(재검토 3차). 기호를 위치와 상관없이
@@ -92,7 +92,7 @@ def _decimal_cast_expression(quoted: str, scale: int) -> str:
     초과값은 NULL(실패)로 둔다 — DECIMAL(38, s) 캐스팅은 s를 넘는 소수부를
     반올림하므로 형태 검사로 먼저 거른다.
     """
-    cleaned = f"regexp_replace({quoted}, '[₩원,\\s]', '', 'g')"
+    cleaned = f"regexp_replace({quoted}, '[₩$원,\\s]', '', 'g')"
     if scale <= 0:
         shape = "'^[+-]?\\d{1,38}$'"
     else:
@@ -132,8 +132,8 @@ def _normalize_expression(
         inner = f"TRY_CAST({quoted} AS DOUBLE)"
     elif rule is NormalizationRule.BOOLEAN:
         inner = (
-            f"CASE WHEN lower({quoted}) IN ('y', '예', 'o', 'true') THEN TRUE "
-            f"WHEN lower({quoted}) IN ('n', '아니오', 'x', 'false') THEN FALSE "
+            f"CASE WHEN lower(trim({quoted})) IN ('y', 'yes', '예', 'o', 'true') THEN TRUE "
+            f"WHEN lower(trim({quoted})) IN ('n', 'no', '아니오', 'x', 'false') THEN FALSE "
             "ELSE NULL END"
         )
     elif rule is NormalizationRule.DATE:
@@ -207,7 +207,7 @@ def _full_decimal_shape(ctx: AnalysisContext, predicate: str, column_id: str) ->
     값은 기호를 떼도 12·34 자릿수 산정에 넣지 않는다.
     """
     quoted = quote_identifier(column_id)
-    cleaned = f"regexp_replace({quoted}, '[₩원,\\s]', '', 'g')"
+    cleaned = f"regexp_replace({quoted}, '[₩$원,\\s]', '', 'g')"
     currency = f"regexp_matches({quoted}, '{CURRENCY_DECIMAL_SHAPE}')"
     decimal_shape = f"regexp_matches({cleaned}, '^[+-]?\\d+(\\.\\d+)?$')"
     significant = "ltrim(ltrim(split_part(c, '.', 1), '+-'), '0')"

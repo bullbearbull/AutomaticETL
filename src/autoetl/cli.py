@@ -96,6 +96,8 @@ def _run_analyze(args: argparse.Namespace) -> int:
         ddl_out = lp.ddl_sql.rstrip()
         if lp.index_ddl_sql.strip():
             ddl_out += "\n\n-- Recommended Indexes\n" + lp.index_ddl_sql.rstrip()
+        if lp.comment_ddl_sql.strip():
+            ddl_out += "\n\n-- Column Comments\n" + lp.comment_ddl_sql.rstrip()
         print(ddl_out)
     elif args.format == "erd":
         print(lp.erd_mermaid, end="")
@@ -424,6 +426,32 @@ def _run_index(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_synonyms_arg(raw: str | None) -> dict[str, list[str]] | None:
+    """`--synonyms` 인자('휴가=연차|유급휴가,등록=신청' 또는 JSON)를 동의어 사전으로 파싱한다."""
+    if not raw or not raw.strip():
+        return None
+    text = raw.strip()
+    if text.startswith("{"):
+        import json
+
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return {
+                str(k): ([str(v)] if isinstance(v, str) else [str(x) for x in v])
+                for k, v in data.items()
+            }
+    out: dict[str, list[str]] = {}
+    for entry in text.split(","):
+        if "=" not in entry:
+            continue
+        left, right = entry.split("=", 1)
+        key = left.strip()
+        vals = [v.strip() for v in right.split("|") if v.strip()]
+        if key and vals:
+            out.setdefault(key, []).extend(vals)
+    return out or None
+
+
 def _run_query(args: argparse.Namespace) -> int:
     from autoetl.docindex import (
         DocumentIndex,
@@ -441,6 +469,7 @@ def _run_query(args: argparse.Namespace) -> int:
         return 2
 
     try:
+        synonyms = _parse_synonyms_arg(getattr(args, "synonyms", None))
         reranker = create_reranker(
             args.reranker,
             model_path=args.reranker_model,
@@ -453,6 +482,7 @@ def _run_query(args: argparse.Namespace) -> int:
                 candidate_k=max(args.top_k, args.candidate_k),
                 doc_id=args.doc_id,
                 reranker=reranker,
+                synonyms=synonyms,
             )
     except ParserInputError as exc:
         print(f"문서 검색에 실패했다: {exc}", file=sys.stderr)
@@ -810,7 +840,7 @@ def main(argv: list[str] | None = None) -> int:
     index_cmd.add_argument(
         "--replace",
         action="store_true",
-        help="동일 SHA-256 문서가 이미 있어도 기존 색인을 덮어쓰기",
+        help="동일 경로(source_path) 또는 동일 SHA-256 문서가 이미 있으면 구버전을 원자적으로 교체",
     )
     index_cmd.add_argument(
         "--json",
@@ -844,6 +874,12 @@ def main(argv: list[str] | None = None) -> int:
         type=str,
         default=None,
         help="특정 문서로 검색 범위 제한",
+    )
+    query_cmd.add_argument(
+        "--synonyms",
+        type=str,
+        default=None,
+        help="도메인 동의어 확장(예: '휴가=연차|유급휴가,등록=신청' 또는 JSON 객체)",
     )
     query_cmd.add_argument(
         "--reranker",

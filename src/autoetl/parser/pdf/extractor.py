@@ -180,6 +180,7 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
     form_stack: list[_FormFrame] = []
     line_width_stack: list[float] = [1.0]
     char_spacing_stack: list[float] = [0.0]
+    fill_color_stack: list[tuple[float, float, float] | None] = [None]
 
     # 현재 visitor_text 플러시 사이클 동안 누적된 대간격 TJ/Tc/Td 점프 힌트
     pending_glyph_cuts: list[tuple[int, float]] = []  # (nonspace_idx, jump_em)
@@ -261,6 +262,7 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
                     )
                 )
 
+        fill_rgb = fill_color_stack[-1] if (filled and fill_color_stack) else None
         for rx0, ry0, rx1, ry1 in pending_rects:
             if rx1 - rx0 < 0.5 and ry1 - ry0 < 0.5:
                 continue
@@ -273,6 +275,7 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
                     is_stroked=stroked,
                     is_filled=filled,
                     stroke_width=stroke_w,
+                    fill_color=fill_rgb,
                 )
             )
 
@@ -350,12 +353,40 @@ def extract_page_primitives(page: pypdf.PageObject, page_number: int) -> RawPage
         if op == b"q":
             line_width_stack.append(line_width_stack[-1] if line_width_stack else 1.0)
             char_spacing_stack.append(char_spacing_stack[-1] if char_spacing_stack else 0.0)
+            fill_color_stack.append(fill_color_stack[-1] if fill_color_stack else None)
             return
         if op == b"Q":
             if len(line_width_stack) > 1:
                 line_width_stack.pop()
             if len(char_spacing_stack) > 1:
                 char_spacing_stack.pop()
+            if len(fill_color_stack) > 1:
+                fill_color_stack.pop()
+            return
+        if op == b"g" and args:
+            with contextlib.suppress(TypeError, ValueError):
+                gv = max(0.0, min(1.0, _float_operand(args[0])))
+                fill_color_stack[-1] = (gv, gv, gv)
+            return
+        if op == b"rg" and len(args) >= 3:
+            with contextlib.suppress(TypeError, ValueError):
+                fill_color_stack[-1] = (
+                    max(0.0, min(1.0, _float_operand(args[0]))),
+                    max(0.0, min(1.0, _float_operand(args[1]))),
+                    max(0.0, min(1.0, _float_operand(args[2]))),
+                )
+            return
+        if op == b"k" and len(args) >= 4:
+            with contextlib.suppress(TypeError, ValueError):
+                c_v = max(0.0, min(1.0, _float_operand(args[0])))
+                m_v = max(0.0, min(1.0, _float_operand(args[1])))
+                y_v = max(0.0, min(1.0, _float_operand(args[2])))
+                k_v = max(0.0, min(1.0, _float_operand(args[3])))
+                fill_color_stack[-1] = (
+                    (1.0 - c_v) * (1.0 - k_v),
+                    (1.0 - m_v) * (1.0 - k_v),
+                    (1.0 - y_v) * (1.0 - k_v),
+                )
             return
         if op == b"w" and args:
             with contextlib.suppress(TypeError, ValueError):

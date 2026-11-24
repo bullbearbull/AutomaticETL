@@ -394,6 +394,11 @@ class MultiTableContext:
                     AnalysisContext._validate_spec(spec, path)
                     if spec.converted:
                         self._temp_files.append(spec.load_path)
+                    if spec.row_count == 0:
+                        raise InputError(
+                            f"데이터 행이 0건인 빈 테이블 파일이다({path.name}). "
+                            "헤더 외에 최소 1행 이상의 데이터가 필요하다."
+                        )
                     kind = TableSourceKind.TSV if ext == ".tsv" else TableSourceKind.CSV
                     staged.append(
                         _StagedTable(

@@ -228,17 +228,58 @@ def _has_h_border(
     return covered >= span * 0.55
 
 
+def _is_near_white(rgb: tuple[float, float, float] | None) -> bool:
+    if rgb is None:
+        return False
+    return rgb[0] >= 0.96 and rgb[1] >= 0.96 and rgb[2] >= 0.96
+
+
+def _same_fill_color(
+    c0: tuple[float, float, float] | None,
+    c1: tuple[float, float, float] | None,
+) -> bool:
+    if c0 is None or c1 is None:
+        return True
+    return all(abs(a - b) <= 0.05 for a, b in zip(c0, c1, strict=True))
+
+
 def _infer_header_row_count(
     rows: list[list[str]],
     row_bold_ratios: list[float],
     row_shaded: list[bool],
+    row_fill_colors: list[tuple[float, float, float] | None] | None = None,
 ) -> int:
-    """표의 상단 헤더 행 수(0~2)를 굵기·음영·수치 패턴 변화로 추론한다."""
+    """표의 상단 헤더 행 수(0~2)를 굵기·음영·색상 일관성·수치 패턴 변화로 추론한다."""
     if len(rows) <= 1:
         return 0
+
+    first_non_empty = [c for c in rows[0] if c.strip()]
+    second_non_empty = [c for c in rows[1] if c.strip()]
+    first_num = sum(1 for c in first_non_empty if _NUMERIC_CELL_RE.match(c.strip()))
+    second_num = sum(1 for c in second_non_empty if _NUMERIC_CELL_RE.match(c.strip()))
+
     if row_shaded and row_shaded[0]:
         if len(rows) > 2 and row_shaded[1]:
-            return 2
+            # 2행 헤더 승격은 아래 4가지 안전 조건을 모두 통과할 때만 허용한다(첫 행 누락 차단):
+            # 1) 본문(3행 이후)에 교대 음영(zebra)/배경 채움이 없어야 함
+            # 2) 1행과 2행의 배경색이 서로 다른 색(예: 진한 헤더 vs 연한 데이터 줄)이 아니어야 함
+            # 3) 1행은 순수 텍스트인데 2행에 수치 데이터(매출·건수 등)가 나오면 2행은 데이터 행
+            # 4) 1행만 굵게(>=0.6) 강조되고 2행은 일반체(<0.5)이면 2행은 데이터 행
+            body_shaded = any(row_shaded[2:])
+            same_color = True
+            if row_fill_colors is not None and len(row_fill_colors) >= 2:
+                same_color = _same_fill_color(row_fill_colors[0], row_fill_colors[1])
+            second_looks_numeric = first_num == 0 and second_num >= 1
+            bold_drops_to_body = (
+                len(row_bold_ratios) >= 2 and row_bold_ratios[0] >= 0.6 and row_bold_ratios[1] < 0.5
+            )
+            if (
+                not body_shaded
+                and same_color
+                and not second_looks_numeric
+                and not bold_drops_to_body
+            ):
+                return 2
         return 1
     if (
         row_bold_ratios
@@ -248,13 +289,8 @@ def _infer_header_row_count(
         return 1
 
     # 첫 행은 비수치(레이블)이고 둘째 행부터 수치/코드가 나오면 1행 헤더
-    first_non_empty = [c for c in rows[0] if c.strip()]
-    second_non_empty = [c for c in rows[1] if c.strip()]
-    if first_non_empty and second_non_empty:
-        first_num = sum(1 for c in first_non_empty if _NUMERIC_CELL_RE.match(c.strip()))
-        second_num = sum(1 for c in second_non_empty if _NUMERIC_CELL_RE.match(c.strip()))
-        if first_num == 0 and second_num >= 1:
-            return 1
+    if first_non_empty and second_non_empty and first_num == 0 and second_num >= 1:
+        return 1
     return 1 if first_non_empty else 0
 
 
@@ -313,7 +349,11 @@ def _detect_ruled_grid_tables(
         components.append((ys[0], xs[0], hs, vs))
 
     components.sort(key=lambda c: (c[0], c[1]))
-    shaded_rects = [r for r in page.rects if r.is_filled and r.width >= 15.0 and r.height >= 8.0]
+    shaded_rects = [
+        r
+        for r in page.rects
+        if r.is_filled and r.width >= 15.0 and r.height >= 8.0 and not _is_near_white(r.fill_color)
+    ]
 
     for _, _, hs, vs in components:
         ys = _cluster_coords([s.y for s in hs], tol=3.0)
@@ -449,6 +489,7 @@ def _detect_ruled_grid_tables(
         expanded_cells: list[TableCell] = []
         expanded_bold: list[float] = []
         expanded_shaded: list[bool] = []
+        expanded_fill_colors: list[tuple[float, float, float] | None] = []
         split_subrows_used = False
 
         cells_by_row: dict[int, list[tuple[TableCell, list[RawTextSpan]]]] = {
@@ -457,15 +498,26 @@ def _detect_ruled_grid_tables(
         for cell, c_spans in raw_cells:
             cells_by_row[cell.row].append((cell, c_spans))
 
+        table_height = max(1.0, tbot - ttop)
         for r in range(n_rows):
             row_entries = cells_by_row[r]
-            is_shaded_r = any(
-                sr.top <= ys[r] + 4.0
-                and sr.bottom >= ys[r + 1] - 4.0
-                and sr.x0 <= tx0 + 10.0
-                and sr.x1 >= tx1 - 10.0
-                for sr in shaded_rects
+            row_h = max(1.0, ys[r + 1] - ys[r])
+            # 행 중심을 덮고 표 전체 배경(>=75% 높이)이 아닌 채움 사각형만 행 음영으로 인정
+            row_y_mid = (ys[r] + ys[r + 1]) / 2.0
+            matched_shade = next(
+                (
+                    sr
+                    for sr in shaded_rects
+                    if sr.height < table_height * 0.75
+                    and sr.top <= row_y_mid <= sr.bottom
+                    and (min(sr.bottom, ys[r + 1]) - max(sr.top, ys[r])) >= row_h * 0.55
+                    and sr.x0 <= tx0 + 10.0
+                    and sr.x1 >= tx1 - 10.0
+                ),
+                None,
             )
+            is_shaded_r = matched_shade is not None
+            fill_color_r = matched_shade.fill_color if matched_shade is not None else None
             bold_r = (row_bold_hits[r] / row_span_totals[r]) if row_span_totals[r] > 0 else 0.0
 
             can_split = (
@@ -521,6 +573,7 @@ def _detect_ruled_grid_tables(
                     expanded_grid.append(row_vals)
                     expanded_bold.append(bold_r)
                     expanded_shaded.append(is_shaded_r)
+                    expanded_fill_colors.append(fill_color_r)
             else:
                 out_r = len(expanded_grid)
                 row_vals = [""] * n_cols
@@ -530,13 +583,16 @@ def _detect_ruled_grid_tables(
                 expanded_grid.append(row_vals)
                 expanded_bold.append(bold_r)
                 expanded_shaded.append(is_shaded_r)
+                expanded_fill_colors.append(fill_color_r)
 
         non_empty_cells = sum(1 for cell in expanded_cells if cell.text.strip())
         if non_empty_cells < 2:
             continue
 
         out_n_rows = len(expanded_grid)
-        header_rows = _infer_header_row_count(expanded_grid, expanded_bold, expanded_shaded)
+        header_rows = _infer_header_row_count(
+            expanded_grid, expanded_bold, expanded_shaded, expanded_fill_colors
+        )
         final_cells = [
             cell.model_copy(update={"is_header": cell.row < header_rows}) for cell in expanded_cells
         ]

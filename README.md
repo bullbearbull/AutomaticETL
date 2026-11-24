@@ -26,8 +26,8 @@ PDF, Office 문서, 한글(HWP/HWPX) 파일에서 코드로 읽을 수 있는 �
 
 | 적용 구간 | 역할 | 지원하는 모델 / 백엔드 | CLI 플래그 |
 | --- | --- | --- | --- |
-| **정형 ETL 결정론 엔진** *(0MB AI)* | 여러 CSV·TSV·XLSX의 결측치·칼럼 유형(범주·이산·연속·규칙 문자열 분해·날짜·인덱스)·내부/교차 FK·최적 PK·PostgreSQL DDL·위상 적재 계획 생성 | **AI 모델 불필요** (격리 DuckDB + `sqlglot` 검증 + 결정론 통계·정규식 엔진) | `autoetl analyze <dir\|files...> --out ./etl_plan` |
-| **원문 문서 인덱스 + 선택 리랭커** *(0MB 기본)* | VectorDB 없이 SQLite FTS5(한글 2-gram) + 목차 + DuckDB 표 SQL로 원문 섹션 전체 검색. 필요 시 CPU Cross-Encoder로 Top-20만 정밀 재정렬(환각 0%) | **기본 0MB**: SQLite FTS5 BM25 + 목차 + DuckDB SQL<br>**선택 CPU ONNX 리랭커**: `bge-reranker-v2-m3(-ko)` (INT8 ~280MB), `bge-reranker-base` (~110MB), `ms-marco-MiniLM-L-6-v2` (~25MB) | `autoetl index <dir> --out ./doc.sqlite`<br>`autoetl query ./doc.sqlite "질문" [--reranker onnx --reranker-model ...]` |
+| **정형 ETL 결정론 엔진** *(0MB AI)* | 여러 CSV·TSV·XLSX의 결측치·10종 칼럼 유형·규칙 문자열 분해·내부/교차 FK·최적 PK·PII 민감 컬럼 탐지·DuckDB 실제 시험 적재 검증·PostgreSQL DDL(`IDENTITY`·`PARTITION BY`·`COMMENT ON COLUMN`)·위상 적재 계획 생성 | **AI 모델 불필요** (격리 DuckDB 시험 적재 + `sqlglot` 검증 + 결정론 통계·정규식·PII 엔진) | `autoetl analyze <dir\|files...> --out ./etl_plan` |
+| **원문 문서 인덱스 + 선택 리랭커** *(0MB 기본)* | VectorDB 없이 SQLite FTS5(한글 2-gram·동의어 확장) + 목차 + DuckDB 표 SQL로 원문 섹션 전체 검색. 필요 시 CPU Cross-Encoder로 Top-20만 정밀 재정렬(생성 모델 없이 원문 그대로 반환) | **기본 0MB**: SQLite FTS5 BM25 + 목차 + DuckDB SQL<br>**선택 CPU ONNX 리랭커**: `jina-reranker-v2-base-multilingual` (INT8 ~280MB), `bge-reranker-v2-m3(-ko)` (INT8 ~280MB), `bge-reranker-base` (~110MB) | `autoetl index <dir> --out ./doc.sqlite [--replace]`<br>`autoetl query ./doc.sqlite "질문" [--synonyms ...] [--reranker onnx ...]` |
 | **AI ① 레이아웃 객체 탐지** | 스캔 PDF·이미지 슬라이드를 표·차트·수식·본문 영역으로 자동 분할 크롭 | **ONNX**(`onnxruntime`): `PP-DocLayoutV2`, `PP-DocLayoutV3`, `PP-DocLayout_plus-L`, `DocLayNet`, `PubLayNet`<br>**HTTP**: 로컬/사내 레이아웃 탐지 서버<br>*(모델 없이도 내장 `heuristic` 픽셀 탐지기로 동작)* | `--layout-detector onnx\|http\|heuristic`<br>`--layout-label-preset` |
 | **AI ② OCR · VLM 시각 해석** | 크롭된 스캔 영역·차트·도식·수식을 Markdown과 표로 변환 | **경량 문서 특화 OCR-VLM** *(모델명 자동 감지·전용 프롬프트 내장)*: `PaddleOCR-VL` (0.9B), `GLM-OCR` (0.9B), `DeepSeek-OCR` (3B)<br>**범용 VLM**: Ollama / vLLM / llama-server / LM Studio의 `Qwen2.5-VL` 등 모든 Vision 모델, 외부 OpenAI 호환 API (`gpt-4o` 등)<br>**하이브리드**: 단순 텍스트는 로컬 `Tesseract` OCR, 차트·도식만 VLM으로 자동 분배 | `--vision ollama\|openai-compat\|hybrid\|tesseract`<br>`--vision-model`<br>`--vision-prompt-preset auto` |
 
@@ -156,7 +156,7 @@ autoetl ui
 autoetl index ./docs --out ./doc_index.sqlite
 autoetl query ./doc_index.sqlite "개인정보 암호화 보관 기간"
 
-# 선택 초경량 CPU ONNX Cross-Encoder 리랭커(280MB INT8, 환각 0%, HF onnx/ 폴더 자동 인식)
+# 선택 초경량 CPU ONNX Cross-Encoder 리랭커(280MB INT8, 생성 모델 없이 원문 그대로 반환)
 autoetl query ./doc_index.sqlite "개인정보 암호화 보관 기간" \
   --reranker onnx --reranker-model ./models/jina_v2_int8/onnx/model_int8.onnx --format json
 ```
@@ -211,18 +211,6 @@ autoetl doctor
 
 주석·숨은설명이 필요하면 `--include-comments`를 붙이면 됩니다.  
 암호화되거나 DRM·배포용 제한이 걸린 문서는 우회하지 않고 오류 메시지로 알려주며, 로그와 오류 메시지에는 문서 본문이나 셀 값을 남기지 않습니다.
-
----
-
-## 정형 CSV 분석 (작업 중)
-
-CSV 프로파일링과 스키마 설계 엔진은 아직 v0 단계입니다. 지금은 `--no-llm` 경로만 열려 있습니다.
-
-```bash
-autoetl analyze sample.csv --no-llm --out report.json
-```
-
-통계, 타입 추론, 관계 분석, PostgreSQL DDL 생성은 코드가 결정론적으로 계산하고, LLM은 정해진 판단 지점에서만 돕는 구조로 확장하고 있습니다.
 
 ---
 

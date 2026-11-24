@@ -63,6 +63,21 @@ def _is_valid_yyyymm(val: str) -> bool:
     return _DATE8_MIN_YEAR <= y <= _DATE8_MAX_YEAR and 1 <= m <= 12
 
 
+def _is_temporal_constant_token(val: str) -> bool:
+    """표본에서 우연히 단일 값으로 고정된 연도(YYYY)·연월(YYYYMM)·일자(YYYYMMDD) 토큰 여부.
+
+    예: 2026년 주문만 들어 있는 표본에서 `ORD-2026-SEL-00001`의 `2026`을 리터럴로 고정하면
+    다음 해(`ORD-2027-SEL-00001`)에 지점 추출이 빈 문자열로 깨진다.
+    """
+    if not _ASCII_DIGITS_RE.fullmatch(val):
+        return False
+    if len(val) == 4 and _DATE8_MIN_YEAR <= int(val) <= _DATE8_MAX_YEAR:
+        return True
+    if len(val) == 6 and _is_valid_yyyymm(val):
+        return True
+    return len(val) == 8 and _is_valid_yyyymmdd(val)
+
+
 def _classify_slot_values(
     values: Sequence[str],
     slot_idx: int,
@@ -116,8 +131,14 @@ def _classify_slot_values(
                 False,
                 r"[0-9]{4}",
             )
-        # 2자리 월(01~12)
-        if min_l == 2 and max_l == 2 and all(1 <= int(v) <= 12 for v in non_empty) and zero_padded:
+        # 2자리 월(01~12): 고유값 2종 구분코드(01/02 등) 오인 방지를 위해 3종 이상 요구
+        if (
+            min_l == 2
+            and max_l == 2
+            and n_uniq >= 3
+            and all(1 <= int(v) <= 12 for v in non_empty)
+            and zero_padded
+        ):
             return (
                 "month",
                 ColumnRoleCategory.DISCRETE_NUMERIC,
@@ -233,7 +254,7 @@ def _build_decomposition_from_token_rows(
         top_val, top_cnt = freq.most_common(1)[0]
         dominance = top_cnt / len(col_vals)
 
-        if dominance >= LITERAL_DOMINANCE_THRESHOLD:
+        if dominance >= LITERAL_DOMINANCE_THRESHOLD and not _is_temporal_constant_token(top_val):
             literal_count += 1
             if not _DELIM_SPLIT_RE.fullmatch(top_val):
                 non_delim_literal_count += 1
@@ -339,7 +360,7 @@ def _build_decomposition_from_token_rows(
     final_segments: list[StringSegment] = []
     for seg in segments:
         if seg.kind is StringSegmentKind.SLOT and seg.capture_group is not None:
-            hint = f"regexp_extract(col, '{escaped_sql_rx}', {seg.capture_group})"
+            hint = f"NULLIF(regexp_extract(col, '{escaped_sql_rx}', {seg.capture_group}), '')"
             final_segments.append(seg.model_copy(update={"extract_sql_hint": hint}))
         else:
             final_segments.append(seg)

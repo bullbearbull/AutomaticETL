@@ -4,6 +4,34 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **정형 ETL 실제 시험 적재 검증 및 정직한 무결성 채점 (`load_planner.py`, `multi_analyze.py`, `contracts/schema.py`)**:
+  - `ValidationSummary`가 더 이상 DDL 파싱 성공만으로 `trial_load_ok=true`/`constraint_violation_count=0`을 하드코딩하지 않고, 격리 DuckDB에서 실제 변환·캐스팅·`VARCHAR` 길이·`INT4` 범위·PK 유일성·물리 FK anti-join 시험 적재를 수행해 `trial_load_executed`, `cast_failure_count`, `pk_violation_count`, `fk_violation_count`, `data_loss_rate`를 정직하게 산출
+  - 물리 FK 고아 행(`orphan_rows > 0`)이 존재하면 `trial_load_ok=false`, 무결성 점수 감점, 고아 행 정제·격리 경고 자동 출력
+- **PostgreSQL DDL · 적재 플랜 · ERD 정합성 및 실행 가능성 보완 (`core/ddl/postgres.py`, `load_planner.py`)**:
+  - `DECIMAL` 물리 타입(`balance` 등 천단위 쉼표 포함 숫자)이 의미 타입과 무관하게 `strip_currency_and_comma` 변환식을 생성하도록 수정(`$` 통화 기호 포함)
+  - 서로게이트 PK에 `BIGINT GENERATED ALWAYS AS IDENTITY NOT NULL`을 생성·검증해 실제 PostgreSQL `INSERT` 시 `23502` NOT NULL 오류 방지
+  - 표본에서 우연히 유일한 컬럼(`postal_code` 등)을 `CREATE UNIQUE INDEX`로 자동 승격하지 않고 리포트·노트의 '표본 관측 유일 후보' 권고로 전환해 운영 적재 시 `23505` 충돌 방지
+  - `resolve_postgres_column_types` 단일 진실 원천(SSOT)을 도입해 `ddl.sql`, `load_plan.json`의 `type_cast`, `erd.mmd`의 타입·정밀도·길이가 100% 일치하도록 통일
+  - `C3_ANALYTICS` 선언적 파티셔닝을 실제 실행 가능한 `PARTITION BY RANGE (...)` DDL(파티션 키를 복합 PK에 포함, 하위 단일 FK 참조 부모 테이블은 보류)로 정합화
+  - 해시 치환된 한글·비ASCII 컬럼에 `COMMENT ON COLUMN` DDL을 자동 생성하고 `TableLoadStrategy.source_encoding`에 감지 인코딩(CP949/UTF-8 등) 기록
+- **엄격한 타입 판별·패턴 분해·예외 처리 개선 (`builtin.py`, `s03_types.py`, `string_pattern.py`, `column_classifier.py`, `multi_context.py`)**:
+  - `BOOLEAN` 탐지를 정규 쌍(`{Y,N}`, `{Yes,No}`, `{예,아니오}`, `{O,X}`, `{True,False}`) 매칭으로 엄격화해 `{Y,N,x}`/`{x,y}` 오분류 차단
+  - 단일 연도 표본(예: `2026`만 존재)에서도 연도·년월·년월일 토큰을 고정 리터럴로 묶지 않고 가변 슬롯 `{year}`(`([0-9]{4})`)로 유지하며, 추출식을 `NULLIF(regexp_extract(...), '')`로 감싸 미매칭 시 빈 문자열 대신 `NULL` 반환
+  - 2자리 소수 고유값(`01`/`02`)의 `month` 오명명 방지, 전화번호 컬럼 과도 분해 차단, 1:1 단일 슬롯 중복 컬럼(`customer_id_code_0`) 및 OLTP 이행적 슬롯 FK 생략
+  - 헤더만 존재하는 빈 CSV 입력 시 내부 오류 대신 명확한 한국어 안내 `InputError` 반환
+- **PDF 배경색 헤더 표 첫 데이터 행 누락 수정 (`parser/pdf/geometry.py`, `extractor.py`, `tables.py`)**:
+  - PDF 비선 색상 연산자(`g`/`rg`/`k`)를 추적해 흰색·연회색 바탕 및 표 전체 배경 사각형을 제외하고, 헤더 음영·색상·굵기·수치 신호를 종합 판정해 1행 헤더 표의 첫 데이터 행이 헤더로 흡수되는 현상 수정
+- **원문 문서 인덱스 `--replace` 경로 교체 및 검색 투명성 보완 (`docindex/store.py`, `cli.py`)**:
+  - `autoetl index --replace`가 `sha256`뿐 아니라 동일 `source_path` 구버전 문서도 단일 SQLite 트랜잭션 안에서 원자적으로 삭제·교체하도록 수정(파싱 실패 시 기존 버전 유지)
+  - 소규모 코퍼스(문서 1~2건) 음수 IDF에 대한 어휘 커버리지 보정 및 BM25 소수점 4자리 출력, 도메인 동의어 확장(`synonyms`/`--synonyms`), 후보 0건 시 `fts5_no_candidates` 모드 및 안내 메시지 추가
+
+### Added
+
+- **S7 결정론적 PII·민감 컬럼 탐지 엔진 구현 (`core/stages/s07_sensitivity.py`)**:
+  - 주민등록번호·외국인등록번호·사업자등록번호·카드번호(Luhn)·계좌번호·전화번호·이메일·성명·생년월일·주소·IP를 원본 값 노출 없이 결정론 탐지해 `analyze` 리포트·`TableLoadStrategy.sensitive_columns`·`security_isolation` 점수에 연동
+
 ## [0.2.0-beta.2] — 2026-11-24 (`0.2.0b2`)
 
 로컬 웹 UI 3번째 탭(원문 문서 인덱스·검색·목차 뷰어·DuckDB 표 SQL)과 실측 기반 CPU ONNX 리랭커 최적화를 포함한 베타 릴리스.

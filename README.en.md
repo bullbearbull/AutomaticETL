@@ -26,8 +26,8 @@ Instead of sending every page to an expensive VLM, AutoETL runs a format-native 
 
 | Stage | What it does | Supported models & backends | CLI flags |
 | --- | --- | --- | --- |
-| **Deterministic Structured ETL** *(0MB AI)* | Multi-file CSV/TSV/XLSX profiling, 10-role column typing, string pattern decomposition, internal/cross-table FKs, PK selection, verified PostgreSQL DDL & topological Load Plan | **No AI model required** (sandboxed DuckDB + `sqlglot` DDL verification + deterministic stats/regex engine) | `autoetl analyze <dir\|files...> --out ./etl_plan` |
-| **Original-Text Doc Index + Optional Reranker** *(0MB default)* | VectorDB-free SQLite FTS5 + outline tree + DuckDB table SQL returning full original sections, with optional CPU Cross-Encoder Top-20 reranking (0% hallucination) | **Default 0MB**: SQLite FTS5 BM25 + Outline + DuckDB SQL<br>**Optional CPU ONNX Reranker**: `bge-reranker-v2-m3(-ko)` (INT8 ~280MB), `bge-reranker-base` (~110MB), `ms-marco-MiniLM-L-6-v2` (~25MB) | `autoetl index <dir> --out ./doc.sqlite`<br>`autoetl query ./doc.sqlite "question" [--reranker onnx --reranker-model ...]` |
+| **Deterministic Structured ETL** *(0MB AI)* | Multi-file CSV/TSV/XLSX profiling, 10-role column typing, string pattern decomposition, internal/cross-table FKs, PK selection, PII sensitivity detection, DuckDB trial-load verification, verified PostgreSQL DDL (`IDENTITY`, `PARTITION BY`, `COMMENT ON COLUMN`) & topological Load Plan | **No AI model required** (sandboxed DuckDB trial load + `sqlglot` DDL verification + deterministic stats/regex/PII engine) | `autoetl analyze <dir\|files...> --out ./etl_plan` |
+| **Original-Text Doc Index + Optional Reranker** *(0MB default)* | VectorDB-free SQLite FTS5 (Korean 2-gram + optional synonyms) + outline tree + DuckDB table SQL returning full original sections without generative synthesis, with optional CPU Cross-Encoder Top-20 reranking | **Default 0MB**: SQLite FTS5 BM25 + Outline + DuckDB SQL<br>**Optional CPU ONNX Reranker**: `jina-reranker-v2-base-multilingual` (INT8 ~280MB), `bge-reranker-v2-m3(-ko)` (INT8 ~280MB), `bge-reranker-base` (~110MB) | `autoetl index <dir> --out ./doc.sqlite [--replace]`<br>`autoetl query ./doc.sqlite "question" [--synonyms ...] [--reranker onnx ...]` |
 | **AI 1 — Layout Object Detection** | Splits scanned PDFs or image slides into typed regions (tables, charts, formulas, text) before OCR/VLM | **ONNX** (`onnxruntime`): `PP-DocLayoutV2`, `PP-DocLayoutV3`, `PP-DocLayout_plus-L`, `DocLayNet`, `PubLayNet`<br>**HTTP**: local/internal layout detection service<br>*(Built-in `heuristic` pixel detector works with zero model files)* | `--layout-detector onnx\|http\|heuristic`<br>`--layout-label-preset` |
 | **AI 2 — OCR & VLM Understanding** | Converts cropped scans, charts, diagrams, and equations into Markdown and tables | **Specialized OCR-VLMs** *(auto-detected from model name with built-in task prompts)*: `PaddleOCR-VL` (0.9B), `GLM-OCR` (0.9B), `DeepSeek-OCR` (3B)<br>**General VLMs**: any Vision model on Ollama / vLLM / llama-server / LM Studio (e.g. `Qwen2.5-VL`), or external OpenAI-compatible APIs (`gpt-4o`)<br>**Hybrid**: routes plain text scans to local `Tesseract` and only charts/figures to VLM | `--vision ollama\|openai-compat\|hybrid\|tesseract`<br>`--vision-model`<br>`--vision-prompt-preset auto` |
 
@@ -155,7 +155,7 @@ Index parsed bundles (`parsed.json`) or raw documents into a single SQLite file 
 autoetl index ./docs --out ./doc_index.sqlite
 autoetl query ./doc_index.sqlite "encryption retention policy"
 
-# Optional ultra-lightweight CPU ONNX Cross-Encoder reranker (~280MB INT8, 0% hallucination)
+# Optional ultra-lightweight CPU ONNX Cross-Encoder reranker (~280MB INT8, returns full original text)
 autoetl query ./doc_index.sqlite "encryption retention policy" \
   --reranker onnx --reranker-model ./models/jina_v2_int8/onnx/model_int8.onnx --format json
 ```
@@ -208,18 +208,6 @@ Aside from `pypdf` for PDFs, all parsers are pure Python using only the standard
 | `.doc`, `.ppt` | Pure-Python OLE2 parser (+ LibreOffice upgrade) | Uses `soffice` automatically when installed; falls back to built-in parser otherwise |
 
 Pass `--include-comments` to include review comments / hidden notes. Encrypted or DRM-protected files are rejected with a clear error rather than bypassed, and logs/errors never include raw document text or cell values.
-
----
-
-## Structured CSV Analysis (WIP)
-
-The CSV profiling and schema-design pipeline is still at v0 (`--no-llm` only):
-
-```bash
-autoetl analyze sample.csv --no-llm --out report.json
-```
-
-Statistics, type inference, relation discovery, and PostgreSQL DDL generation are computed deterministically in code, with LLM assistance planned only at fixed decision points.
 
 ---
 

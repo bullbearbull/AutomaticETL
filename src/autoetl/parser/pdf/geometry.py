@@ -80,6 +80,7 @@ class RawVectorRect:
     is_stroked: bool = True
     is_filled: bool = False
     stroke_width: float = 1.0
+    fill_color: tuple[float, float, float] | None = None
 
     @property
     def width(self) -> float:

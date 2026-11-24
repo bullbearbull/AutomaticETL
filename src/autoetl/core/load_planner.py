@@ -1,16 +1,19 @@
-"""Milestone E4: 다중 테이블 최적 DB 스키마 후보 생성·채점·위상 적재 플랜·DDL/ERD/리포트 생성기.
+"""Milestone E4: 다중 테이블 스키마 후보 생성·채점·시험 적재·위상 플랜·DDL/ERD/리포트 생성기.
 
-전 과정이 100% 결정론적(0MB AI/LLM)이며, PostgreSQL DDL은 기존 ``autoetl.core.ddl.postgres``의
-``generate_ddl`` + ``verify_ddl``(sqlglot AST 재파싱 검증)을 통과한 결과만 내보낸다.
+전 과정이 100% 결정론적(0MB AI/LLM)이며, PostgreSQL DDL은 ``autoetl.core.ddl.postgres``의
+``resolve_postgres_column_types`` + ``generate_ddl`` + ``verify_ddl``(sqlglot AST 재파싱 검증)을
+통과하고, ``MultiTableContext``가 제공될 때 DuckDB 실제 시험 적재(변환·캐스팅·PK·FK 검증)를
+거친 정직한 결과만 내보낸다.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from sqlglot import exp
 
@@ -42,6 +45,8 @@ from autoetl.contracts import (
     SchemaPattern,
     Scorecard,
     SemanticType,
+    SensitivityLevel,
+    SensitivityMap,
     StatsKind,
     StringSegment,
     StringSegmentKind,
@@ -49,12 +54,29 @@ from autoetl.contracts import (
     TableProfileBundle,
     TargetColumn,
     TargetTable,
+    TypeAssignment,
     ValidationSummary,
 )
-from autoetl.core.ddl.postgres import generate_ddl, verify_ddl
+from autoetl.core.context import RAW_TABLE, quote_identifier
+from autoetl.core.ddl.postgres import (
+    INT4_MAX,
+    INT4_MIN,
+    build_column_comment_ddl,
+    generate_ddl,
+    resolve_postgres_column_types,
+    verify_ddl,
+)
+from autoetl.core.stages.s02_profile import DEFAULT_MISSING_MARKERS
+from autoetl.core.stages.s03_types import CURRENCY_DECIMAL_SHAPE
+from autoetl.core.stages.s07_sensitivity import detect_table_sensitivity, masking_recommendation
+
+if TYPE_CHECKING:
+    from autoetl.core.multi_context import MultiTableContext
 
 _CAMEL_RE = re.compile(r"([a-z0-9])([A-Z])")
 _NON_IDENT_RE = re.compile(r"[^a-z0-9]+")
+_VARCHAR_LEN_RE = re.compile(r"^VARCHAR\((\d+)\)$", re.IGNORECASE)
+_NUMERIC_PS_RE = re.compile(r"^NUMERIC\((\d+),\s*(\d+)\)$", re.IGNORECASE)
 
 _PURPOSE_WEIGHTS: dict[Purpose, dict[str, float]] = {
     Purpose.OLTP: {
@@ -88,6 +110,13 @@ _SLOT_ROLE_KEEP = {
     ColumnRoleCategory.CODE_IDENTIFIER,
     ColumnRoleCategory.CATEGORICAL_NOMINAL,
     ColumnRoleCategory.CATEGORICAL_ORDINAL,
+}
+
+_LEVEL_RANK = {
+    SensitivityLevel.L0: 0,
+    SensitivityLevel.L1: 1,
+    SensitivityLevel.L2: 2,
+    SensitivityLevel.L3: 3,
 }
 
 
@@ -185,17 +214,40 @@ def _select_acyclic_fks(
     return accepted, warnings
 
 
+def _has_indirect_path(
+    direct_adj: Mapping[str, set[str]],
+    src: str,
+    dst: str,
+) -> bool:
+    """직접 FK 그래프에서 `src -> ... -> dst` 경로가 존재하는지 확인한다."""
+    stack = list(direct_adj.get(src, ()))
+    visited: set[str] = set()
+    while stack:
+        cur = stack.pop()
+        if cur == dst:
+            return True
+        if cur in visited:
+            continue
+        visited.add(cur)
+        stack.extend(direct_adj.get(cur, ()))
+    return False
+
+
 @dataclass(frozen=True)
 class _BuiltCandidate:
     candidate: SchemaCandidate
     # (target_table, target_col) -> transform metadata
     transforms: dict[tuple[str, str], str]
+    # (target_table, target_col) -> (source_column, regex_pattern, capture_group)
+    slot_extract_specs: dict[tuple[str, str], tuple[str, str, int]]
     # target_table -> source_table
     source_table_map: dict[str, str]
     # target_table -> surrogate key used?
     surrogate_tables: set[str]
     # dropped derived columns per table (for reporting)
     omitted_derivations: dict[str, list[str]]
+    # analytics partition deferred notes per table
+    partition_notes: dict[str, list[str]]
     # decomposed string slot columns count
     materialized_slot_count: int
 
@@ -208,12 +260,24 @@ def _materializable_slots(
     """규칙 문자열에서 대상 테이블 컬럼으로 구체화할 가치가 있는 가변 슬롯을 고른다."""
     if cls.string_pattern is None:
         return []
+    variable_slots = [
+        seg
+        for seg in cls.string_pattern.segments
+        if seg.kind is StringSegmentKind.SLOT and seg.slot_name is not None
+    ]
     out: list[StringSegment] = []
-    for seg in cls.string_pattern.segments:
-        if seg.kind is not StringSegmentKind.SLOT or seg.slot_name is None:
-            continue
+    for seg in variable_slots:
+        assert seg.slot_name is not None
         if seg.slot_name in slot_fk_names:
             out.append(seg)
+            continue
+        # 단일 가변 슬롯이 사실상 원본 식별자와 1:1 대응(예: 'C000161'의 '000161')이면
+        # 중복 컬럼을 늘릴 실익이 없으므로 구체화하지 않는다.
+        if (
+            len(variable_slots) == 1
+            and row_count > 0
+            and seg.unique_count >= max(1, int(row_count * 0.95))
+        ):
             continue
         if (
             seg.slot_category in _SLOT_ROLE_KEEP
@@ -237,7 +301,6 @@ def _build_candidate(
     analytics_mode: bool,
 ) -> _BuiltCandidate:
     """단일 후보 SchemaCandidate와 변환/원본 매핑 메타데이터를 결정론적으로 조립한다."""
-    by_table = {b.source.table_name: b for b in bundles}
     pk_map = relations.primary_keys
 
     # 테이블별 원본 컬럼명 -> SQL 식별자 맵을 먼저 확정(FK가 부모 SQL 컬럼명을 참조해야 함)
@@ -265,20 +328,35 @@ def _build_candidate(
         for col_name, phys in type_by_col.items():
             parent_pk_phys[(t_name, col_name)] = phys
 
-    # FK 빠른 조회 맵
+    # 직접 FK 그래프와 슬롯 FK 필터링
     direct_fk_by_col: dict[tuple[str, str], CrossTableForeignKey] = {}
-    slot_fk_by_key: dict[tuple[str, str, str], CrossTableForeignKey] = {}
+    direct_adj: dict[str, set[str]] = {}
     for fk in acyclic_fks:
         if fk.child_slot_name is None:
             direct_fk_by_col[(fk.child_table, fk.child_columns[0])] = fk
-        else:
-            slot_fk_by_key[(fk.child_table, fk.child_columns[0], fk.child_slot_name)] = fk
+            direct_adj.setdefault(fk.child_table, set()).add(fk.parent_table)
+
+    slot_fk_by_key: dict[tuple[str, str, str], CrossTableForeignKey] = {}
+    for fk in acyclic_fks:
+        if fk.child_slot_name is None:
+            continue
+        # OLTP 모드에서 직접 FK 경로(예: transactions -> accounts -> branches)로 이미
+        # 도달 가능한 조상 테이블로의 이행적(transitive) 슬롯 FK는 3NF 정규화를 위해 생략한다.
+        if not analytics_mode and _has_indirect_path(direct_adj, fk.child_table, fk.parent_table):
+            continue
+        slot_fk_by_key[(fk.child_table, fk.child_columns[0], fk.child_slot_name)] = fk
+
+    referenced_parents: set[str] = {fk.parent_table for fk in direct_fk_by_col.values()}
+    if decompose_strings:
+        referenced_parents.update(fk.parent_table for fk in slot_fk_by_key.values())
 
     tables: list[TargetTable] = []
     transforms: dict[tuple[str, str], str] = {}
+    slot_extract_specs: dict[tuple[str, str], tuple[str, str, int]] = {}
     source_table_map: dict[str, str] = {}
     surrogate_tables: set[str] = set()
     omitted_derivations: dict[str, list[str]] = {}
+    partition_notes: dict[str, list[str]] = {}
     materialized_slot_count = 0
 
     for bundle in bundles:
@@ -303,12 +381,11 @@ def _build_candidate(
         target_cols: list[TargetColumn] = []
         used_cols = set(used_cols_by_table[t_name])
 
-        # 1. 자연 PK가 없으면 BIGINT 서로게이트 PK를 첫 컬럼으로 추가
+        # 1. 자연 PK가 없으면 BIGINT GENERATED ALWAYS AS IDENTITY 서로게이트 PK를 첫 컬럼으로 추가
         if table_pk is not None and table_pk.recommend_surrogate:
             raw_surr = table_pk.surrogate_column_name or f"{t_name}_id"
             surr_used: set[str] = set()
             surr_sql = _to_sql_ident(raw_surr, used=surr_used, fallback_prefix="surr")
-            # 기존 컬럼과 충돌 시 회피
             if surr_sql in col_sql_map[t_name].values():
                 surr_sql = _to_sql_ident(f"{t_name}_surrogate_id", used=used_cols)
             surrogate_tables.add(t_name)
@@ -319,7 +396,8 @@ def _build_candidate(
                     source_columns=["__surrogate__"],
                     nullable=False,
                     is_primary_key=True,
-                    description="자연 PK 부재로 자동 생성되는 서로게이트 PK",
+                    is_identity=True,
+                    description="자연 PK 부재로 자동 생성되는 서로게이트 IDENTITY PK",
                 )
             )
             transforms[(t_name, surr_sql)] = "generated_always_as_identity"
@@ -346,7 +424,7 @@ def _build_candidate(
             phys = cls.physical_type
 
             fk_spec: str | None = None
-            transform = _default_transform(cls, t_assign.semantic_type)
+            transform = _default_transform(cls, t_assign)
 
             if direct_fk is not None:
                 p_table = direct_fk.parent_table
@@ -387,7 +465,11 @@ def _build_candidate(
 
             if fk_spec is not None and sql_col not in index_cols:
                 index_cols.append(sql_col)
-            if cls.category is ColumnRoleCategory.TEMPORAL and temporal_partition_col is None:
+            if (
+                cls.category is ColumnRoleCategory.TEMPORAL
+                and not nullable
+                and temporal_partition_col is None
+            ):
                 temporal_partition_col = sql_col
             if (
                 analytics_mode
@@ -432,9 +514,10 @@ def _build_candidate(
                             f"`{col_name}` 규칙 문자열의 가변 슬롯 `{seg.slot_name}` 파싱 컬럼"
                         )
 
+                    cap_group = seg.capture_group or 1
                     extract_expr = seg.extract_sql_hint or (
-                        f"regexp_extract({col_name}, '{cls.string_pattern.regex_pattern}', "
-                        f"{seg.capture_group or 1})"
+                        f"NULLIF(regexp_extract({col_name}, '{cls.string_pattern.regex_pattern}', "
+                        f"{cap_group}), '')"
                     )
                     target_cols.append(
                         TargetColumn(
@@ -448,14 +531,42 @@ def _build_candidate(
                         )
                     )
                     transforms[(t_name, slot_sql_col)] = extract_expr
+                    slot_extract_specs[(t_name, slot_sql_col)] = (
+                        col_name,
+                        cls.string_pattern.regex_pattern,
+                        cap_group,
+                    )
                     materialized_slot_count += 1
                     if slot_fk_spec is not None and slot_sql_col not in index_cols:
                         index_cols.append(slot_sql_col)
 
+        # 4. PostgreSQL 선언적 파티셔닝(C3_ANALYTICS):
+        #    - 실제 DDL(`PARTITION BY RANGE(...)`)이 실행 가능할 때만 `table.partition`을 설정한다.
+        #    - PostgreSQL은 파티션 키가 PRIMARY KEY에 포함되어야 하며, 자식 테이블이 단일 컬럼 PK로
+        #      참조 중인 부모 테이블은 복합 PK로 바꾸면 자식 FK가 깨지므로 안전하게 보류한다.
         partition_expr: str | None = None
         has_outgoing_fk = any(c.foreign_key is not None for c in target_cols)
         if analytics_mode and temporal_partition_col is not None and has_outgoing_fk:
-            partition_expr = f"RANGE ({temporal_partition_col})"
+            pk_names = [c.name for c in target_cols if c.is_primary_key]
+            can_partition = (
+                t_name not in referenced_parents
+                or temporal_partition_col in pk_names
+                or not pk_names
+            )
+            if can_partition:
+                target_cols = [
+                    c.model_copy(update={"is_primary_key": True, "nullable": False})
+                    if c.name == temporal_partition_col
+                    else c
+                    for c in target_cols
+                ]
+                partition_expr = f"RANGE ({temporal_partition_col})"
+            else:
+                partition_notes.setdefault(t_name, []).append(
+                    f"하위 테이블이 단일 PK를 참조 중이라 `{temporal_partition_col}` 자동 "
+                    "PARTITION BY RANGE 생성을 보류했다(파티셔닝 적용 시 자식 테이블에도 "
+                    "파티션 키를 포함한 복합 FK 설계 필요)."
+                )
 
         tables.append(
             TargetTable(
@@ -466,12 +577,9 @@ def _build_candidate(
             )
         )
 
-    # 빈 테이블 방어
     if not tables:
         raise ValueError("스키마 후보를 생성할 테이블이 없습니다.")
 
-    # 실제 참조 없는 고립 테이블 경고 없이 깔끔히 유지
-    _ = by_table
     candidate = SchemaCandidate(
         id=candidate_id,
         pattern=pattern,
@@ -482,21 +590,30 @@ def _build_candidate(
     return _BuiltCandidate(
         candidate=candidate,
         transforms=transforms,
+        slot_extract_specs=slot_extract_specs,
         source_table_map=source_table_map,
         surrogate_tables=surrogate_tables,
         omitted_derivations=omitted_derivations,
+        partition_notes=partition_notes,
         materialized_slot_count=materialized_slot_count,
     )
 
 
-def _default_transform(cls: ColumnClassification, sem: SemanticType) -> str:
-    if sem in {SemanticType.AMOUNT, SemanticType.RATIO}:
+def _default_transform(cls: ColumnClassification, t_assign: TypeAssignment) -> str:
+    if (
+        t_assign.semantic_type in {SemanticType.AMOUNT, SemanticType.RATIO}
+        or cls.physical_type is PhysicalType.DECIMAL
+    ):
         return "strip_currency_and_comma"
     if cls.category is ColumnRoleCategory.TEMPORAL:
         if any(("한국어 날짜" in r or "한글 날짜" in r) for r in cls.reasons):
             return "parse_korean_date"
         return "parse_iso_temporal"
-    if sem is SemanticType.BOOLEAN_LIKE:
+    if (
+        t_assign.semantic_type is SemanticType.BOOLEAN_LIKE
+        or cls.physical_type is PhysicalType.BOOLEAN
+        or cls.category is ColumnRoleCategory.BOOLEAN
+    ):
         return "normalize_boolean"
     return "identity"
 
@@ -569,19 +686,352 @@ def _merge_profiles_and_stats(
     return list(merged_profiles.values()), list(merged_stats.values()), sampling
 
 
+def _sql_literal(val: str) -> str:
+    return "'" + val.replace("'", "''") + "'"
+
+
+def _raw_missing_predicate(qcol: str) -> str:
+    clauses = [f"{qcol} IS NULL", f"regexp_matches({qcol}, '^\\s*$')"]
+    clauses += [f"{qcol} = {_sql_literal(m)}" for m in sorted(DEFAULT_MISSING_MARKERS)]
+    return " OR ".join(f"({c})" for c in clauses)
+
+
+def _trial_cast_expr(
+    qcol: str,
+    col: TargetColumn,
+    transform: str,
+    pg_type: exp.DataType,
+    slot_spec: tuple[str, str, int] | None,
+) -> tuple[str, int | None, bool]:
+    """시험 적재용 DuckDB 변환 SQL, VARCHAR 최대 길이, INT4 범위 검사 여부를 반환한다."""
+    pg_sql = pg_type.sql(dialect="postgres")
+    varchar_limit: int | None = None
+    m_vc = _VARCHAR_LEN_RE.fullmatch(pg_sql)
+    if m_vc is not None:
+        varchar_limit = int(m_vc.group(1))
+    check_int4 = pg_sql.upper() in {"INT", "INTEGER"}
+
+    if col.is_identity or transform == "generated_always_as_identity":
+        return "row_number() OVER ()", None, False
+
+    if slot_spec is not None:
+        _src_name, pattern, cap_group = slot_spec
+        pat_lit = _sql_literal(pattern)
+        extracted = f"NULLIF(regexp_extract({qcol}, {pat_lit}, {cap_group}), '')"
+        if col.physical_type is PhysicalType.INTEGER:
+            inner = (
+                f"CASE WHEN regexp_matches({extracted}, '^[+-]?\\d+$') "
+                f"THEN TRY_CAST({extracted} AS BIGINT) ELSE NULL END"
+            )
+        elif col.physical_type is PhysicalType.DECIMAL:
+            inner = f"TRY_CAST({extracted} AS DOUBLE)"
+        else:
+            inner = extracted
+        return inner, varchar_limit, check_int4
+
+    if transform == "strip_currency_and_comma" or col.physical_type is PhysicalType.DECIMAL:
+        cleaned = f"regexp_replace({qcol}, '[₩$원,\\s]', '', 'g')"
+        shape_lit = _sql_literal(CURRENCY_DECIMAL_SHAPE)
+        m_num = _NUMERIC_PS_RE.fullmatch(pg_sql)
+        if col.physical_type is PhysicalType.INTEGER:
+            cast_target = "BIGINT"
+        elif m_num is not None:
+            cast_target = f"DECIMAL({int(m_num.group(1))}, {int(m_num.group(2))})"
+        else:
+            cast_target = "DOUBLE"
+        inner = (
+            f"CASE WHEN regexp_matches({qcol}, {shape_lit}) "
+            f"THEN TRY_CAST({cleaned} AS {cast_target}) ELSE NULL END"
+        )
+        return inner, None, check_int4
+
+    if transform == "normalize_boolean" or col.physical_type is PhysicalType.BOOLEAN:
+        inner = (
+            f"CASE WHEN lower(trim({qcol})) IN ('y', 'yes', '예', 'o', 'true') THEN TRUE "
+            f"WHEN lower(trim({qcol})) IN ('n', 'no', '아니오', 'x', 'false') THEN FALSE "
+            "ELSE NULL END"
+        )
+        return inner, None, False
+
+    if transform == "parse_korean_date":
+        inner = (
+            "COALESCE("
+            f"CAST(TRY_STRPTIME(trim({qcol}), '%Y년 %m월 %d일') AS DATE), "
+            f"CAST(TRY_STRPTIME(trim({qcol}), '%Y년%m월%d일') AS DATE), "
+            f"CAST(TRY_STRPTIME(trim({qcol}), '%Y-%m-%d') AS DATE), "
+            f"CAST(TRY_STRPTIME(trim({qcol}), '%Y/%m/%d') AS DATE), "
+            f"CAST(TRY_STRPTIME(trim({qcol}), '%Y.%m.%d') AS DATE)"
+            ")"
+        )
+        return inner, None, False
+
+    if transform == "parse_iso_temporal" or col.physical_type in {
+        PhysicalType.DATE,
+        PhysicalType.TIMESTAMP,
+        PhysicalType.TIMESTAMPTZ,
+        PhysicalType.TIME,
+    }:
+        if col.physical_type is PhysicalType.TIME:
+            return f"TRY_CAST(trim({qcol}) AS TIME)", None, False
+        if col.physical_type is PhysicalType.TIMESTAMP:
+            return f"TRY_CAST(trim({qcol}) AS TIMESTAMP)", None, False
+        if col.physical_type is PhysicalType.TIMESTAMPTZ:
+            return f"TRY_CAST(trim({qcol}) AS TIMESTAMPTZ)", None, False
+        inner = (
+            "COALESCE("
+            f"CAST(TRY_STRPTIME(trim({qcol}), '%Y-%m-%d') AS DATE), "
+            f"CAST(TRY_STRPTIME(trim({qcol}), '%Y/%m/%d') AS DATE), "
+            f"CAST(TRY_STRPTIME(trim({qcol}), '%Y.%m.%d') AS DATE), "
+            f"CAST(TRY_STRPTIME(trim({qcol}), '%Y%m%d') AS DATE), "
+            f"CASE WHEN regexp_matches(trim({qcol}), '^\\d+$') "
+            f"AND TRY_CAST(trim({qcol}) AS INTEGER) BETWEEN 25569 AND 73050 "
+            f"THEN DATE '1899-12-30' + TRY_CAST(trim({qcol}) AS INTEGER) ELSE NULL END"
+            ")"
+        )
+        return inner, None, False
+
+    if col.physical_type is PhysicalType.INTEGER:
+        inner = (
+            f"CASE WHEN regexp_matches(trim({qcol}), '^[+-]?\\d+$') "
+            f"THEN TRY_CAST(trim({qcol}) AS BIGINT) ELSE NULL END"
+        )
+        return inner, None, check_int4
+
+    if col.physical_type is PhysicalType.FLOAT:
+        return f"TRY_CAST(trim({qcol}) AS DOUBLE)", None, False
+
+    return f"CAST({qcol} AS VARCHAR)", varchar_limit, False
+
+
+def _run_trial_load(
+    mctx: MultiTableContext | None,
+    built: _BuiltCandidate,
+    bundles: Sequence[TableProfileBundle],
+    relations: MultiTableRelationAnalysis,
+    col_types: Mapping[tuple[str, str], exp.DataType],
+    *,
+    ddl_ok: bool,
+) -> ValidationSummary:
+    """실제 DuckDB 시험 적재(변환·캐스팅·PK·FK 무결성)를 실행해 정직한 검증 요약을 산출한다."""
+    total_rows = sum(b.source.row_count for b in bundles)
+
+    if not ddl_ok:
+        return ValidationSummary(
+            ddl_parse_ok=False,
+            trial_load_ok=False,
+            trial_load_executed=False,
+            constraint_violation_count=1,
+            cast_failure_count=0,
+            pk_violation_count=0,
+            fk_violation_count=0,
+            data_loss_rate=0.0,
+        )
+
+    # mctx가 없으면 시험 적재를 수행하지 않았음을 정직하게 보고하되,
+    # 관계 분석에서 관측된 물리 FK 고아 행 수는 그대로 반영한다.
+    if mctx is None or mctx.connection is None:
+        orphan_by_pair: dict[tuple[str, str], int] = {}
+        for fk in relations.foreign_keys:
+            key = (fk.child_table, fk.parent_table)
+            orphan_by_pair[key] = max(orphan_by_pair.get(key, 0), fk.orphan_rows)
+        fk_orphans = 0
+        for tbl in built.candidate.tables:
+            seen_parents: set[str] = set()
+            for col in tbl.columns:
+                if col.foreign_key is None:
+                    continue
+                parent = col.foreign_key.split("(", 1)[0]
+                if parent not in seen_parents:
+                    seen_parents.add(parent)
+                    fk_orphans += orphan_by_pair.get((tbl.name, parent), 0)
+        return ValidationSummary(
+            ddl_parse_ok=True,
+            trial_load_ok=False,
+            trial_load_executed=False,
+            constraint_violation_count=fk_orphans,
+            cast_failure_count=0,
+            pk_violation_count=0,
+            fk_violation_count=fk_orphans,
+            data_loss_rate=min(1.0, round(fk_orphans / max(total_rows, 1), 6)),
+        )
+
+    conn = mctx.connection
+    cand = built.candidate
+    load_order = _topological_order(cand)
+    table_by_name = {t.name: t for t in cand.tables}
+    trial_name_by_table: dict[str, str] = {}
+    col_alias_by_table: dict[str, dict[str, str]] = {}
+    created_temps: list[str] = []
+
+    cast_failure_count = 0
+    failed_cast_rows = 0
+    pk_violation_count = 0
+    fk_violation_count = 0
+
+    try:
+        for idx, lo in enumerate(load_order):
+            t_name = lo.table
+            target_table = table_by_name[t_name]
+            src_name = built.source_table_map[t_name]
+            slot = mctx.get_by_name(src_name)
+            col_id_by_src = {c.original_name: c.column_id for c in slot.columns}
+            src_rel = f"{slot.table_info.table_id}.{RAW_TABLE}"
+            temp_tbl = f"_autoetl_trial_{idx}"
+            trial_name_by_table[t_name] = temp_tbl
+            col_aliases: dict[str, str] = {}
+            select_exprs: list[str] = []
+            fail_predicates: list[str] = []
+
+            for c_idx, col in enumerate(target_table.columns):
+                alias = f"v{c_idx}"
+                col_aliases[col.name] = alias
+                transform = built.transforms.get((t_name, col.name), "identity")
+                pg_type = col_types[(t_name, col.name)]
+                slot_spec = built.slot_extract_specs.get((t_name, col.name))
+
+                if col.is_identity or transform == "generated_always_as_identity":
+                    select_exprs.append(f"row_number() OVER () AS {alias}")
+                    continue
+
+                src_col_name = col.source_columns[0]
+                raw_cid = col_id_by_src.get(src_col_name)
+                if raw_cid is None:
+                    select_exprs.append(f"NULL AS {alias}")
+                    continue
+
+                qcol = quote_identifier(raw_cid)
+                miss_pred = _raw_missing_predicate(qcol)
+                inner_expr, varchar_limit, check_int4 = _trial_cast_expr(
+                    qcol, col, transform, pg_type, slot_spec
+                )
+                wrapped = f"CASE WHEN ({miss_pred}) THEN NULL ELSE ({inner_expr}) END"
+                select_exprs.append(f"{wrapped} AS {alias}")
+
+                # 비결측 원시 값이 변환 후 NULL이 되거나 DDL 길이/정수 범위를 초과하면 실패
+                fail_parts = [f"(NOT ({miss_pred}) AND ({wrapped}) IS NULL)"]
+                if varchar_limit is not None:
+                    fail_parts.append(
+                        f"(({wrapped}) IS NOT NULL AND "
+                        f"length(CAST({wrapped} AS VARCHAR)) > {varchar_limit})"
+                    )
+                if check_int4:
+                    fail_parts.append(
+                        f"(({wrapped}) IS NOT NULL AND "
+                        f"(({wrapped}) < {INT4_MIN} OR ({wrapped}) > {INT4_MAX}))"
+                    )
+                fail_predicates.append("(" + " OR ".join(fail_parts) + ")")
+
+            col_alias_by_table[t_name] = col_aliases
+            conn.execute(
+                f"CREATE OR REPLACE TEMP TABLE {temp_tbl} AS "
+                f"SELECT {', '.join(select_exprs)} FROM {src_rel}"
+            )
+            created_temps.append(temp_tbl)
+
+            if fail_predicates:
+                sum_cells = " + ".join(
+                    f"COALESCE(SUM(CASE WHEN {pred} THEN 1 ELSE 0 END), 0)"
+                    for pred in fail_predicates
+                )
+                any_fail = " OR ".join(fail_predicates)
+                row_res = conn.execute(
+                    f"SELECT ({sum_cells}), "
+                    f"COALESCE(SUM(CASE WHEN {any_fail} THEN 1 ELSE 0 END), 0) "
+                    f"FROM {src_rel}"
+                ).fetchone()
+                if row_res is not None:
+                    cast_failure_count += int(row_res[0] or 0)
+                    failed_cast_rows += int(row_res[1] or 0)
+
+            # PK 무결성 검사 (NULL 및 중복 행)
+            pk_cols = [
+                c.name for c in target_table.columns if c.is_primary_key and not c.is_identity
+            ]
+            if pk_cols:
+                pk_aliases = [col_aliases[c] for c in pk_cols]
+                null_cond = " OR ".join(f"{a} IS NULL" for a in pk_aliases)
+                not_null_cond = " AND ".join(f"{a} IS NOT NULL" for a in pk_aliases)
+                pk_null_row = conn.execute(
+                    f"SELECT COUNT(*) FROM temp.main.{temp_tbl} WHERE {null_cond}"
+                ).fetchone()
+                pk_nulls = int(pk_null_row[0]) if pk_null_row is not None else 0
+                group_expr = ", ".join(pk_aliases)
+                pk_dup_row = conn.execute(
+                    f"SELECT COALESCE(SUM(cnt - 1), 0) FROM ("
+                    f"SELECT COUNT(*) AS cnt FROM temp.main.{temp_tbl} "
+                    f"WHERE {not_null_cond} GROUP BY {group_expr} HAVING COUNT(*) > 1)"
+                ).fetchone()
+                pk_dups = int(pk_dup_row[0]) if pk_dup_row is not None else 0
+                pk_violation_count += pk_nulls + pk_dups
+
+        # FK 참조 무결성 검사 (실제 변환된 임시 테이블 간 anti-join)
+        for target_table in cand.tables:
+            child_temp = trial_name_by_table[target_table.name]
+            child_aliases = col_alias_by_table[target_table.name]
+            for col in target_table.columns:
+                if col.foreign_key is None:
+                    continue
+                parent_table, rest = col.foreign_key.split("(", 1)
+                parent_col = rest.rstrip(")")
+                parent_temp = trial_name_by_table.get(parent_table)
+                parent_alias = col_alias_by_table.get(parent_table, {}).get(parent_col)
+                child_alias = child_aliases.get(col.name)
+                if parent_temp is None or parent_alias is None or child_alias is None:
+                    continue
+                fk_res = conn.execute(
+                    f"SELECT COUNT(*) FROM temp.main.{child_temp} c "
+                    f"WHERE c.{child_alias} IS NOT NULL "
+                    f"AND NOT EXISTS ("
+                    f"SELECT 1 FROM temp.main.{parent_temp} p "
+                    f"WHERE p.{parent_alias} = c.{child_alias})"
+                ).fetchone()
+                if fk_res is not None:
+                    fk_violation_count += int(fk_res[0] or 0)
+    finally:
+        for temp_tbl in created_temps:
+            conn.execute(f"DROP TABLE IF EXISTS temp.main.{temp_tbl}")
+
+    constraint_violations = pk_violation_count + fk_violation_count
+    lost_rows = failed_cast_rows + constraint_violations
+    loss_rate = min(1.0, round(lost_rows / max(total_rows, 1), 6))
+    trial_ok = ddl_ok and cast_failure_count == 0 and constraint_violations == 0
+
+    return ValidationSummary(
+        ddl_parse_ok=ddl_ok,
+        trial_load_ok=trial_ok,
+        trial_load_executed=True,
+        constraint_violation_count=constraint_violations,
+        cast_failure_count=cast_failure_count,
+        pk_violation_count=pk_violation_count,
+        fk_violation_count=fk_violation_count,
+        data_loss_rate=loss_rate,
+    )
+
+
 def _score_candidate(
     built: _BuiltCandidate,
     purpose: Purpose,
+    bundles: Sequence[TableProfileBundle],
+    relations: MultiTableRelationAnalysis,
     merged_profiles: Sequence[ColumnProfile],
     merged_stats: Sequence[ColumnStats],
     merged_sampling: SamplingPlan,
     total_derivations: int,
-) -> tuple[Scorecard, str]:
-    """후보 스키마를 `generate_ddl` + `verify_ddl`로 검증하고 목적별 가중 점수를 계산한다."""
+    sensitivity_by_table: Mapping[str, SensitivityMap],
+    mctx: MultiTableContext | None,
+) -> tuple[Scorecard, str, dict[tuple[str, str], exp.DataType]]:
+    """후보 스키마를 `generate_ddl` + `verify_ddl` + DuckDB 시험 적재로 검증하고 채점한다."""
     cand = built.candidate
     ddl_ok = False
     ddl_sql = ""
+    col_types: dict[tuple[str, str], exp.DataType] = {}
     try:
+        col_types = resolve_postgres_column_types(
+            cand,
+            profiles=merged_profiles,
+            stats=merged_stats,
+            sampling=merged_sampling,
+        )
         ddl_sql = generate_ddl(
             cand,
             profiles=merged_profiles,
@@ -593,7 +1043,17 @@ def _score_candidate(
     except ValueError:
         ddl_ok = False
 
+    validation = _run_trial_load(
+        mctx,
+        built,
+        bundles,
+        relations,
+        col_types,
+        ddl_ok=ddl_ok,
+    )
+
     n_tables = len(cand.tables)
+    total_rows = sum(b.source.row_count for b in bundles)
     pk_tables = sum(1 for t in cand.tables if any(c.is_primary_key for c in t.columns))
     fk_count = sum(1 for t in cand.tables for c in t.columns if c.foreign_key is not None)
     omitted_count = sum(len(v) for v in built.omitted_derivations.values())
@@ -605,6 +1065,11 @@ def _score_candidate(
         pk_ratio = pk_tables / max(n_tables, 1)
         fk_bonus = min(15.0, fk_count * 4.0)
         integrity_val = min(100.0, 65.0 + 20.0 * pk_ratio + fk_bonus)
+        total_issues = validation.constraint_violation_count + validation.cast_failure_count
+        if total_issues > 0:
+            issue_ratio = total_issues / max(total_rows, 1)
+            penalty = min(45.0, 15.0 + 100.0 * issue_ratio)
+            integrity_val = max(20.0, integrity_val - penalty)
 
     # 중복도: 파생 컬럼을 제거(정규화)했을수록 높음
     if total_derivations > 0:
@@ -657,7 +1122,23 @@ def _score_candidate(
         75.0 + min(15.0, fk_count * 3.5) + min(10.0, built.materialized_slot_count * 3.5),
     )
 
-    security_val = 85.0
+    # 보안·민감정보 격리 점수(S7 PII 탐지 결과 반영)
+    all_pii = [a for smap in sensitivity_by_table.values() for a in smap.assignments]
+    if not all_pii:
+        security_val = 92.0
+        security_detail = "민감(PII) 컬럼 미탐지 · 원본 셀 값 비노출 결정론적 스키마 생성"
+    else:
+        max_level = max((a.level for a in all_pii), key=lambda lv: _LEVEL_RANK[lv])
+        if max_level is SensitivityLevel.L3:
+            security_val = 60.0
+        elif max_level is SensitivityLevel.L2:
+            security_val = 72.0
+        else:
+            security_val = 82.0
+        security_detail = (
+            f"민감(PII) 컬럼 {len(all_pii)}건 탐지(최고 등급 {max_level.value}) — "
+            "적재 시 암호화·마스킹 및 접근 통제 적용 권고"
+        )
 
     weights = _PURPOSE_WEIGHTS[purpose]
     weighted = round(
@@ -670,13 +1151,21 @@ def _score_candidate(
         2,
     )
 
+    trial_detail = (
+        f"시험적재 {'통과' if validation.trial_load_ok else '실패'}"
+        f"(캐스트실패 {validation.cast_failure_count}, PK위반 {validation.pk_violation_count}, "
+        f"FK고아 {validation.fk_violation_count})"
+        if validation.trial_load_executed
+        else f"시험적재 미실행(FK고아 {validation.fk_violation_count})"
+    )
+
     scorecard = Scorecard(
         candidate_id=cand.id,
         integrity=CriterionScore(
             score=round(integrity_val, 2),
             detail=(
                 f"DDL 검증 {'통과' if ddl_ok else '실패'}, "
-                f"PK {pk_tables}/{n_tables}, FK {fk_count}건"
+                f"PK {pk_tables}/{n_tables}, FK {fk_count}건, {trial_detail}"
             ),
         ),
         redundancy=CriterionScore(
@@ -704,18 +1193,13 @@ def _score_candidate(
         ),
         security_isolation=CriterionScore(
             score=security_val,
-            detail="원본 셀 값 비노출 결정론적 스키마 생성",
+            detail=security_detail,
         ),
         weighted_total=weighted,
         purpose=purpose,
-        validation=ValidationSummary(
-            ddl_parse_ok=ddl_ok,
-            trial_load_ok=ddl_ok,
-            constraint_violation_count=0 if ddl_ok else 1,
-            data_loss_rate=0.0,
-        ),
+        validation=validation,
     )
-    return scorecard, ddl_sql
+    return scorecard, ddl_sql, col_types
 
 
 def _topological_order(candidate: SchemaCandidate) -> list[LoadOrder]:
@@ -737,7 +1221,6 @@ def _topological_order(candidate: SchemaCandidate) -> list[LoadOrder]:
     while remaining:
         ready = [name for name in remaining if depends[name] <= done]
         if not ready:
-            # 순환 방어 완료 상태여야 하지만 만약 남더라도 결정론적으로 풀기
             ready = [remaining[0]]
         for name in ready:
             ordered.append(LoadOrder(table=name, depends_on=sorted(depends[name])))
@@ -746,17 +1229,23 @@ def _topological_order(candidate: SchemaCandidate) -> list[LoadOrder]:
     return ordered
 
 
-def _pg_type_cast_label(col: TargetColumn) -> str:
+def _pg_type_cast_label(
+    col: TargetColumn,
+    resolved_type: exp.DataType | None = None,
+) -> str:
+    """`ddl.sql`과 1:1 일치하는 PostgreSQL 캐스팅 타입 문자열을 반환한다."""
+    if resolved_type is not None:
+        return resolved_type.sql(dialect="postgres").lower()
     if col.physical_type is PhysicalType.INTEGER:
-        return "bigint" if col.source_columns == ["__surrogate__"] else "integer"
+        return "bigint" if col.is_identity or col.source_columns == ["__surrogate__"] else "int"
     if col.physical_type is PhysicalType.DECIMAL:
         if col.precision is not None and col.scale is not None:
-            return f"numeric({col.precision},{col.scale})"
+            return f"numeric({col.precision}, {col.scale})"
         return "numeric"
     if col.physical_type is PhysicalType.FLOAT:
         return "double precision"
     if col.physical_type is PhysicalType.STRING:
-        return "varchar"
+        return "text"
     return str(col.physical_type.value)
 
 
@@ -792,11 +1281,14 @@ def _build_table_load_strategies(
     bundles: Sequence[TableProfileBundle],
     relations: MultiTableRelationAnalysis,
     purpose: Purpose,
-) -> tuple[list[TableLoadStrategy], str]:
-    """위상 정렬 순서에 맞춰 테이블별 적재 전략·컬럼 변환·권고 인덱스를 생성한다."""
+    col_types: Mapping[tuple[str, str], exp.DataType],
+    sensitivity_by_table: Mapping[str, SensitivityMap],
+) -> tuple[list[TableLoadStrategy], str, str]:
+    """위상 정렬 순서에 맞춰 테이블별 적재 전략·컬럼 변환·권고 인덱스·컬럼 주석 DDL을 생성한다."""
     bundle_by_name = {b.source.table_name: b for b in bundles}
     table_by_name = {t.name: t for t in built.candidate.tables}
     all_indexes: list[IndexRecommendation] = []
+    column_comments: list[tuple[str, str, str]] = []
     strategies: list[TableLoadStrategy] = []
 
     for order_idx, lo in enumerate(load_order):
@@ -807,6 +1299,7 @@ def _build_table_load_strategies(
         pk_rec = relations.primary_keys.get(src_name)
         cls_by_col = {c.column: c for c in bundle.classifications}
         uses_surrogate = t_name in built.surrogate_tables
+        src_encoding = bundle.ingest.files[0].encoding if bundle.ingest.files else "utf-8"
 
         pk_cols = [c.name for c in target_table.columns if c.is_primary_key]
         mappings: list[ColumnMapping] = []
@@ -818,22 +1311,29 @@ def _build_table_load_strategies(
             src_col = col.source_columns[0]
             transform = built.transforms.get((t_name, col.name), "identity")
             null_handling = NullHandling.REJECT_ROW if not col.nullable else NullHandling.NULL
+            resolved_dt = col_types.get((t_name, col.name))
             mappings.append(
                 ColumnMapping(
                     source_column=src_col,
                     target_table=t_name,
                     target_column=col.name,
                     transform=transform,
-                    type_cast=_pg_type_cast_label(col),
+                    type_cast=_pg_type_cast_label(col, resolved_dt),
                     null_handling=null_handling,
                 )
             )
+            if col.name != src_col and src_col != "__surrogate__":
+                if (t_name, col.name) in built.slot_extract_specs:
+                    column_comments.append((t_name, col.name, f"원본 '{src_col}'에서 추출된 슬롯"))
+                else:
+                    column_comments.append((t_name, col.name, src_col))
+
             src_cls = cls_by_col.get(src_col)
             if (
                 src_cls is not None
                 and src_cls.category is ColumnRoleCategory.TEMPORAL
                 and src_cls.missing_count == 0
-                and col.name == src_col
+                and (t_name, col.name) not in built.slot_extract_specs
             ):
                 temporal_cols.append(col.name)
 
@@ -864,37 +1364,13 @@ def _build_table_load_strategies(
                     )
                 )
 
-        # 대안 자연 유일 키(코드·식별자·규칙 문자열만, 금액/측정량·표시명 제외)에 UNIQUE 인덱스 권고
+        # 표본 관측 대안 유일 키는 미래 배치에서 중복이 발생할 수 있으므로(예: 우편번호)
+        # 물리 UNIQUE INDEX로 자동 승격하지 않고 권고 노트/리포트에만 기록한다.
+        alt_key_advisories: list[str] = []
         if pk_rec is not None:
-            col_name_set = {c.name for c in target_table.columns}
-            for alt_key in pk_rec.alternative_keys[:2]:
-                if len(alt_key) != 1 or alt_key[0] not in col_name_set:
-                    continue
-                alt_col = alt_key[0]
-                alt_cls = cls_by_col.get(alt_col)
-                if alt_cls is None or alt_cls.category not in {
-                    ColumnRoleCategory.INDEX,
-                    ColumnRoleCategory.CODE_IDENTIFIER,
-                    ColumnRoleCategory.STRUCTURED_STRING,
-                }:
-                    continue
-                low_alt = alt_col.lower()
-                if any(
-                    low_alt == suf or low_alt.endswith(f"_{suf}")
-                    for suf in ("name", "title", "label", "desc", "memo", "note")
-                ):
-                    continue
-                alt_tuple = (alt_col,)
-                if alt_tuple not in indexed_tuples and alt_key != pk_cols:
-                    indexed_tuples.add(alt_tuple)
-                    table_indexes.append(
-                        IndexRecommendation(
-                            table=t_name,
-                            columns=[alt_col],
-                            unique=True,
-                            reason="대안 유일 비즈니스 키 무결성 및 단건 조회 최적화",
-                        )
-                    )
+            for alt_key in pk_rec.alternative_keys[:3]:
+                if alt_key != pk_rec.columns:
+                    alt_key_advisories.append(", ".join(alt_key))
 
         # 분석 목적일 때 범주형 필터 컬럼 인덱스 추가
         if purpose is Purpose.ANALYTICS:
@@ -902,7 +1378,7 @@ def _build_table_load_strategies(
                 src_cls = cls_by_col.get(col.source_columns[0])
                 if (
                     src_cls is not None
-                    and col.name == col.source_columns[0]
+                    and (t_name, col.name) not in built.slot_extract_specs
                     and src_cls.category
                     in {
                         ColumnRoleCategory.CATEGORICAL_NOMINAL,
@@ -941,20 +1417,45 @@ def _build_table_load_strategies(
 
         notes: list[str] = []
         if uses_surrogate:
-            notes.append("자연 PK 부재로 서로게이트 BIGINT 키와 APPEND 적재를 권고한다.")
+            notes.append(
+                "자연 PK 부재로 `GENERATED ALWAYS AS IDENTITY` 서로게이트 BIGINT 키와 "
+                "APPEND 적재를 권고한다."
+            )
         if t_name in built.omitted_derivations:
             notes.append(
                 "정규화 후보 선택으로 산술 파생 컬럼을 테이블에서 제외하고 뷰/계산식 계산을 "
                 f"권고한다: {', '.join(built.omitted_derivations[t_name])}"
             )
         if target_table.partition:
-            notes.append(f"시계열 분석 성능용 파티셔닝 권고: {target_table.partition}")
+            notes.append(
+                f"시계열 분석용 선언적 파티셔닝 반영: PARTITION BY {target_table.partition}"
+            )
+        if t_name in built.partition_notes:
+            notes.extend(built.partition_notes[t_name])
+        if alt_key_advisories:
+            notes.append(
+                "표본 관측 유일 후보(비즈니스 규칙 확인 후 UNIQUE 제약 적용 검토): "
+                + "; ".join(alt_key_advisories)
+            )
+
+        smap = sensitivity_by_table.get(src_name)
+        sensitive_cols: list[str] = []
+        if smap is not None and smap.assignments:
+            for item in smap.assignments:
+                sensitive_cols.append(item.column)
+                primary_type = item.types[0]
+                notes.append(
+                    f"민감(PII) 컬럼 `{item.column}` [{item.level.value} / "
+                    f"{', '.join(t.value for t in item.types)}]: "
+                    f"{masking_recommendation(primary_type)}"
+                )
 
         all_indexes.extend(table_indexes)
         strategies.append(
             TableLoadStrategy(
                 source_table=src_name,
                 target_table=t_name,
+                source_encoding=src_encoding,
                 load_order_index=order_idx,
                 depends_on=list(lo.depends_on),
                 primary_key=pk_cols,
@@ -965,18 +1466,22 @@ def _build_table_load_strategies(
                 deduplication=dedup,
                 column_mappings=mappings,
                 recommended_indexes=table_indexes,
+                sensitive_columns=sensitive_cols,
                 expected_row_count=bundle.source.row_count,
                 notes=notes,
             )
         )
 
     index_ddl = _build_index_ddl(all_indexes)
-    return strategies, index_ddl
+    comment_ddl = build_column_comment_ddl(column_comments)
+    return strategies, index_ddl, comment_ddl
 
 
 def render_mermaid_erd(
     candidate: SchemaCandidate,
     relations: MultiTableRelationAnalysis,
+    *,
+    col_types: Mapping[tuple[str, str], exp.DataType] | None = None,
 ) -> str:
     """선택된 스키마 후보와 관계 정보를 Mermaid ``erDiagram`` 코드로 렌더링한다."""
     card_by_pair: dict[tuple[str, str], RelationshipCardinality] = {}
@@ -987,7 +1492,8 @@ def render_mermaid_erd(
     for table in candidate.tables:
         lines.append(f"    {table.name} {{")
         for col in table.columns:
-            mtype = _mermaid_type(col.physical_type)
+            resolved_dt = col_types.get((table.name, col.name)) if col_types is not None else None
+            mtype = _mermaid_type(col.physical_type, resolved_dt)
             tags: list[str] = []
             if col.is_primary_key:
                 tags.append("PK")
@@ -1015,7 +1521,24 @@ def render_mermaid_erd(
     return "\n".join(lines) + "\n"
 
 
-def _mermaid_type(phys: PhysicalType) -> str:
+def _mermaid_type(phys: PhysicalType, resolved_type: exp.DataType | None = None) -> str:
+    """`ddl.sql`과 모순 없는 Mermaid `erDiagram` 타입 토큰을 반환한다."""
+    if resolved_type is not None:
+        pg = resolved_type.sql(dialect="postgres").upper()
+        if pg in {"INT", "INTEGER"}:
+            return "INT"
+        if pg == "BIGINT":
+            return "BIGINT"
+        if pg.startswith("NUMERIC"):
+            return "NUMERIC"
+        if pg.startswith("VARCHAR"):
+            return "VARCHAR"
+        if pg == "TEXT":
+            return "TEXT"
+        if pg == "DOUBLE PRECISION":
+            return "DOUBLE"
+        return pg.replace(" ", "_")
+
     mapping = {
         PhysicalType.INTEGER: "BIGINT",
         PhysicalType.FLOAT: "DOUBLE",
@@ -1038,10 +1561,29 @@ def plan_multi_table_load(
     *,
     purpose: Purpose = Purpose.OLTP,
     decompose_strings: bool = True,
+    mctx: MultiTableContext | None = None,
 ) -> MultiTableLoadPlan:
-    """Milestone E4 통합 실행: 후보 스키마 합성 → 채점·DDL 검증 → 위상 적재 플랜 + ERD."""
+    """Milestone E4 통합 실행: PII 탐지 → 후보 합성 → DDL+DuckDB 시험 적재 채점 → 플랜·ERD."""
     acyclic_fks, cycle_warnings = _select_acyclic_fks(relations)
+    for fk in acyclic_fks:
+        if fk.orphan_rows > 0:
+            cycle_warnings.append(
+                f"물리 FK `{fk.child_table}.{fk.child_columns[0]}` → "
+                f"`{fk.parent_table}.{fk.parent_columns[0]}`에 참조 대상 없는 고아 행 "
+                f"{fk.orphan_rows}건이 존재한다(포함률 {fk.inclusion_rate:.1%}). "
+                "PostgreSQL FK 제약 적용 전 고아 행 정제·격리(quarantine) 또는 "
+                "부모 키 보완이 필요하다."
+            )
+
     merged_profiles, merged_stats, merged_sampling = _merge_profiles_and_stats(bundles)
+
+    # S7 결정론적 PII·민감 컬럼 탐지 (원본 셀 값 비노출)
+    sensitivity_by_table: dict[str, SensitivityMap] = {}
+    for bundle in bundles:
+        slot = None
+        if mctx is not None:
+            slot = mctx.activate(bundle.source.table_id)
+        sensitivity_by_table[bundle.source.table_name] = detect_table_sensitivity(bundle, slot)
 
     total_derivations = sum(
         len(relations.table_relations[b.source.table_name].derivations)
@@ -1120,19 +1662,23 @@ def plan_multi_table_load(
     )
     built_candidates.append(c3)
 
-    scored: list[tuple[Scorecard, _BuiltCandidate, str]] = []
+    scored: list[tuple[Scorecard, _BuiltCandidate, str, dict[tuple[str, str], exp.DataType]]] = []
     for built in built_candidates:
-        sc, ddl = _score_candidate(
+        sc, ddl, col_types = _score_candidate(
             built,
             purpose,
+            bundles,
+            relations,
             merged_profiles,
             merged_stats,
             merged_sampling,
             total_derivations,
+            sensitivity_by_table,
+            mctx,
         )
-        scored.append((sc, built, ddl))
+        scored.append((sc, built, ddl, col_types))
 
-    # DDL 검증 통과 + 가중 총점 최고 후보 선택 (동률 시 candidate_id 오름차순)
+    # DDL 검증 통과 + 가중 총점 최고 후보 선택 (동률 시 candidate_id 길이 짧은 순)
     scored.sort(
         key=lambda item: (
             item[0].validation.ddl_parse_ok,
@@ -1141,13 +1687,19 @@ def plan_multi_table_load(
         ),
         reverse=True,
     )
-    best_sc, best_built, best_ddl = scored[0]
+    best_sc, best_built, best_ddl, best_col_types = scored[0]
 
     load_order = _topological_order(best_built.candidate)
-    table_plans, index_ddl = _build_table_load_strategies(
-        best_built, load_order, bundles, relations, purpose
+    table_plans, index_ddl, comment_ddl = _build_table_load_strategies(
+        best_built,
+        load_order,
+        bundles,
+        relations,
+        purpose,
+        best_col_types,
+        sensitivity_by_table,
     )
-    erd_mermaid = render_mermaid_erd(best_built.candidate, relations)
+    erd_mermaid = render_mermaid_erd(best_built.candidate, relations, col_types=best_col_types)
 
     return MultiTableLoadPlan(
         purpose=purpose,
@@ -1158,17 +1710,36 @@ def plan_multi_table_load(
         table_plans=table_plans,
         ddl_sql=best_ddl,
         index_ddl_sql=index_ddl,
+        comment_ddl_sql=comment_ddl,
         erd_mermaid=erd_mermaid,
         cycle_warnings=cycle_warnings,
     )
 
 
 def render_analysis_report(bundle: MultiTableAnalysisBundle) -> str:
-    """다중 테이블 분석·문자열 분해·PK/FK·적재 계획을 한국어 Markdown 리포트로 생성한다."""
+    """다중 테이블 분석·패턴 분해·PK/FK·시험 적재·PII·적재 계획을 Markdown으로 렌더링한다."""
     lp = bundle.load_plan
     rel = bundle.relations
     total_rows = sum(t.source.row_count for t in bundle.tables)
     slot_fk_count = sum(1 for fk in rel.foreign_keys if fk.child_slot_name is not None)
+    selected_sc = next(
+        (sc for sc in lp.scorecards if sc.candidate_id == lp.selected_candidate_id),
+        lp.scorecards[0] if lp.scorecards else None,
+    )
+    total_pii = sum(len(tp.sensitive_columns) for tp in lp.table_plans)
+
+    trial_summary = "미실행"
+    if selected_sc is not None:
+        v = selected_sc.validation
+        if v.trial_load_executed:
+            status_lbl = "통과" if v.trial_load_ok else "실패"
+            trial_summary = (
+                f"{status_lbl} (캐스팅 실패 {v.cast_failure_count}건, "
+                f"PK 위반 {v.pk_violation_count}건, FK 고아 {v.fk_violation_count}건, "
+                f"손실률 {v.data_loss_rate:.2%})"
+            )
+        else:
+            trial_summary = f"미실행 (FK 고아 관측 {v.fk_violation_count}건)"
 
     lines: list[str] = [
         "# AutomaticETL 다중 테이블 결정론적 분석 및 DB 적재 계획 리포트",
@@ -1180,6 +1751,8 @@ def render_analysis_report(bundle: MultiTableAnalysisBundle) -> str:
         f"- **입력 테이블 수**: {len(bundle.tables)}개 (총 {total_rows:,}행)",
         f"- **탐지된 교차 FK 관계**: {len(rel.foreign_keys)}건 "
         f"(규칙 문자열 숨은 슬롯 FK {slot_fk_count}건 포함)",
+        f"- **DuckDB 시험 적재 검증**: {trial_summary}",
+        f"- **탐지된 민감(PII) 컬럼**: {total_pii}건",
         "- **AI/LLM 사용 여부**: 미사용 (100% 결정론적 통계·규칙 엔진)",
         "",
     ]
@@ -1197,9 +1770,9 @@ def render_analysis_report(bundle: MultiTableAnalysisBundle) -> str:
             "",
             (
                 "| 순위 | 후보 ID | 패턴 | 무결성 | 중복도 | 용도적합 | "
-                "적재단순 | 확장성 | 가중총점 | DDL 검증 |"
+                "적재단순 | 확장성 | 가중총점 | DDL 검증 | 시험 적재 |"
             ),
-            "|---:|---|---|---:|---:|---:|---:|---:|---:|---|",
+            "|---:|---|---|---:|---:|---:|---:|---:|---:|---|---|",
         ]
     )
     cand_by_id = {c.id: c for c in lp.candidates}
@@ -1207,11 +1780,19 @@ def render_analysis_report(bundle: MultiTableAnalysisBundle) -> str:
         cand = cand_by_id[sc.candidate_id]
         mark = " **★**" if sc.candidate_id == lp.selected_candidate_id else ""
         ddl_mark = "통과" if sc.validation.ddl_parse_ok else "실패"
+        if not sc.validation.trial_load_executed:
+            trial_mark = "미실행"
+        elif sc.validation.trial_load_ok:
+            trial_mark = "통과"
+        else:
+            issues = sc.validation.constraint_violation_count + sc.validation.cast_failure_count
+            trial_mark = f"실패 ({issues}건)"
         lines.append(
             f"| {rank} | `{sc.candidate_id}`{mark} | `{cand.pattern.value}` | "
             f"{sc.integrity.score:.1f} | {sc.redundancy.score:.1f} | "
             f"{sc.fitness.score:.1f} | {sc.load_simplicity.score:.1f} | "
-            f"{sc.extensibility.score:.1f} | **{sc.weighted_total:.2f}** | {ddl_mark} |"
+            f"{sc.extensibility.score:.1f} | **{sc.weighted_total:.2f}** | "
+            f"{ddl_mark} | {trial_mark} |"
         )
     lines.append("")
 
@@ -1256,19 +1837,22 @@ def render_analysis_report(bundle: MultiTableAnalysisBundle) -> str:
     lines.append("")
 
     # 테이블별 칼럼 유형·결측치·문자열 패턴·PK 분석
+    plan_by_table = {tp.source_table: tp for tp in lp.table_plans}
     lines.extend(["## 5. 테이블별 칼럼 프로파일 · 문자열 분해 · PK 선정", ""])
     for tb in bundle.tables:
         t_name = tb.source.table_name
         pk = rel.primary_keys.get(t_name)
+        tp_info = plan_by_table.get(t_name)
+        enc_lbl = tp_info.source_encoding if tp_info is not None else "utf-8"
         lines.append(f"### `{t_name}` ({tb.source.display_name})")
         lines.append(
             f"- **규모**: {tb.source.row_count:,}행 x {tb.source.column_count}컬럼 "
-            f"(`{tb.source.source_kind.value}`)"
+            f"(`{tb.source.source_kind.value}`, 인코딩 `{enc_lbl}`)"
         )
         if pk is not None:
             if pk.recommend_surrogate:
                 lines.append(
-                    f"- **권고 PK**: 서로게이트 키 `{pk.surrogate_column_name}` "
+                    f"- **권고 PK**: 서로게이트 IDENTITY 키 `{pk.surrogate_column_name}` "
                     f"(사유: {'; '.join(pk.reasons)})"
                 )
             else:
@@ -1276,6 +1860,12 @@ def render_analysis_report(bundle: MultiTableAnalysisBundle) -> str:
                 lines.append(
                     f"- **권고 PK**: {pk_label} (점수 {pk.score:.1f}, "
                     f"피참조 {pk.referenced_by_count}건 — {'; '.join(pk.reasons)})"
+                )
+            alt_labels = [", ".join(f"`{c}`" for c in ak) for ak in pk.alternative_keys[:3]]
+            if alt_labels:
+                lines.append(
+                    "- **표본 관측 유일 후보(업무 규칙 확인 후 UNIQUE 검토)**: "
+                    + "; ".join(alt_labels)
                 )
         lines.extend(
             [
@@ -1285,8 +1875,11 @@ def render_analysis_report(bundle: MultiTableAnalysisBundle) -> str:
             ]
         )
         pattern_cols: list[ColumnClassification] = []
+        sensitive_set = set(tp_info.sensitive_columns) if tp_info is not None else set()
         for cls in tb.classifications:
             note_parts: list[str] = []
+            if cls.column in sensitive_set:
+                note_parts.append("PII 민감 컬럼")
             if cls.index_meta is not None and cls.index_meta.likely_surrogate_index:
                 note_parts.append("단조 순번 인덱스")
             if cls.ordinal_order:
@@ -1335,16 +1928,29 @@ def render_analysis_report(bundle: MultiTableAnalysisBundle) -> str:
                 )
             lines.append("")
 
+    # 개인정보(PII) · 민감 컬럼 탐지 요약
+    pii_notes = [
+        (tp.target_table, note)
+        for tp in lp.table_plans
+        for note in tp.notes
+        if note.startswith("민감(PII) 컬럼")
+    ]
+    if pii_notes:
+        lines.extend(["### 개인정보(PII) · 민감 컬럼 탐지 및 마스킹 권고", ""])
+        for tbl_name, note in pii_notes:
+            lines.append(f"- `{tbl_name}` — {note}")
+        lines.append("")
+
     # 위상 적재 계획
     lines.extend(
         [
             "## 6. 최적 DB 위상 적재 계획 (Load Plan)",
             "",
             (
-                "| 순서 | 대상 테이블 | 선행 의존 테이블 | PK | 증분 전략 | "
-                "워터마크 | 기대 행수 | 권고 인덱스 수 |"
+                "| 순서 | 대상 테이블 | 원본 인코딩 | 선행 의존 테이블 | PK | 증분 전략 | "
+                "워터마크 | 기대 행수 | 민감 컬럼 | 권고 인덱스 수 |"
             ),
-            "|---:|---|---|---|---|---|---:|---:|",
+            "|---:|---|---|---|---|---|---|---:|---:|---:|",
         ]
     )
     for tp in lp.table_plans:
@@ -1352,8 +1958,9 @@ def render_analysis_report(bundle: MultiTableAnalysisBundle) -> str:
         pks = ", ".join(f"`{c}`" for c in tp.primary_key) if tp.primary_key else "-"
         wm = f"`{tp.watermark_column}`" if tp.watermark_column else "-"
         lines.append(
-            f"| {tp.load_order_index + 1} | `{tp.target_table}` | {deps} | {pks} | "
-            f"`{tp.increment_mode.value}` | {wm} | {tp.expected_row_count:,} | "
+            f"| {tp.load_order_index + 1} | `{tp.target_table}` | `{tp.source_encoding}` | "
+            f"{deps} | {pks} | `{tp.increment_mode.value}` | {wm} | "
+            f"{tp.expected_row_count:,} | {len(tp.sensitive_columns)} | "
             f"{len(tp.recommended_indexes)} |"
         )
     lines.append("")
@@ -1382,6 +1989,8 @@ def render_analysis_report(bundle: MultiTableAnalysisBundle) -> str:
     full_ddl = lp.ddl_sql.rstrip()
     if lp.index_ddl_sql.strip():
         full_ddl = f"{full_ddl}\n\n-- Recommended Indexes\n{lp.index_ddl_sql.rstrip()}"
+    if lp.comment_ddl_sql.strip():
+        full_ddl = f"{full_ddl}\n\n-- Column Comments\n{lp.comment_ddl_sql.rstrip()}"
     lines.extend(
         [
             "## 7. 검증 완료 PostgreSQL DDL (`ddl.sql`)",
@@ -1407,6 +2016,8 @@ def export_multi_table_bundle(
     ddl_content = lp.ddl_sql.rstrip() + "\n"
     if lp.index_ddl_sql.strip():
         ddl_content += "\n-- Recommended Indexes\n" + lp.index_ddl_sql.rstrip() + "\n"
+    if lp.comment_ddl_sql.strip():
+        ddl_content += "\n-- Column Comments\n" + lp.comment_ddl_sql.rstrip() + "\n"
 
     report_md = render_analysis_report(bundle)
 

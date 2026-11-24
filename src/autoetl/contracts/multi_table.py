@@ -228,6 +228,9 @@ class TableLoadStrategy(ContractModel):
 
     source_table: str
     target_table: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    source_encoding: str = Field(
+        default="utf-8", description="원본 파일에서 감지된 문자 인코딩(UTF-8/CP949/EUC-KR 등)"
+    )
     load_order_index: NonNegativeInt
     depends_on: list[str] = Field(default_factory=list)
     primary_key: list[str] = Field(default_factory=list)
@@ -238,6 +241,10 @@ class TableLoadStrategy(ContractModel):
     deduplication: DeduplicationRule
     column_mappings: list[ColumnMapping] = Field(default_factory=list)
     recommended_indexes: list[IndexRecommendation] = Field(default_factory=list)
+    sensitive_columns: list[str] = Field(
+        default_factory=list,
+        description="탐지된 개인정보·민감 컬럼 목록(원본 셀 값 미포함)",
+    )
     expected_row_count: NonNegativeInt
     notes: list[str] = Field(default_factory=list)
 
@@ -254,6 +261,7 @@ class MultiTableLoadPlan(ContractModel):
     table_plans: list[TableLoadStrategy] = Field(default_factory=list)
     ddl_sql: str = ""
     index_ddl_sql: str = ""
+    comment_ddl_sql: str = ""
     erd_mermaid: str = ""
     cycle_warnings: list[str] = Field(default_factory=list)
 

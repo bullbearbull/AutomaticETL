@@ -36,6 +36,10 @@ class TargetColumn(ContractModel):
     source_columns: list[str] = Field(min_length=1, description="원본 컬럼(들)")
     nullable: bool
     is_primary_key: bool = Field(default=False)
+    is_identity: bool = Field(
+        default=False,
+        description="PostgreSQL GENERATED ALWAYS AS IDENTITY 서로게이트 키 여부",
+    )
     foreign_key: str | None = Field(default=None, description="'다른테이블(컬럼)' 형식의 참조")
     description: str = Field(default="")
 
@@ -66,7 +70,19 @@ class ValidationSummary(ContractModel):
 
     ddl_parse_ok: bool
     trial_load_ok: bool
+    trial_load_executed: bool = Field(
+        default=False, description="DuckDB 기반 실제 시험 적재 수행 여부"
+    )
     constraint_violation_count: NonNegativeInt
+    cast_failure_count: NonNegativeInt = Field(
+        default=0, description="시험 적재 변환·캐스팅 실패 셀 건수"
+    )
+    pk_violation_count: NonNegativeInt = Field(
+        default=0, description="시험 적재 PK NULL/중복 위반 행 수"
+    )
+    fk_violation_count: NonNegativeInt = Field(
+        default=0, description="시험 적재 물리 FK 참조 무결성 위반(고아) 행 수"
+    )
     data_loss_rate: float = Field(ge=0, le=1, description="원본 대비 손실 비율")
 
 

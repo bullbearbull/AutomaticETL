@@ -18,7 +18,7 @@ import json
 import re
 import sqlite3
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -42,6 +42,7 @@ from autoetl.docindex.reranker import CrossEncoderReranker
 from autoetl.docindex.tokenizer import (
     build_fts5_match_expr,
     compute_outline_overlap,
+    extract_index_tokens,
     extract_query_terms,
     index_text_for_fts,
 )
@@ -140,6 +141,42 @@ class _DraftSection:
     page_end: int
     parts: list[str] = field(default_factory=list)
     table_ids: list[str] = field(default_factory=list)
+
+
+def _normalize_source_path(source_path: str) -> str:
+    """`--replace` 경로 매칭을 위한 결정론적 경로 정규화."""
+    raw = source_path.strip()
+    if not raw:
+        return raw
+    try:
+        p = Path(raw)
+        if p.exists():
+            return str(p.resolve())
+    except OSError:
+        pass
+    return raw.replace("\\", "/")
+
+
+def _expand_query_terms(
+    query: str,
+    synonyms: Mapping[str, Sequence[str]] | None = None,
+) -> list[str]:
+    """원본 질의 토큰에 선택 동의어 사전(양방향 매칭)을 반영해 FTS5 검색 토큰을 확장한다."""
+    terms = extract_query_terms(query)
+    if not synonyms or not query.strip():
+        return terms
+    low_q = query.lower()
+    seen = set(terms)
+    expanded = list(terms)
+    for head, aliases in synonyms.items():
+        group = [head, *aliases]
+        if any(item.strip() and item.strip().lower() in low_q for item in group):
+            for item in group:
+                for tok in extract_query_terms(item):
+                    if tok not in seen:
+                        seen.add(tok)
+                        expanded.append(tok)
+    return expanded
 
 
 def _make_doc_id(sha256: str, source_path: str) -> str:
@@ -365,30 +402,45 @@ class DocumentIndex:
     ) -> tuple[str, bool, int, int]:
         """`ParsedDocument` 1건을 원문 섹션·목차·FTS5·표 저장소에 색인한다.
 
+        ``replace=True``이면 동일 ``sha256`` 또는 동일 ``source_path``(정규화 경로 포함)로
+        등록된 구버전 문서를 단일 트랜잭션 안에서 원자적으로 삭제 후 새 버전으로 교체한다.
+
         반환값: ``(doc_id, indexed_now, section_count, table_count)``
         """
         sha = doc.document.sha256
-        existing = self._conn.execute(
+        raw_source_path = doc.document.source_path
+        norm_source_path = _normalize_source_path(raw_source_path)
+
+        existing_sha = self._conn.execute(
             "SELECT doc_id FROM documents WHERE sha256 = ?", (sha,)
         ).fetchone()
-        if existing is not None:
-            old_id = str(existing["doc_id"])
-            if not replace:
-                return (old_id, False, 0, 0)
-            self._delete_document(old_id)
+        if existing_sha is not None and not replace:
+            return (str(existing_sha["doc_id"]), False, 0, 0)
 
-        doc_id = _make_doc_id(sha, doc.document.source_path)
-        doc_title = (doc.document.title or Path(doc.document.source_path).stem or doc_id).strip()
+        ids_to_replace: list[str] = []
+        if replace:
+            matched_rows = self._conn.execute(
+                "SELECT doc_id FROM documents "
+                "WHERE sha256 = ? OR source_path = ? OR source_path = ?",
+                (sha, raw_source_path, norm_source_path),
+            ).fetchall()
+            ids_to_replace = [str(r["doc_id"]) for r in matched_rows]
+
+        doc_id = _make_doc_id(sha, raw_source_path)
+        doc_title = (doc.document.title or Path(raw_source_path).stem or doc_id).strip()
         sections = _extract_sections_from_parsed(doc, doc_id)
 
         with self._conn:
+            for old_id in ids_to_replace:
+                self._delete_document_in_tx(old_id)
+
             self._conn.execute(
                 "INSERT INTO documents "
                 "(doc_id, source_path, format, sha256, title, page_count, metadata_json) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     doc_id,
-                    doc.document.source_path,
+                    raw_source_path,
                     doc.document.format.value,
                     sha,
                     doc_title,
@@ -472,7 +524,8 @@ class DocumentIndex:
 
         return (doc_id, True, len(sections), len(doc.tables))
 
-    def _delete_document(self, doc_id: str) -> None:
+    def _delete_document_in_tx(self, doc_id: str) -> None:
+        """현재 트랜잭션 안에서 문서와 연계된 FTS5·섹션·표 행을 제거한다."""
         sec_ids = [
             str(r["section_id"])
             for r in self._conn.execute(
@@ -485,12 +538,15 @@ class DocumentIndex:
                 "SELECT table_uid FROM doc_tables WHERE doc_id = ?", (doc_id,)
             ).fetchall()
         ]
+        for sid in sec_ids:
+            self._conn.execute("DELETE FROM sections_fts WHERE section_id = ?", (sid,))
+        for uid in tbl_uids:
+            self._conn.execute("DELETE FROM tables_fts WHERE table_uid = ?", (uid,))
+        self._conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+
+    def _delete_document(self, doc_id: str) -> None:
         with self._conn:
-            for sid in sec_ids:
-                self._conn.execute("DELETE FROM sections_fts WHERE section_id = ?", (sid,))
-            for uid in tbl_uids:
-                self._conn.execute("DELETE FROM tables_fts WHERE table_uid = ?", (uid,))
-            self._conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+            self._delete_document_in_tx(doc_id)
 
     def list_documents(self) -> list[IndexedDocument]:
         """인덱스에 등록된 모든 문서 요약 목록을 반환한다."""
@@ -702,9 +758,10 @@ class DocumentIndex:
         *,
         top_k: int = 5,
         doc_id: str | None = None,
+        synonyms: Mapping[str, Sequence[str]] | None = None,
     ) -> list[IndexedTableInfo]:
         """질의와 관련된 추출 표 후보를 FTS5 BM25로 탐색한다."""
-        terms = extract_query_terms(query)
+        terms = _expand_query_terms(query, synonyms)
         match_expr = build_fts5_match_expr(terms)
         if not match_expr:
             return []
@@ -746,10 +803,11 @@ class DocumentIndex:
         candidate_k: int = 20,
         doc_id: str | None = None,
         reranker: CrossEncoderReranker | None = None,
+        synonyms: Mapping[str, Sequence[str]] | None = None,
     ) -> EvidencePack:
         """2단계 원문 리트리벌(0MB FTS5 BM25+목차 → 선택 초경량 CPU ONNX 리랭커 → EvidencePack)."""
         t0 = time.perf_counter()
-        query_terms = extract_query_terms(query)
+        query_terms = _expand_query_terms(query, synonyms)
         match_expr = build_fts5_match_expr(query_terms)
         fetch_k = max(top_k, candidate_k)
 
@@ -817,12 +875,26 @@ class DocumentIndex:
             full_text = str(r["full_text"])
             table_ids: list[str] = json.loads(str(r["table_ids_json"]))
             raw_bm25 = max(0.0, -float(r["rank_score"]))
-            bm25_norm = raw_bm25 / (1.0 + raw_bm25)
-            outline_boost = compute_outline_overlap(query_terms, title, sec_path)
-            stage1_score = round(0.75 * bm25_norm + 0.25 * outline_boost, 6)
 
-            haystack = f"{title} {' '.join(sec_path)} {full_text}".lower()
+            haystack_raw = f"{title} {' '.join(sec_path)} {full_text}"
+            haystack = haystack_raw.lower()
             matched = [t for t in query_terms if t in haystack][:12]
+            outline_boost = compute_outline_overlap(query_terms, title, sec_path)
+
+            if raw_bm25 > 0.0:
+                bm25_norm = raw_bm25 / (1.0 + raw_bm25)
+            else:
+                # 소규모 코퍼스(문서 1~2건)에서는 SQLite FTS5 IDF가 음수가 되어 bm25가 0으로
+                # 잘릴 수 있으므로, 실제 어휘 커버리지 기반의 양수 정규화 보정을 적용한다.
+                haystack_tokens = set(extract_index_tokens(haystack_raw))
+                overlap = (
+                    sum(1 for t in query_terms if t in haystack_tokens) / max(len(query_terms), 1)
+                    if query_terms
+                    else 0.0
+                )
+                bm25_norm = max(0.05, 0.5 * overlap) if (matched or overlap > 0.0) else 0.0
+
+            stage1_score = round(0.75 * bm25_norm + 0.25 * outline_boost, 6)
 
             candidates.append(
                 EvidenceHit(
@@ -843,7 +915,7 @@ class DocumentIndex:
                 )
             )
 
-        mode = "fts5_bm25"
+        mode = "fts5_bm25" if candidates else "fts5_no_candidates"
         reranker_name: str | None = None
         if reranker is not None and candidates:
             passages = [f"{c.title}\n{c.full_text}" for c in candidates]
@@ -865,7 +937,9 @@ class DocumentIndex:
             reranker_name = reranker.name
 
         candidates.sort(key=lambda h: (h.final_score, h.bm25_score), reverse=True)
-        table_hits = self.search_tables(query, top_k=min(5, top_k), doc_id=doc_id)
+        table_hits = self.search_tables(
+            query, top_k=min(5, top_k), doc_id=doc_id, synonyms=synonyms
+        )
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 3)
 
         return EvidencePack(
@@ -1014,7 +1088,11 @@ def render_evidence_pack_markdown(pack: EvidencePack) -> str:
     ]
 
     if not pack.hits:
-        lines.append("일치하는 원문 섹션을 찾지 못했습니다.")
+        lines.append(
+            "일치하는 원문 섹션을 찾지 못했습니다. "
+            "(1단계 FTS5 어휘/2-gram 후보가 0건이어서 2단계 리랭커는 실행되지 않았습니다 — "
+            "동의어 사전(`--synonyms`/`synonyms`) 또는 목차 탐색(`get_outline`)을 활용해 보세요.)"
+        )
         return "\n".join(lines) + "\n"
 
     for rank, hit in enumerate(pack.hits, start=1):
@@ -1024,7 +1102,9 @@ def render_evidence_pack_markdown(pack: EvidencePack) -> str:
             if hit.page_start == hit.page_end
             else f"p.{hit.page_start}-{hit.page_end}"
         )
-        score_detail = f"final={hit.final_score:.3f}, bm25={hit.bm25_score:.2f}"
+        score_detail = f"final={hit.final_score:.3f}, bm25={hit.bm25_score:.4f}"
+        if hit.bm25_score == 0.0 and hit.final_score > 0.0:
+            score_detail += " (소규모 코퍼스 어휘 보정)"
         if hit.rerank_score is not None:
             score_detail += f", rerank={hit.rerank_score:.3f}"
         lines.extend(

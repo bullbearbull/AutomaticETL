@@ -35,14 +35,23 @@ __all__ = ["BUILTIN_DETECTORS", "EXCEL_SERIAL_MAX", "EXCEL_SERIAL_MIN"]
 # ASCII만 받아 전각 숫자가 탐지기와 정규화에서 같게 취급된다.
 _UNSIGNED_INT = re.compile(r"^\d+$", re.ASCII)
 _SIGNED_INT = re.compile(r"^[+-]?\d+$", re.ASCII)
-_DECIMAL = re.compile(r"^[₩\s]*[+-]?(\d{1,3}(,\d{3})+|\d+)(\.\d+)?[원]?[\s]*$", re.ASCII)
+_DECIMAL = re.compile(r"^[₩$\s]*[+-]?(\d{1,3}(,\d{3})+|\d+)(\.\d+)?[원]?[\s]*$", re.ASCII)
 _FLOAT = re.compile(r"^[+-]?\d+(\.\d+)?[eE][+-]?\d+$", re.ASCII)
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", re.ASCII)
 _URL = re.compile(r"^https?://\S+$", re.ASCII)
 _TIME = re.compile(r"^(\d{1,2}):(\d{2})(:(\d{2}))?$", re.ASCII)
 _TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?(\.\d+)?$", re.ASCII)
 
-BOOLEAN_TOKENS = frozenset({"y", "n", "예", "아니오", "o", "x", "true", "false"})
+BOOLEAN_PAIRS: tuple[frozenset[str], ...] = (
+    frozenset({"y", "n"}),
+    frozenset({"yes", "no"}),
+    frozenset({"예", "아니오"}),
+    frozenset({"o", "x"}),
+    frozenset({"true", "false"}),
+)
+"""허용하는 불리언 참/거짓 짝. 서로 다른 짝이 섞이면(예: {y,n,x}, {x,y}) 불리언이 아니다."""
+
+BOOLEAN_TOKENS = frozenset().union(*BOOLEAN_PAIRS)
 """불리언 유사 표기(소문자 기준). 1/0은 약한 근거라 넣지 않는다."""
 
 DATE_FORMATS = ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d")
@@ -105,13 +114,17 @@ def _detect_url(sample: ColumnSample) -> TypeGuess | None:
 
 
 def _detect_boolean(sample: ColumnSample) -> TypeGuess | None:
-    fit = _fit(sample.values, lambda v: v.lower() in BOOLEAN_TOKENS)
-    if fit <= 0.0:
+    if not sample.values:
+        return None
+    distinct = {v.strip().lower() for v in sample.values if v.strip()}
+    if not distinct or len(distinct) > 2:
+        return None
+    if not any(distinct <= pair for pair in BOOLEAN_PAIRS):
         return None
     return TypeGuess(
         physical_type=PhysicalType.BOOLEAN,
         semantic_type=SemanticType.BOOLEAN_LIKE,
-        confidence=fit,
+        confidence=1.0,
         normalization=NormalizationRule.BOOLEAN,
     )
 
@@ -205,7 +218,7 @@ def _decimal_parts(value: str) -> tuple[int, int] | None:
     """콤마·통화 기호를 뺀 (정수부 자릿수, 소수부 자릿수). 아니면 None."""
     if _DECIMAL.fullmatch(value) is None:
         return None
-    digits = value.strip().strip("₩").removesuffix("원").replace(",", "").replace(" ", "")
+    digits = value.strip().strip("₩$").removesuffix("원").replace(",", "").replace(" ", "")
     unsigned = digits.lstrip("+-")
     int_part, _, frac_part = unsigned.partition(".")
     int_digits = len(int_part.lstrip("0")) or 1  # '0.5'의 정수부는 자릿수 1로 센다

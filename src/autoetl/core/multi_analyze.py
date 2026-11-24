@@ -50,6 +50,7 @@ def analyze_tables(
             relations,
             purpose=resolved_purpose,
             decompose_strings=decompose_strings,
+            mctx=mctx,
         )
 
     warnings: list[str] = []
