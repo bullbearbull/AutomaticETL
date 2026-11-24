@@ -201,16 +201,11 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
 
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "알 수 없는 경로다."})
 
-    def do_POST(self) -> None:
-        path_only = self.path.split("?", 1)[0]
-        if path_only != "/api/parse":
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "알 수 없는 API 경로다."})
-            return
-
+    def _read_json_body(self) -> dict[str, Any] | None:
         cl_str = self.headers.get("Content-Length", "0")
         if not cl_str.isdigit():
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "유효하지 않은 Content-Length다."})
-            return
+            return None
         content_len = int(cl_str)
         if content_len <= 0 or content_len > _MAX_REQUEST_BYTES:
             max_mb = _MAX_UPLOAD_BYTES // (1024 * 1024)
@@ -218,19 +213,156 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                 {"error": f"요청 본문 크기가 허용 상한({max_mb}MB)을 초과했다."},
             )
-            return
-
+            return None
         try:
             raw_body = self.rfile.read(content_len)
             req = json.loads(raw_body.decode("utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "유효한 JSON 요청 본문이 아니다."})
-            return
-
+            return None
         if not isinstance(req, dict):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "JSON 객체 형식이 필요하다."})
+            return None
+        return req
+
+    def do_POST(self) -> None:
+        path_only = self.path.split("?", 1)[0]
+        if path_only == "/api/parse":
+            req = self._read_json_body()
+            if req is not None:
+                self._handle_parse(req)
+            return
+        if path_only == "/api/analyze-tables":
+            req = self._read_json_body()
+            if req is not None:
+                self._handle_analyze_tables(req)
+            return
+        self._send_json(HTTPStatus.NOT_FOUND, {"error": "알 수 없는 API 경로다."})
+
+    def _handle_analyze_tables(self, req: dict[str, Any]) -> None:
+        from autoetl.contracts import Purpose
+        from autoetl.core.load_planner import render_analysis_report
+        from autoetl.core.multi_analyze import analyze_tables
+        from autoetl.core.multi_context import SUPPORTED_TABLE_EXTENSIONS
+        from autoetl.core.pipeline import InputError
+
+        raw_files = req.get("files")
+        if not isinstance(raw_files, list) or not raw_files:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "분석할 테이블 파일 목록(`files`)이 1개 이상 필요하다."},
+            )
             return
 
+        raw_opts = req.get("options")
+        opts_in: dict[str, Any] = raw_opts if isinstance(raw_opts, dict) else {}
+        purpose_raw = str(opts_in.get("purpose", Purpose.OLTP.value) or Purpose.OLTP.value).lower()
+        try:
+            purpose = Purpose(purpose_raw)
+        except ValueError:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": f"지원하지 않는 분석 목적(`purpose`)이다: '{purpose_raw}'"},
+            )
+            return
+        decompose_strings = bool(opts_in.get("decompose_strings", True))
+
+        decoded_files: list[tuple[str, bytes]] = []
+        total_bytes = 0
+        seen_names: set[str] = set()
+        allowed_exts = sorted(SUPPORTED_TABLE_EXTENSIONS)
+
+        for idx, item in enumerate(raw_files):
+            if not isinstance(item, dict):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "각 파일 항목은 `filename`과 `content_base64` 객체여야 한다."},
+                )
+                return
+            filename = Path(str(item.get("filename", "")).strip()).name
+            b64_data = item.get("content_base64")
+            if not filename or not isinstance(b64_data, str) or not b64_data:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "각 항목에 파일명(`filename`)과 내용(`content_base64`)이 필요하다."},
+                )
+                return
+            ext = Path(filename).suffix.lower()
+            if ext not in SUPPORTED_TABLE_EXTENSIONS:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": f"지원하지 않는 테이블 파일 형식이다: '{ext or '(없음)'}' "
+                        f"(지원: {', '.join(allowed_exts)})"
+                    },
+                )
+                return
+            try:
+                fbytes = base64.b64decode(b64_data, validate=True)
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "파일 Base64 디코딩에 실패했다."})
+                return
+            total_bytes += len(fbytes)
+            if total_bytes > _MAX_UPLOAD_BYTES:
+                self._send_json(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    {"error": "업로드 파일 합계 크기가 50MB 상한을 초과했다."},
+                )
+                return
+            safe_name = filename
+            if safe_name in seen_names:
+                safe_name = f"{idx + 1}_{filename}"
+            seen_names.add(safe_name)
+            decoded_files.append((safe_name, fbytes))
+
+        t0 = time.perf_counter()
+        try:
+            with tempfile.TemporaryDirectory(prefix="autoetl_ui_tables_") as td:
+                td_path = Path(td)
+                in_dir = td_path / "inputs"
+                in_dir.mkdir()
+                bundle_dir = td_path / "bundle"
+                for fname, fbytes in decoded_files:
+                    (in_dir / fname).write_bytes(fbytes)
+
+                bundle = analyze_tables(
+                    sources=[in_dir],
+                    purpose=purpose,
+                    decompose_strings=decompose_strings,
+                    out_dir=bundle_dir,
+                )
+                bundle_id = self.server.bundle_store.put_zip(
+                    bundle_dir,
+                    "autoetl_multi_table_plan.zip",
+                )
+                report_md = render_analysis_report(bundle)
+
+                payload: dict[str, Any] = {
+                    "bundle_id": bundle_id,
+                    "elapsed_seconds": round(time.perf_counter() - t0, 3),
+                    "purpose": bundle.purpose.value,
+                    "selected_candidate_id": bundle.load_plan.selected_candidate_id,
+                    "tables": [tb.model_dump(mode="json") for tb in bundle.tables],
+                    "relations": bundle.relations.model_dump(mode="json"),
+                    "load_plan": bundle.load_plan.model_dump(mode="json"),
+                    "analysis_report_markdown": report_md,
+                    "warnings": list(bundle.warnings),
+                }
+            self._send_json(HTTPStatus.OK, payload)
+        except (InputError, ValueError) as exc:
+            self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
+        except Exception:
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {
+                    "error": (
+                        "다중 테이블 분석 중 내부 오류가 발생했다"
+                        "(데이터 보호를 위해 상세 원문 생략)."
+                    )
+                },
+            )
+
+    def _handle_parse(self, req: dict[str, Any]) -> None:
         filename = Path(str(req.get("filename", "")).strip()).name
         b64_data = req.get("content_base64")
         raw_opts = req.get("options")

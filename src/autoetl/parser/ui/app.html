@@ -291,6 +291,58 @@
     font-size: 13px;
     min-width: 220px;
   }
+  .mode-bar {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  .mode-btn {
+    padding: 9px 16px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--muted);
+    font-size: 13.5px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .mode-btn.active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+  .file-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    justify-content: center;
+    margin-top: 8px;
+  }
+  .file-chip {
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: var(--surface);
+    border: 1px solid #bfdbfe;
+    color: var(--accent);
+  }
+  .slot-badge {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    padding: 2px 6px;
+    margin: 2px 4px 2px 0;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--surface-alt);
+  }
+  .slot-badge.slot-var {
+    background: var(--accent-soft);
+    border-color: #bfdbfe;
+    color: var(--accent);
+  }
 </style>
 </head>
 <body>
@@ -315,6 +367,12 @@
     <div id="doctorContent"></div>
   </section>
 
+  <div class="mode-bar" id="modeBar">
+    <button class="mode-btn active" data-mode="parserModePanel" type="button">문서 파서 (Auto Parser)</button>
+    <button class="mode-btn" data-mode="etlModePanel" type="button">다중 테이블 ETL 분석 (CSV · TSV · XLSX)</button>
+  </div>
+
+  <div id="parserModePanel">
   <section class="card">
     <div class="upload-grid">
       <div class="dropzone" id="dropzone" tabindex="0">
@@ -410,6 +468,101 @@
       <div class="vis-grid" id="visualsGrid"></div>
     </div>
   </section>
+  </div>
+
+  <div id="etlModePanel" class="hidden">
+    <section class="card">
+      <div class="upload-grid">
+        <div class="dropzone" id="etlDropzone" tabindex="0">
+          <strong>연관된 CSV · TSV · XLSX 파일 여러 개를 끌어다 놓거나 선택하세요</strong>
+          <small>100% 결정론 엔진(0MB AI) · 결측치 · 칼럼 유형 · 문자열 패턴 분해 · PK/FK 관계 · 최적 DB 적재 계획</small>
+          <div class="file-chips" id="etlSelectedFiles"><span class="selected-file">선택된 파일 없음</span></div>
+          <input type="file" id="etlFileInput" class="hidden" multiple accept=".csv,.tsv,.xlsx">
+        </div>
+        <div class="opts-panel">
+          <div class="opts-grid">
+            <label class="field">
+              DB 적재 목적 (Purpose)
+              <select id="etlPurpose">
+                <option value="oltp" selected>OLTP (트랜잭션 · 3NF 정규화 우선)</option>
+                <option value="analytics">Analytics (BI 분석 · 파생 지표·인덱스 확장)</option>
+                <option value="archive">Archive (아카이브 · 최소 변환 원형 보존)</option>
+              </select>
+            </label>
+            <div style="display:flex; align-items:flex-end;">
+              <button class="btn btn-sm" id="etlClearBtn" type="button">선택 파일 초기화</button>
+            </div>
+          </div>
+          <div class="check-row">
+            <label><input type="checkbox" id="etlDecomposeStrings" checked> 규칙성 문자열 내부 분해 및 숨은 슬롯 FK 추출</label>
+          </div>
+          <div style="display:flex; gap:10px;">
+            <button class="btn btn-primary" id="etlRunBtn" type="button" style="flex:1;" disabled>다중 테이블 분석 &amp; 적재 계획 생성</button>
+            <a class="btn hidden" id="etlDownloadBtn" href="#">ETL 번들 ZIP 다운로드</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="status-banner" id="etlStatusBanner"></div>
+
+    <section class="card hidden" id="etlResultSection">
+      <div class="kpi-row" id="etlKpiRow"></div>
+      <div class="tabs" id="etlTabsBar">
+        <button class="tab-btn active" data-etl-tab="etlTabColumns" type="button">테이블 · 칼럼 분류 · 문자열 분해</button>
+        <button class="tab-btn" data-etl-tab="etlTabRelations" type="button">PK · FK 관계도 (<span id="etlFkCnt">0</span>)</button>
+        <button class="tab-btn" data-etl-tab="etlTabLoadPlan" type="button">최적 적재 계획 (Load Plan)</button>
+        <button class="tab-btn" data-etl-tab="etlTabDdl" type="button">PostgreSQL DDL</button>
+        <button class="tab-btn" data-etl-tab="etlTabReport" type="button">Mermaid ERD · 전체 리포트</button>
+      </div>
+
+      <div class="tab-panel active" id="etlTabColumns">
+        <div class="toolbar">
+          <select id="etlTableSelect" class="search-input"></select>
+          <span id="etlTableMeta" style="font-size:12.5px; color:var(--muted);"></span>
+        </div>
+        <div class="table-wrap"><table class="data-table" id="etlColumnsTable"></table></div>
+        <div id="etlPatternsBox"></div>
+      </div>
+
+      <div class="tab-panel" id="etlTabRelations">
+        <h3 style="margin-top:0; font-size:15px;">테이블 간 외래 키(FK) — 문자열 슬롯 숨은 FK 포함</h3>
+        <div class="table-wrap"><table class="data-table" id="etlFkTable"></table></div>
+        <h3 style="font-size:15px;">테이블별 최적 Primary Key 선정 결과</h3>
+        <div class="table-wrap"><table class="data-table" id="etlPkTable"></table></div>
+      </div>
+
+      <div class="tab-panel" id="etlTabLoadPlan">
+        <h3 style="margin-top:0; font-size:15px;">스키마 후보 평가표 (Scorecards)</h3>
+        <div class="table-wrap"><table class="data-table" id="etlScoreTable"></table></div>
+        <h3 style="font-size:15px;">위상 정렬 적재 순서 (부모 먼저)</h3>
+        <div class="table-wrap"><table class="data-table" id="etlOrderTable"></table></div>
+        <h3 style="font-size:15px;">주요 컬럼 변환·추출 규칙</h3>
+        <div class="table-wrap"><table class="data-table" id="etlMappingsTable"></table></div>
+      </div>
+
+      <div class="tab-panel" id="etlTabDdl">
+        <div class="toolbar">
+          <strong>검증 완료 PostgreSQL DDL (ddl.sql)</strong>
+          <button class="btn btn-sm" id="copyEtlDdlBtn" type="button">DDL 복사</button>
+        </div>
+        <pre class="code-box" id="etlDdlPre"></pre>
+      </div>
+
+      <div class="tab-panel" id="etlTabReport">
+        <div class="toolbar">
+          <strong>Mermaid ERD (erd.mmd)</strong>
+          <button class="btn btn-sm" id="copyEtlErdBtn" type="button">ERD 복사</button>
+        </div>
+        <pre class="code-box" id="etlErdPre" style="max-height:280px;"></pre>
+        <div class="toolbar" style="margin-top:14px;">
+          <strong>전체 분석 리포트 (analysis_report.md)</strong>
+          <button class="btn btn-sm" id="copyEtlReportBtn" type="button">리포트 복사</button>
+        </div>
+        <pre class="code-box" id="etlReportPre"></pre>
+      </div>
+    </section>
+  </div>
 </main>
 
 <script>
@@ -764,6 +917,345 @@ document.getElementById("parseBtn").addEventListener("click", async () => {
     }
   } catch (err) {
     showStatus("로컬 서버 통신 오류가 발생했습니다.", "error");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// Mode switcher + Multi-Table ETL UI controller (XSS-safe DOM builders only)
+let etlSelectedFiles = [];
+let etlLastResult = null;
+
+document.getElementById("modeBar").addEventListener("click", e => {
+  const btn = e.target.closest(".mode-btn");
+  if (!btn) return;
+  document.querySelectorAll(".mode-btn").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+  const target = btn.getAttribute("data-mode");
+  document.getElementById("parserModePanel").classList.toggle("hidden", target !== "parserModePanel");
+  document.getElementById("etlModePanel").classList.toggle("hidden", target !== "etlModePanel");
+});
+
+function showEtlStatus(msg, kind) {
+  const b = document.getElementById("etlStatusBanner");
+  b.className = "status-banner " + kind;
+  b.textContent = msg;
+}
+function hideEtlStatus() {
+  const b = document.getElementById("etlStatusBanner");
+  b.className = "status-banner";
+  b.textContent = "";
+}
+
+function renderEtlFileChips() {
+  const box = document.getElementById("etlSelectedFiles");
+  box.textContent = "";
+  if (etlSelectedFiles.length === 0) {
+    box.appendChild(el("span", {class: "selected-file"}, "선택된 파일 없음"));
+    document.getElementById("etlRunBtn").disabled = true;
+    return;
+  }
+  etlSelectedFiles.forEach(f => {
+    box.appendChild(el("span", {class: "file-chip"}, `${f.name} (${(f.size / 1024).toFixed(1)} KB)`));
+  });
+  document.getElementById("etlRunBtn").disabled = false;
+}
+
+function addEtlFiles(fileList) {
+  const seen = new Set(etlSelectedFiles.map(f => `${f.name}:${f.size}`));
+  for (const f of Array.from(fileList || [])) {
+    const key = `${f.name}:${f.size}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      etlSelectedFiles.push(f);
+    }
+  }
+  renderEtlFileChips();
+}
+
+const etlDz = document.getElementById("etlDropzone");
+const etlFi = document.getElementById("etlFileInput");
+etlDz.addEventListener("click", () => etlFi.click());
+etlDz.addEventListener("dragover", e => { e.preventDefault(); etlDz.classList.add("dragover"); });
+etlDz.addEventListener("dragleave", () => etlDz.classList.remove("dragover"));
+etlDz.addEventListener("drop", e => {
+  e.preventDefault();
+  etlDz.classList.remove("dragover");
+  if (e.dataTransfer && e.dataTransfer.files) addEtlFiles(e.dataTransfer.files);
+});
+etlFi.addEventListener("change", () => {
+  if (etlFi.files) addEtlFiles(etlFi.files);
+  etlFi.value = "";
+});
+document.getElementById("etlClearBtn").addEventListener("click", () => {
+  etlSelectedFiles = [];
+  renderEtlFileChips();
+});
+
+document.getElementById("etlTabsBar").addEventListener("click", e => {
+  const btn = e.target.closest(".tab-btn");
+  if (!btn) return;
+  const bar = document.getElementById("etlTabsBar");
+  bar.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+  document.querySelectorAll("#etlResultSection .tab-panel").forEach(p => p.classList.remove("active"));
+  btn.classList.add("active");
+  document.getElementById(btn.getAttribute("data-etl-tab")).classList.add("active");
+});
+
+function buildSimpleTable(tableEl, headers, rows) {
+  tableEl.textContent = "";
+  const thead = el("thead");
+  const hr = el("tr");
+  headers.forEach(h => hr.appendChild(el("th", null, h)));
+  thead.appendChild(hr);
+  tableEl.appendChild(thead);
+  const tbody = el("tbody");
+  if (rows.length === 0) {
+    const tr = el("tr");
+    const td = el("td", {colspan: String(headers.length), style: "color:var(--muted);"}, "표시할 항목이 없습니다.");
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  } else {
+    rows.forEach(r => {
+      const tr = el("tr");
+      r.forEach(cell => tr.appendChild(el("td", null, cell)));
+      tbody.appendChild(tr);
+    });
+  }
+  tableEl.appendChild(tbody);
+}
+
+function renderEtlTableColumns(idx) {
+  const tables = (etlLastResult && etlLastResult.tables) || [];
+  const tb = tables[idx];
+  if (!tb) return;
+  const pkMap = (etlLastResult.relations && etlLastResult.relations.primary_keys) || {};
+  const pk = pkMap[tb.source.table_name];
+  const pkText = pk
+    ? (pk.recommend_surrogate ? `서로게이트 PK(${pk.surrogate_column_name})` : `PK(${(pk.columns || []).join(", ")})`)
+    : "-";
+  document.getElementById("etlTableMeta").textContent =
+    `${tb.source.display_name} · ${tb.source.row_count}행 × ${tb.source.column_count}컬럼 · ${pkText}`;
+
+  const rows = (tb.classifications || []).map(c => {
+    const notes = [];
+    if (c.index_meta && c.index_meta.likely_surrogate_index) notes.push("단조 순번 인덱스");
+    if (c.ordinal_order && c.ordinal_order.length) notes.push("서열: " + c.ordinal_order.slice(0, 5).join(" < "));
+    if (c.string_pattern) notes.push("패턴: " + c.string_pattern.template);
+    return [
+      c.column,
+      c.physical_type,
+      c.category,
+      `${c.missing_count} (${(c.missing_rate * 100).toFixed(1)}%)`,
+      String(c.unique_count),
+      Number(c.cardinality_ratio || 0).toFixed(2),
+      notes.join(" · ") || "-",
+    ];
+  });
+  buildSimpleTable(
+    document.getElementById("etlColumnsTable"),
+    ["컬럼", "물리 타입", "정밀 유형", "결측치", "고유값 수", "기수성", "세부 정보"],
+    rows
+  );
+
+  const pBox = document.getElementById("etlPatternsBox");
+  pBox.textContent = "";
+  const patCols = (tb.classifications || []).filter(c => c.string_pattern);
+  if (patCols.length > 0) {
+    pBox.appendChild(el("h3", {style: "font-size:14.5px; margin:14px 0 8px;"}, "규칙성 문자열 내부 구조 분해"));
+    patCols.forEach(c => {
+      const sp = c.string_pattern;
+      const card = el("div", {class: "chunk-card"});
+      const hdr = el("div", {class: "chunk-meta"});
+      hdr.appendChild(el("strong", null, c.column));
+      hdr.appendChild(el("span", null, `템플릿: ${sp.template}`));
+      hdr.appendChild(el("span", null, `전략: ${sp.strategy}`));
+      hdr.appendChild(el("span", null, `일치율: ${(sp.coverage * 100).toFixed(1)}%`));
+      card.appendChild(hdr);
+      const segRow = el("div");
+      (sp.segments || []).forEach(seg => {
+        if (seg.kind === "literal") {
+          segRow.appendChild(el("span", {class: "slot-badge"}, `고정: "${seg.literal_value}"`));
+        } else {
+          segRow.appendChild(
+            el("span", {class: "slot-badge slot-var"}, `슬롯 {${seg.slot_name}} (${seg.slot_category || "-"}, 고유 ${seg.unique_count})`)
+          );
+        }
+      });
+      card.appendChild(segRow);
+      pBox.appendChild(card);
+    });
+  }
+}
+
+function renderEtlResult(data) {
+  etlLastResult = data;
+  document.getElementById("etlResultSection").classList.remove("hidden");
+  const dl = document.getElementById("etlDownloadBtn");
+  if (data.bundle_id) {
+    dl.href = "/api/download/" + encodeURIComponent(data.bundle_id);
+    dl.classList.remove("hidden");
+  }
+
+  const tables = data.tables || [];
+  const fks = (data.relations && data.relations.foreign_keys) || [];
+  const slotFks = fks.filter(f => f.child_slot_name).length;
+  const lp = data.load_plan || {};
+  const totalRows = tables.reduce((acc, t) => acc + (t.source ? t.source.row_count : 0), 0);
+
+  const kpiRow = document.getElementById("etlKpiRow");
+  kpiRow.textContent = "";
+  [
+    ["테이블 수", `${tables.length}개`],
+    ["총 행 수", `${totalRows.toLocaleString()}행`],
+    ["탐지 FK (슬롯 FK)", `${fks.length}건 (${slotFks}건)`],
+    ["선택 스키마 후보", lp.selected_candidate_id || "-"],
+    ["적재 목적", String(data.purpose || "").toUpperCase()],
+    ["소요 시간", `${(data.elapsed_seconds || 0).toFixed(2)}s`],
+  ].forEach(([lbl, val]) => {
+    const k = el("div", {class: "kpi"});
+    k.appendChild(el("div", {class: "lbl"}, lbl));
+    k.appendChild(el("div", {class: "val"}, val));
+    kpiRow.appendChild(k);
+  });
+  document.getElementById("etlFkCnt").textContent = String(fks.length);
+
+  // Table selector
+  const tSel = document.getElementById("etlTableSelect");
+  tSel.textContent = "";
+  tables.forEach((tb, idx) => {
+    tSel.appendChild(el("option", {value: String(idx)}, `${tb.source.table_name} (${tb.source.row_count}행 × ${tb.source.column_count}열)`));
+  });
+  if (tables.length > 0) renderEtlTableColumns(0);
+
+  // FK table
+  buildSimpleTable(
+    document.getElementById("etlFkTable"),
+    ["자식 테이블", "자식 컬럼 / 슬롯", "기수성", "부모 테이블", "부모 컬럼", "포함률", "고아행", "신뢰도"],
+    fks.map(fk => [
+      fk.child_table,
+      fk.child_slot_name ? `${fk.child_columns.join(", ")} → 슬롯(${fk.child_slot_name})` : fk.child_columns.join(", "),
+      fk.cardinality,
+      fk.parent_table,
+      fk.parent_columns.join(", "),
+      `${(fk.inclusion_rate * 100).toFixed(1)}%`,
+      String(fk.orphan_rows || 0),
+      Number(fk.confidence || 0).toFixed(2),
+    ])
+  );
+
+  // PK table
+  const pks = Object.values((data.relations && data.relations.primary_keys) || {});
+  buildSimpleTable(
+    document.getElementById("etlPkTable"),
+    ["테이블", "권고 PK", "유형", "피참조 수", "점수", "선정 근거"],
+    pks.map(pk => [
+      pk.table_name,
+      pk.recommend_surrogate ? pk.surrogate_column_name : (pk.columns || []).join(", "),
+      pk.recommend_surrogate ? "서로게이트 키" : (pk.is_composite ? "복합 PK" : "단일 PK"),
+      String(pk.referenced_by_count || 0),
+      Number(pk.score || 0).toFixed(1),
+      (pk.reasons || []).join("; "),
+    ])
+  );
+
+  // Scorecards
+  buildSimpleTable(
+    document.getElementById("etlScoreTable"),
+    ["후보 ID", "무결성", "중복도", "용도적합", "적재단순", "확장성", "가중총점", "DDL 검증"],
+    (lp.scorecards || []).map(sc => [
+      sc.candidate_id + (sc.candidate_id === lp.selected_candidate_id ? " ★" : ""),
+      sc.integrity.score.toFixed(1),
+      sc.redundancy.score.toFixed(1),
+      sc.fitness.score.toFixed(1),
+      sc.load_simplicity.score.toFixed(1),
+      sc.extensibility.score.toFixed(1),
+      sc.weighted_total.toFixed(2),
+      sc.validation && sc.validation.ddl_parse_ok ? "통과" : "실패",
+    ])
+  );
+
+  // Load order
+  buildSimpleTable(
+    document.getElementById("etlOrderTable"),
+    ["순서", "대상 테이블", "선행 의존", "PK", "증분 전략", "워터마크", "기대 행수", "권고 인덱스"],
+    (lp.table_plans || []).map(tp => [
+      String(tp.load_order_index + 1),
+      tp.target_table,
+      (tp.depends_on || []).join(", ") || "-",
+      (tp.primary_key || []).join(", ") || "-",
+      tp.increment_mode,
+      tp.watermark_column || "-",
+      String(tp.expected_row_count),
+      String((tp.recommended_indexes || []).length),
+    ])
+  );
+
+  // Non-identity mappings
+  const maps = [];
+  (lp.table_plans || []).forEach(tp => {
+    (tp.column_mappings || []).forEach(m => {
+      if (m.transform !== "identity") {
+        maps.push([m.target_table, m.target_column, m.source_column, m.transform, m.type_cast, m.null_handling]);
+      }
+    });
+  });
+  buildSimpleTable(
+    document.getElementById("etlMappingsTable"),
+    ["대상 테이블", "대상 컬럼", "원본 컬럼", "변환/추출식", "타입", "결측 정책"],
+    maps
+  );
+
+  const fullDdl = (lp.ddl_sql || "").trim() +
+    (lp.index_ddl_sql && lp.index_ddl_sql.trim() ? "\n\n-- Recommended Indexes\n" + lp.index_ddl_sql.trim() : "");
+  document.getElementById("etlDdlPre").textContent = fullDdl;
+  document.getElementById("etlErdPre").textContent = lp.erd_mermaid || "";
+  document.getElementById("etlReportPre").textContent = data.analysis_report_markdown || "";
+}
+
+document.getElementById("etlTableSelect").addEventListener("change", e => {
+  renderEtlTableColumns(Number(e.target.value));
+});
+document.getElementById("copyEtlDdlBtn").addEventListener("click", e => {
+  copyText(document.getElementById("etlDdlPre").textContent || "", e.target);
+});
+document.getElementById("copyEtlErdBtn").addEventListener("click", e => {
+  copyText(document.getElementById("etlErdPre").textContent || "", e.target);
+});
+document.getElementById("copyEtlReportBtn").addEventListener("click", e => {
+  copyText(document.getElementById("etlReportPre").textContent || "", e.target);
+});
+
+document.getElementById("etlRunBtn").addEventListener("click", async () => {
+  if (etlSelectedFiles.length === 0) return;
+  const btn = document.getElementById("etlRunBtn");
+  btn.disabled = true;
+  showEtlStatus(`${etlSelectedFiles.length}개 파일 다중 테이블 분석 및 DB 적재 계획 생성 중...`, "info");
+  try {
+    const filesPayload = [];
+    for (const f of etlSelectedFiles) {
+      filesPayload.push({filename: f.name, content_base64: await fileToBase64(f)});
+    }
+    const res = await fetch("/api/analyze-tables", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        files: filesPayload,
+        options: {
+          purpose: document.getElementById("etlPurpose").value,
+          decompose_strings: document.getElementById("etlDecomposeStrings").checked,
+        },
+      }),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      showEtlStatus(body.error || "다중 테이블 분석에 실패했습니다.", "error");
+    } else {
+      hideEtlStatus();
+      renderEtlResult(body);
+    }
+  } catch (err) {
+    showEtlStatus("로컬 서버 통신 오류가 발생했습니다.", "error");
   } finally {
     btn.disabled = false;
   }

@@ -12,8 +12,8 @@ import sys
 from pathlib import Path
 
 from autoetl import __version__
-from autoetl.contracts import Purpose, Report
-from autoetl.core.pipeline import InputError, run_pipeline
+from autoetl.contracts import Purpose
+from autoetl.core.pipeline import InputError
 
 
 def _targets_same_file(out: Path, source: Path) -> bool:
@@ -29,50 +29,78 @@ def _targets_same_file(out: Path, source: Path) -> bool:
 
 
 def _run_analyze(args: argparse.Namespace) -> int:
-    if not args.no_llm:
-        print("v0은 --no-llm 경로만 지원한다. LLM 하네스는 P2에서 연결된다.", file=sys.stderr)
-        return 2
-    if not args.file.exists():
-        print(f"입력 파일이 없다: {args.file}", file=sys.stderr)
-        return 2
-    if args.out is not None and _targets_same_file(args.out, args.file):
-        print("--out이 입력 파일과 같은 파일이다. 원본을 덮어쓰지 않는다.", file=sys.stderr)
-        return 2
+    from autoetl.core.load_planner import export_multi_table_bundle, render_analysis_report
+    from autoetl.core.multi_analyze import analyze_tables
+
+    inputs: list[Path] = list(args.files)
+    for src in inputs:
+        if not src.exists():
+            print(f"입력 파일 또는 폴더가 없다: {src}", file=sys.stderr)
+            return 2
+        if args.out is not None and _targets_same_file(args.out, src):
+            print("--out이 입력 경로와 같다. 원본을 덮어쓰지 않는다.", file=sys.stderr)
+            return 2
 
     try:
-        result = run_pipeline(args.file, purpose=Purpose(args.purpose))
+        bundle = analyze_tables(
+            sources=inputs,
+            purpose=Purpose(args.purpose),
+            decompose_strings=not args.no_decompose_strings,
+            recursive=not args.no_recursive,
+        )
     except UnicodeDecodeError:
-        # 예외 원문(값이 포함된 메시지)은 내보내지 않는다(금지 패턴 6).
         print(
-            "입력 파일을 UTF-8 텍스트로 읽을 수 없다. "
-            "다른 인코딩·형식 지원은 P1(결정론 엔진)에서 추가된다.",
+            "입력 파일 인코딩을 해독할 수 없다. UTF-8/CP949/EUC-KR CSV·TSV·XLSX를 확인하라.",
             file=sys.stderr,
         )
         return 1
     except InputError as exc:
-        # 입력 문제만 안내 메시지를 낸다(메시지에 셀 값이 없음이 보장된다).
         print(f"입력을 처리할 수 없다: {exc}", file=sys.stderr)
         return 1
     except Exception:
-        # 그 밖의 예외(ValidationError 포함)는 원문을 내보내지 않고 고정 문구만
-        # 낸다. 이후 단계가 값을 담은 ValueError를 던져도 새어 나갈 수 없다
-        # (금지 패턴 1·6). 실제 데이터 값은 공개 이슈 트래커로 보내지 않는다
-        # (정책 1.2절 — 데이터 L2·L3 원문은 저장소 밖으로 나갈 수 없다).
         print(
-            "파이프라인이 내부 오류로 끝났다(상세 원문은 표시하지 않는다). "
-            "이슈에는 실제 데이터 파일을 첨부하지 말고 실행 명령·autoetl 버전·"
-            "컬럼 수·헤더 형태(이름 형태만)를 알려달라.",
+            "분석 파이프라인이 내부 오류로 끝났다(데이터 보호를 위해 상세 원문은 표시하지 않는다). "
+            "실행 명령·autoetl 버전·파일 형식·컬럼 구조 정보만 확인해 달라.",
             file=sys.stderr,
         )
         return 3
-    report: Report = result.report
-    payload = report.model_dump_json(indent=2)
+
+    lp = bundle.load_plan
     if args.out is not None:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(payload + "\n", encoding="utf-8")
-        print(f"보고서: {args.out} ({report.pipeline_version}, {report.sop_version})")
+        out_path: Path = args.out
+        if out_path.suffix.lower() == ".json":
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(bundle.model_dump_json(indent=2) + "\n", encoding="utf-8")
+            print(
+                f"분석 번들 JSON 저장 완료: {out_path} "
+                f"(테이블 {len(bundle.tables)}개, FK {len(bundle.relations.foreign_keys)}건, "
+                f"후보 {lp.selected_candidate_id})"
+            )
+        else:
+            written = export_multi_table_bundle(bundle, out_path)
+            slot_fk_cnt = sum(
+                1 for fk in bundle.relations.foreign_keys if fk.child_slot_name is not None
+            )
+            print(
+                f"다중 테이블 분석 완료: 테이블 {len(bundle.tables)}개, "
+                f"FK {len(bundle.relations.foreign_keys)}건(숨은 슬롯 FK {slot_fk_cnt}건), "
+                f"선택 후보 {lp.selected_candidate_id} ({bundle.purpose.value})"
+            )
+            for label, fpath in written.items():
+                print(f"- {label}: {fpath}")
+        return 0
+
+    if args.format == "json":
+        print(bundle.model_dump_json(indent=2))
+    elif args.format == "ddl":
+        ddl_out = lp.ddl_sql.rstrip()
+        if lp.index_ddl_sql.strip():
+            ddl_out += "\n\n-- Recommended Indexes\n" + lp.index_ddl_sql.rstrip()
+        print(ddl_out)
+    elif args.format == "erd":
+        print(lp.erd_mermaid, end="")
     else:
-        print(payload)
+        print(render_analysis_report(bundle), end="")
     return 0
 
 
@@ -367,21 +395,54 @@ def main(argv: list[str] | None = None) -> int:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    analyze = subparsers.add_parser("analyze", help="정형 파일(CSV)을 분석해 보고서를 낸다")
-    analyze.add_argument("file", type=Path, help="입력 파일(CSV — 인코딩 자동 감지)")
+    analyze = subparsers.add_parser(
+        "analyze",
+        help=(
+            "정형 파일·폴더(CSV·TSV·XLSX)의 칼럼 분류·문자열 분해·"
+            "PK/FK 관계·최적 DB 적재 계획을 생성한다"
+        ),
+    )
     analyze.add_argument(
-        "--no-llm",
-        action="store_true",
-        help="LLM 없이 규칙·스텁만 실행 (v0은 이 경로만 지원)",
+        "files",
+        nargs="+",
+        type=Path,
+        help="입력 파일(CSV·TSV·XLSX) 또는 폴더(복수 지정 가능)",
     )
     analyze.add_argument(
         "--purpose",
         choices=[purpose.value for purpose in Purpose],
-        default=Purpose.ANALYTICS.value,
-        help="용도(채점 가중치 기준)",
+        default=Purpose.OLTP.value,
+        help="DB 적재 용도(기본: oltp — 채점 가중치·인덱스·파티셔닝 기준)",
     )
     analyze.add_argument(
-        "--out", type=Path, default=None, help="보고서 JSON 파일 경로(기본: stdout)"
+        "--out",
+        type=Path,
+        default=None,
+        help=(
+            "번들 저장 폴더(ddl.sql, load_plan.json, relations.json, "
+            "erd.mmd, analysis_report.md) 또는 .json 파일"
+        ),
+    )
+    analyze.add_argument(
+        "--format",
+        choices=["report", "json", "ddl", "erd"],
+        default="report",
+        help="--out 미지정 시 stdout 출력 형식(기본: report)",
+    )
+    analyze.add_argument(
+        "--no-decompose-strings",
+        action="store_true",
+        help="규칙성 문자열의 가변 슬롯 컬럼 분리·숨은 FK 구체화 비활성화",
+    )
+    analyze.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="폴더 입력 시 하위 디렉터리 재귀 탐색 비활성화",
+    )
+    analyze.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="호환용 플래그(결정론 분석 엔진은 기본적으로 0MB AI/LLM 없이 동작)",
     )
 
     parse = subparsers.add_parser(

@@ -2,6 +2,18 @@
 
 이 문서는 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/) 형식을 따릅니다.
 
+## [Unreleased]
+
+### Added
+
+- **결정론 다중 테이블 ETL 분석·관계도·최적 DB 적재 계획 엔진 (0MB AI, Milestones E1–E5)**:
+  - 다중 파일·다중 시트 격리 DuckDB 컨텍스트(`MultiTableContext`): CSV·TSV·다중 시트 XLSX·메모리 표를 단일 잠금 DuckDB 세션의 스키마별(`t0..tN`) 테이블로 일괄 적재
+  - 10종 정밀 칼럼 유형 분류 및 S4 심화 통계(`s04_stats`, `column_classifier`): 인덱스/순번, 이산·연속 수치형, 명목·서열 범주형, 날짜(한국어 날짜 포함), 규칙 문자열, 코드, 자유 텍스트, 불리언 및 결측치 프로파일링
+  - 결정론 규칙 문자열 내부 분해기(`analyze_string_pattern`): 공통 고정부와 가변 슬롯 분리, 슬롯별 세부 유형·정규식·DuckDB/PostgreSQL `regexp_extract` 추출식 생성
+  - 내부·교차 테이블 관계 분석 및 최적 PK 선정(`relations_multi`, `pk_selector`): FD·상관·산술 파생·범주 계층, 테이블 간 FK(규칙 문자열 가변 슬롯 속 숨은 FK 포함), 피참조 횟수 기반 단일/복합 PK 및 서로게이트 키 권고
+  - 최적 DB 스키마 채점·위상 적재 플랜·번들 내보내기(`load_planner`, `analyze_tables`): 목적(`oltp`/`analytics`/`archive`)별 후보 채점, `sqlglot` 재파싱 검증 PostgreSQL DDL + 인덱스 DDL, Kahn 위상 적재 순서, `UPSERT`/`WATERMARK`/`APPEND` 증분 전략, Mermaid ERD(`erd.mmd`) 및 한국어 분석 리포트(`analysis_report.md`)
+  - CLI(`autoetl analyze <dir|files...> --out ./etl_plan`), 최상위 Python SDK(`autoetl.analyze_tables`), 로컬 웹 UI(`autoetl ui` 다중 테이블 ETL 분석 모드 + `/api/analyze-tables` + ZIP 다운로드)
+
 ## [0.1.0-beta.1] — 2026-11-23 (`0.1.0b1`)
 
 Auto Parser 중심의 첫 번째 베타 릴리스.

@@ -8,6 +8,11 @@ from typing import TYPE_CHECKING, Any
 __version__ = "0.1.0b1"
 
 if TYPE_CHECKING:
+    from autoetl.contracts import MultiTableAnalysisBundle, Purpose
+    from autoetl.core.load_planner import export_multi_table_bundle, render_analysis_report
+    from autoetl.core.multi_analyze import analyze_tables
+    from autoetl.core.multi_context import MultiTableContext, NamedTableInput
+    from autoetl.core.string_pattern import analyze_string_pattern
     from autoetl.doctor import DoctorCheck, DoctorReport, collect_doctor_report
     from autoetl.parser import (
         BatchManifest,
@@ -40,13 +45,20 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "DocumentChunk": ("autoetl.parser", "DocumentChunk"),
     "ExportManifest": ("autoetl.parser", "ExportManifest"),
     "LocalParserUiServer": ("autoetl.parser.ui", "LocalParserUiServer"),
+    "MultiTableAnalysisBundle": ("autoetl.contracts", "MultiTableAnalysisBundle"),
+    "MultiTableContext": ("autoetl.core.multi_context", "MultiTableContext"),
+    "NamedTableInput": ("autoetl.core.multi_context", "NamedTableInput"),
     "ParseOptions": ("autoetl.parser", "ParseOptions"),
     "ParsedDocument": ("autoetl.parser", "ParsedDocument"),
+    "Purpose": ("autoetl.contracts", "Purpose"),
     "RoutingPlan": ("autoetl.parser", "RoutingPlan"),
+    "analyze_string_pattern": ("autoetl.core.string_pattern", "analyze_string_pattern"),
+    "analyze_tables": ("autoetl.core.multi_analyze", "analyze_tables"),
     "chunk_document": ("autoetl.parser", "chunk_document"),
     "collect_doctor_report": ("autoetl.doctor", "collect_doctor_report"),
     "create_ui_server": ("autoetl.parser.ui", "create_ui_server"),
     "export_bundle": ("autoetl.parser", "export_parse_bundle"),
+    "export_multi_table_bundle": ("autoetl.core.load_planner", "export_multi_table_bundle"),
     "export_parse_bundle": ("autoetl.parser", "export_parse_bundle"),
     "inspect": ("autoetl.parser", "inspect_document"),
     "inspect_document": ("autoetl.parser", "inspect_document"),
@@ -54,6 +66,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "parse_and_export": ("autoetl.parser", "parse_and_export"),
     "parse_batch": ("autoetl.parser", "parse_batch"),
     "parse_document": ("autoetl.parser", "parse_document"),
+    "render_analysis_report": ("autoetl.core.load_planner", "render_analysis_report"),
     "serve_ui": ("autoetl.parser.ui", "serve_ui"),
     "supported_extensions": ("autoetl.parser", "supported_extensions"),
 }
@@ -66,14 +79,21 @@ __all__ = [
     "DocumentChunk",
     "ExportManifest",
     "LocalParserUiServer",
+    "MultiTableAnalysisBundle",
+    "MultiTableContext",
+    "NamedTableInput",
     "ParseOptions",
     "ParsedDocument",
+    "Purpose",
     "RoutingPlan",
     "__version__",
+    "analyze_string_pattern",
+    "analyze_tables",
     "chunk_document",
     "collect_doctor_report",
     "create_ui_server",
     "export_bundle",
+    "export_multi_table_bundle",
     "export_parse_bundle",
     "inspect",
     "inspect_document",
@@ -81,6 +101,7 @@ __all__ = [
     "parse_and_export",
     "parse_batch",
     "parse_document",
+    "render_analysis_report",
     "serve_ui",
     "supported_extensions",
 ]

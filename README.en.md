@@ -11,7 +11,7 @@ Deterministic code extracts digital text and native tables from PDF, Microsoft O
 
 > Status: **`v0.1.0-beta.1`** (installable from Git; not yet on PyPI).
 > - **Document parser (`parse`, `ui`, `doctor`)**: ready to use across 8 formats, with RAG chunking, folder batching, a local web UI, and optional ONNX layout / OCR-VLM backends.
-> - **Structured ETL (`analyze`)**: early `--no-llm` CSV prototype; LLM harness and PostgreSQL DDL integration are in progress.
+> - **Deterministic Structured ETL (`analyze`, `ui`)**: zero-AI (0MB) multi-file CSV/TSV/XLSX analysis — missing values, 10-role column classification, structured string pattern decomposition, cross-table FKs (including hidden string-slot FKs), optimal PK selection, verified PostgreSQL DDL, Mermaid ERD, and topological Load Plan.
 
 ---
 
@@ -25,9 +25,9 @@ Instead of sending every page to an expensive VLM, AutoETL runs a format-native 
 
 | Stage | What it does | Supported models & backends | CLI flags |
 | --- | --- | --- | --- |
+| **Deterministic Structured ETL** *(0MB AI)* | Multi-file CSV/TSV/XLSX profiling, 10-role column typing, string pattern decomposition, internal/cross-table FKs, PK selection, verified PostgreSQL DDL & topological Load Plan | **No AI model required** (sandboxed DuckDB + `sqlglot` DDL verification + deterministic stats/regex engine) | `autoetl analyze <dir\|files...> --out ./etl_plan` |
 | **AI 1 — Layout Object Detection** | Splits scanned PDFs or image slides into typed regions (tables, charts, formulas, text) before OCR/VLM | **ONNX** (`onnxruntime`): `PP-DocLayoutV2`, `PP-DocLayoutV3`, `PP-DocLayout_plus-L`, `DocLayNet`, `PubLayNet`<br>**HTTP**: local/internal layout detection service<br>*(Built-in `heuristic` pixel detector works with zero model files)* | `--layout-detector onnx\|http\|heuristic`<br>`--layout-label-preset` |
 | **AI 2 — OCR & VLM Understanding** | Converts cropped scans, charts, diagrams, and equations into Markdown and tables | **Specialized OCR-VLMs** *(auto-detected from model name with built-in task prompts)*: `PaddleOCR-VL` (0.9B), `GLM-OCR` (0.9B), `DeepSeek-OCR` (3B)<br>**General VLMs**: any Vision model on Ollama / vLLM / llama-server / LM Studio (e.g. `Qwen2.5-VL`), or external OpenAI-compatible APIs (`gpt-4o`)<br>**Hybrid**: routes plain text scans to local `Tesseract` and only charts/figures to VLM | `--vision ollama\|openai-compat\|hybrid\|tesseract`<br>`--vision-model`<br>`--vision-prompt-preset auto` |
-| **AI 3 — Structured ETL LLM Harness** *(WIP)* | Assists semantic naming and schema selection on top of deterministic DuckDB profiling & FD analysis | Closed Pydantic-contract LLM harness (planned; v0 currently runs `--no-llm` only) | `autoetl analyze --no-llm` |
 
 - Lightweight OCR-VLMs (`PaddleOCR-VL`, `GLM-OCR`, `DeepSeek-OCR`) are detected automatically from `--vision-model`, switching to their official short task triggers (`OCR:`, `Table Recognition:`, etc.) and output cleaners.
 - Only loopback (`127.0.0.1`) and registered internal endpoints are allowed by default. Sending crops to an external API requires `--allow-external-vision` and an env var name (`--vision-api-key-env`).
@@ -54,7 +54,30 @@ uv sync
 
 ## Usage
 
-### 1. Parse a single file (default offline mode)
+### 1. Multi-table deterministic ETL analysis & DB load planning (0MB AI)
+
+Pass multiple CSV/TSV/XLSX files or a directory to inspect column roles, missingness, structured string decompositions (literal parts vs variable slots), cross-table FKs (including hidden FKs inside string slots), optimal PKs, verified PostgreSQL DDL, and a topological Load Plan:
+
+```bash
+autoetl analyze ./sales_data --purpose oltp --out ./etl_plan
+autoetl analyze branches.csv customers.csv orders.xlsx --purpose analytics --out ./etl_plan
+autoetl analyze ./sales_data --format ddl   # verified PostgreSQL DDL to stdout
+autoetl analyze ./sales_data --format erd   # Mermaid ERD to stdout
+```
+
+Writing to `--out ./etl_plan` produces 6 files:
+
+```text
+etl_plan/
+├── ddl.sql              # sqlglot-verified PostgreSQL CREATE TABLE + INDEX statements
+├── load_plan.json       # topological load order, UPSERT/WATERMARK/APPEND policies & column transforms
+├── relations.json       # internal FDs/correlations/derivations/hierarchies, cross-table FKs & PK scores
+├── analysis_bundle.json # complete typed analysis contract JSON
+├── erd.mmd              # Mermaid erDiagram
+└── analysis_report.md   # full analysis report in Markdown
+```
+
+### 2. Parse a single document (default offline mode)
 
 ```bash
 autoetl parse report.pdf --out ./out
@@ -81,7 +104,7 @@ autoetl parse report.pdf --format markdown # Markdown to stdout
 autoetl parse report.pdf --format chunks   # JSONL chunks to stdout
 ```
 
-### 2. Attach AI models for scanned pages & charts
+### 3. Attach AI models for scanned pages & charts
 
 ```bash
 # Recommended 2-stage local stack: PP-DocLayoutV2 (ONNX) → PaddleOCR-VL-1.6
@@ -101,7 +124,7 @@ autoetl parse report.pdf --vision openai-compat --vision-model gpt-4o \
   --allow-external-vision --out ./out
 ```
 
-### 3. Batch-parse a folder
+### 4. Batch-parse a folder
 
 Pass a directory to recursively discover and parse all supported files:
 
@@ -113,19 +136,24 @@ autoetl parse ./docs --out ./batch_out --workers 4 --resume
 - `--resume` skips files whose SHA-256 already succeeded in a prior run.
 - Produces `batch_summary.md`, `batch_manifest.json`, and a merged `all_chunks.jsonl`.
 
-### 4. Local web UI
+### 5. Local web UI
 
 ```bash
 autoetl ui
 ```
 
-Starts a stdlib-only web UI on `http://127.0.0.1:8765` (loopback only by default). Drop a file to inspect Markdown, tables (with CSV/Markdown copy), searchable RAG chunks, and cropped visuals, or download the full bundle as a ZIP.
+Starts a stdlib-only web UI on `http://127.0.0.1:8765` (loopback only by default). Switch between **Document Parser** and **Multi-Table ETL Analysis** to inspect column roles, decomposed string patterns, PK/FK graphs, verified DDL, Mermaid ERD, or parsed document outputs, and download the full bundle as a ZIP.
 
-### 5. Python API
+### 6. Python API
 
 ```python
 import autoetl
 
+# Multi-table deterministic ETL analysis & DB load plan (0MB AI)
+etl = autoetl.analyze_tables(["./sales_data"], purpose="oltp", out_dir="./etl_plan")
+print(etl.load_plan.selected_candidate_id, etl.load_plan.ddl_sql)
+
+# Document parsing & chunking
 doc = autoetl.parse("notice.hwp")
 chunks = autoetl.chunk_document(doc, options=autoetl.ChunkOptions(max_chars=1500))
 manifest = autoetl.export_bundle(doc, "./out_hwp")
@@ -133,7 +161,7 @@ manifest = autoetl.export_bundle(doc, "./out_hwp")
 batch = autoetl.parse_batch("./docs", "./batch_out", workers=4, resume=True)
 ```
 
-### 6. Environment check
+### 7. Environment check
 
 ```bash
 autoetl doctor
