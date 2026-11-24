@@ -1,0 +1,68 @@
+[project]
+name = "autoetl"
+description = "결정론 분석 엔진과 LLM 하네스로 CSV·엑셀을 분석해 PostgreSQL 스키마와 적재 플랜을 만드는 로컬 ETL 도구"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "charset-normalizer>=3.5.2",
+    "duckdb>=1.5.6",
+    "pydantic>=2.5",
+    "pypdf>=5.0",
+    "pyyaml>=6.0",
+    "sqlglot>=30.30.0",
+]
+dynamic = ["version"]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "ruff>=0.8",
+    "types-pyyaml>=6.0",
+]
+
+[project.scripts]
+autoetl = "autoetl.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/autoetl"]
+
+[tool.hatch.version]
+path = "src/autoetl/__init__.py"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle 오류
+    "W",   # pycodestyle 경고
+    "F",   # pyflakes
+    "I",   # import 정렬
+    "UP",  # pyupgrade
+    "B",   # 버그 가능성
+    "C4",  # comprehension 정리
+    "SIM", # 단순화
+    "RUF", # ruff 추천 규칙
+]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = [
+    "src",
+    "tests",
+    "tools/license_check.py",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

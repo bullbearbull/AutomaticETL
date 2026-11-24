@@ -1,0 +1,23 @@
+# 로컬 개발·에이전트 도구 (저장소에 올리지 않음)
+.board/
+.mcp.json
+.mcp.json.example
+AGENTS.md
+CLAUDE.md
+tools/board/
+docs/PLAN.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db

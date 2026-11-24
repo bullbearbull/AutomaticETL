@@ -1,0 +1,650 @@
+"""autoetl CLI v0.
+
+    autoetl analyze <file.csv> --no-llm [--out report.json]
+
+v0은 LLM 없는 경로(--no-llm)만 지원한다. LLM 하네스 연동은 P2 이후.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from autoetl import __version__
+from autoetl.contracts import Purpose, Report
+from autoetl.core.pipeline import InputError, run_pipeline
+
+
+def _targets_same_file(out: Path, source: Path) -> bool:
+    """--out이 입력 파일을 가리키는지 검사한다.
+
+    resolve() 비교는 심볼릭 링크와 같은 경로를 잡지만 하드 링크·대소문자 무시
+    파일시스템(macOS 기본 등)의 다른 표기는 못 잡는다. samefile(아이노드 비교)을
+    함께 써서 둘 다 막는다. samefile은 양쪽 파일이 있을 때만 쓸 수 있다.
+    """
+    if out.resolve() == source.resolve():
+        return True
+    return out.exists() and source.exists() and out.samefile(source)
+
+
+def _run_analyze(args: argparse.Namespace) -> int:
+    if not args.no_llm:
+        print("v0은 --no-llm 경로만 지원한다. LLM 하네스는 P2에서 연결된다.", file=sys.stderr)
+        return 2
+    if not args.file.exists():
+        print(f"입력 파일이 없다: {args.file}", file=sys.stderr)
+        return 2
+    if args.out is not None and _targets_same_file(args.out, args.file):
+        print("--out이 입력 파일과 같은 파일이다. 원본을 덮어쓰지 않는다.", file=sys.stderr)
+        return 2
+
+    try:
+        result = run_pipeline(args.file, purpose=Purpose(args.purpose))
+    except UnicodeDecodeError:
+        # 예외 원문(값이 포함된 메시지)은 내보내지 않는다(금지 패턴 6).
+        print(
+            "입력 파일을 UTF-8 텍스트로 읽을 수 없다. "
+            "다른 인코딩·형식 지원은 P1(결정론 엔진)에서 추가된다.",
+            file=sys.stderr,
+        )
+        return 1
+    except InputError as exc:
+        # 입력 문제만 안내 메시지를 낸다(메시지에 셀 값이 없음이 보장된다).
+        print(f"입력을 처리할 수 없다: {exc}", file=sys.stderr)
+        return 1
+    except Exception:
+        # 그 밖의 예외(ValidationError 포함)는 원문을 내보내지 않고 고정 문구만
+        # 낸다. 이후 단계가 값을 담은 ValueError를 던져도 새어 나갈 수 없다
+        # (금지 패턴 1·6). 실제 데이터 값은 공개 이슈 트래커로 보내지 않는다
+        # (정책 1.2절 — 데이터 L2·L3 원문은 저장소 밖으로 나갈 수 없다).
+        print(
+            "파이프라인이 내부 오류로 끝났다(상세 원문은 표시하지 않는다). "
+            "이슈에는 실제 데이터 파일을 첨부하지 말고 실행 명령·autoetl 버전·"
+            "컬럼 수·헤더 형태(이름 형태만)를 알려달라.",
+            file=sys.stderr,
+        )
+        return 3
+    report: Report = result.report
+    payload = report.model_dump_json(indent=2)
+    if args.out is not None:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(payload + "\n", encoding="utf-8")
+        print(f"보고서: {args.out} ({report.pipeline_version}, {report.sop_version})")
+    else:
+        print(payload)
+    return 0
+
+
+def _run_parse(args: argparse.Namespace) -> int:
+    # 무거운 파서 의존성은 parse 명령이 실행될 때만 지연 import한다.
+    from autoetl.parser import (
+        ChunkOptions,
+        LibreOfficePptxRenderer,
+        ParseOptions,
+        ParserInputError,
+        VisionStatus,
+        chunk_document,
+        create_layout_detector,
+        create_vision_adapter,
+        inspect_document,
+        parse_and_export,
+        parse_batch,
+        parse_document,
+        parse_page_selection,
+        render_chunks_jsonl,
+        render_document_markdown,
+        render_routing_report_markdown,
+    )
+
+    if not args.file.exists():
+        print(f"입력 파일 또는 폴더가 없다: {args.file}", file=sys.stderr)
+        return 2
+    if args.file.is_dir() and args.out is None:
+        print("폴더 일괄 처리에는 --out <출력폴더> 지정이 필요하다.", file=sys.stderr)
+        return 2
+    if args.out is not None and _targets_same_file(args.out, args.file):
+        print("--out이 입력 경로와 같다. 원본을 덮어쓰지 않는다.", file=sys.stderr)
+        return 2
+    if args.dpi <= 0:
+        print("--dpi는 양수여야 한다.", file=sys.stderr)
+        return 2
+    if args.workers <= 0:
+        print("--workers는 1 이상이어야 한다.", file=sys.stderr)
+        return 2
+    if not (0.0 < args.layout_score_threshold <= 1.0):
+        print("--layout-score-threshold는 0보다 크고 1 이하여야 한다.", file=sys.stderr)
+        return 2
+    if args.chunk_max_chars < 200:
+        print("--chunk-max-chars는 200 이상이어야 한다.", file=sys.stderr)
+        return 2
+    if args.chunk_overlap < 0:
+        print("--chunk-overlap은 0 이상이어야 한다.", file=sys.stderr)
+        return 2
+    if args.vision != "none" and args.no_crops and not args.plan_only:
+        print(
+            "--vision을 사용할 때는 이미지 크롭이 필요하므로 --no-crops와 함께 쓸 수 없다.",
+            file=sys.stderr,
+        )
+        return 2
+
+    pptx_renderer: LibreOfficePptxRenderer | None = None
+    try:
+        pages = parse_page_selection(args.pages) if args.pages else None
+        options = ParseOptions(
+            pages=pages,
+            extract_crops=not args.no_crops,
+            render_dpi=args.dpi,
+            detect_borderless_tables=not args.no_borderless_tables,
+            layout_detect_all_pages=args.layout_all_pages,
+            include_speaker_notes=not args.no_speaker_notes,
+            include_comments=args.include_comments,
+        )
+        chunk_opts = ChunkOptions(
+            max_chars=args.chunk_max_chars,
+            overlap_chars=args.chunk_overlap,
+        )
+        if args.pptx_renderer == "libreoffice":
+            pptx_renderer = LibreOfficePptxRenderer()
+            if not pptx_renderer.available:
+                raise ParserInputError(
+                    "LibreOffice PPTX 렌더러를 쓸 수 없다 — "
+                    "`soffice`/`libreoffice`와 PDF 렌더러(`pypdfium2` 또는 `pdftoppm`)가 필요하다."
+                )
+
+        layout_detector = (
+            create_layout_detector(
+                args.layout_detector,
+                model_path=args.layout_model_path,
+                label_preset=args.layout_label_preset,
+                base_url=args.layout_base_url,
+                api_key_env=args.layout_api_key_env,
+                score_threshold=args.layout_score_threshold,
+                allow_external=args.allow_external_layout,
+                registered_internal=tuple(args.vision_internal_host or ()),
+            )
+            if args.layout_detector != "none"
+            else None
+        )
+
+        vision_adapter = (
+            create_vision_adapter(
+                args.vision,
+                model=args.vision_model,
+                base_url=args.vision_base_url,
+                api_key_env=args.vision_api_key_env,
+                ocr_lang=args.ocr_lang,
+                prompt_preset=args.vision_prompt_preset,
+                allow_external=args.allow_external_vision,
+                registered_internal=tuple(args.vision_internal_host or ()),
+            )
+            if (args.vision != "none" and not args.plan_only)
+            else None
+        )
+
+        # 폴더 입력: 일괄 배치 처리 경로
+        if args.file.is_dir():
+            include_exts = (
+                tuple(tok.strip() for tok in args.include_ext.split(",") if tok.strip())
+                if args.include_ext
+                else None
+            )
+            batch_manifest = parse_batch(
+                args.file,
+                args.out,
+                recursive=not args.no_recursive,
+                include_extensions=include_exts,
+                workers=args.workers,
+                resume=args.resume,
+                fail_fast=args.fail_fast,
+                plan_only=args.plan_only,
+                options=options,
+                include_chunks=not args.no_chunks,
+                chunk_options=chunk_opts,
+                vision_adapter=vision_adapter,
+                page_renderer=pptx_renderer,
+                layout_detector=layout_detector,
+            )
+            mode_lbl = "일괄 진단" if args.plan_only else "일괄 파싱"
+            print(
+                f"{mode_lbl} 완료: {args.file} -> {args.out} "
+                f"(총 {batch_manifest.total_files}건: 성공 {batch_manifest.succeeded}, "
+                f"재개 스킵 {batch_manifest.skipped_resume}, 실패 {batch_manifest.failed}, "
+                f"{batch_manifest.elapsed_seconds:.2f}s)"
+            )
+            print(f"- 요약 리포트(MD): {args.out / 'batch_summary.md'}")
+            print(f"- 매니페스트(JSON): {args.out / 'batch_manifest.json'}")
+            if batch_manifest.all_chunks_jsonl:
+                print(
+                    f"- 통합 RAG 청크: {args.out / batch_manifest.all_chunks_jsonl} "
+                    f"({batch_manifest.total_chunks}개)"
+                )
+            return 1 if (args.fail_fast and batch_manifest.failed > 0) else 0
+
+        if args.plan_only:
+            plan = inspect_document(
+                args.file,
+                options=options,
+                layout_detector=layout_detector,
+                page_renderer=pptx_renderer,
+            )
+            if args.out is not None:
+                out_dir: Path = args.out
+                out_dir.mkdir(parents=True, exist_ok=True)
+                md_path = out_dir / "routing_report.md"
+                json_path = out_dir / "routing_report.json"
+                md_path.write_text(render_routing_report_markdown(plan), encoding="utf-8")
+                json_path.write_text(plan.model_dump_json(indent=2) + "\n", encoding="utf-8")
+                print(
+                    f"구조 진단 완료: {plan.document.source_path} "
+                    f"({plan.summary.analyzed_pages}/{plan.summary.total_pages}p, "
+                    f"표 {plan.summary.table_count}개, 시각 {plan.summary.visual_region_count}개)"
+                )
+                print(f"- 전략 리포트(MD): {md_path}")
+                print(f"- 전략 리포트(JSON): {json_path}")
+            elif args.format == "json":
+                print(plan.model_dump_json(indent=2))
+            else:
+                print(render_routing_report_markdown(plan), end="")
+            return 0
+
+        if args.out is not None:
+            doc, manifest = parse_and_export(
+                args.file,
+                args.out,
+                options=options,
+                vision_adapter=vision_adapter,
+                page_renderer=pptx_renderer,
+                layout_detector=layout_detector,
+                include_chunks=not args.no_chunks,
+                chunk_options=chunk_opts,
+            )
+            s = doc.routing_plan.summary
+            print(
+                f"파싱 완료: {doc.document.source_path} "
+                f"({s.analyzed_pages}/{s.total_pages}p, "
+                f"표 {len(doc.tables)}개, 시각 {len(doc.visual_regions)}개)"
+            )
+            print(f"- 통합 IR JSON: {manifest.parsed_json}")
+            print(f"- 통합 Markdown: {manifest.document_markdown}")
+            if manifest.chunks_jsonl is not None:
+                print(f"- RAG 청크 JSONL: {manifest.chunks_jsonl} ({manifest.chunk_count}개)")
+            print(f"- 구조·전략 리포트: {manifest.routing_report_markdown}")
+            print(f"- 전략 JSON: {manifest.routing_report_json}")
+            if layout_detector is not None:
+                print(f"- 레이아웃 탐지: {layout_detector.name}")
+            if manifest.table_csv_paths:
+                tables_dir = manifest.out_dir / "tables"
+                print(f"- 추출 표 CSV/JSON: {len(manifest.table_csv_paths)}개 ({tables_dir})")
+            if manifest.crop_paths:
+                crops_dir = manifest.out_dir / "crops"
+                print(f"- 시각 영역 크롭: {len(manifest.crop_paths)}개 ({crops_dir})")
+            if vision_adapter is not None and doc.visual_regions:
+                done_cnt = sum(
+                    1 for v in doc.visual_regions if v.vision_status == VisionStatus.COMPLETED
+                )
+                fail_cnt = sum(
+                    1 for v in doc.visual_regions if v.vision_status == VisionStatus.FAILED
+                )
+                print(
+                    f"- 시각 해석({vision_adapter.name}): "
+                    f"완료 {done_cnt}/{len(doc.visual_regions)}개 (실패 {fail_cnt}개)"
+                )
+            return 0
+
+        doc = parse_document(
+            args.file,
+            options=options,
+            vision_adapter=vision_adapter,
+            page_renderer=pptx_renderer,
+            layout_detector=layout_detector,
+        )
+        if args.format == "json":
+            print(doc.model_dump_json(indent=2))
+        elif args.format == "markdown":
+            print(render_document_markdown(doc), end="")
+        elif args.format == "chunks":
+            print(render_chunks_jsonl(chunk_document(doc, options=chunk_opts)), end="")
+        else:
+            print(render_routing_report_markdown(doc.routing_plan), end="")
+        return 0
+    except ParserInputError as exc:
+        print(f"문서를 처리할 수 없다: {exc}", file=sys.stderr)
+        return 1
+    except Exception:
+        print(
+            "문서 파싱이 내부 오류로 끝났다(문서 본문 보호를 위해 상세 원문은 표시하지 않는다).",
+            file=sys.stderr,
+        )
+        return 3
+    finally:
+        if pptx_renderer is not None:
+            pptx_renderer.close()
+
+
+def _run_doctor(args: argparse.Namespace) -> int:
+    from autoetl.doctor import collect_doctor_report, render_doctor_markdown
+
+    report = collect_doctor_report()
+    if args.json:
+        print(report.model_dump_json(indent=2))
+    else:
+        print(render_doctor_markdown(report), end="")
+    return 0
+
+
+def _run_ui(args: argparse.Namespace) -> int:
+    from autoetl.parser.adapters import ParserInputError
+    from autoetl.parser.ui import serve_ui
+
+    if not (0 <= args.port <= 65535):
+        print("--port는 0~65535 범위여야 한다.", file=sys.stderr)
+        return 2
+    try:
+        serve_ui(
+            host=args.host,
+            port=args.port,
+            open_browser=not args.no_browser,
+        )
+        return 0
+    except ParserInputError as exc:
+        print(f"로컬 웹 UI를 시작할 수 없다: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"포트 바인딩에 실패했다({args.host}:{args.port}): {exc}", file=sys.stderr)
+        return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="autoetl", description="결정론 엔진과 LLM 하네스 기반 로컬 ETL·문서 파서"
+    )
+    parser.add_argument(
+        "--version",
+        "-V",
+        action="version",
+        version=f"autoetl {__version__}",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    analyze = subparsers.add_parser("analyze", help="정형 파일(CSV)을 분석해 보고서를 낸다")
+    analyze.add_argument("file", type=Path, help="입력 파일(CSV — 인코딩 자동 감지)")
+    analyze.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="LLM 없이 규칙·스텁만 실행 (v0은 이 경로만 지원)",
+    )
+    analyze.add_argument(
+        "--purpose",
+        choices=[purpose.value for purpose in Purpose],
+        default=Purpose.ANALYTICS.value,
+        help="용도(채점 가중치 기준)",
+    )
+    analyze.add_argument(
+        "--out", type=Path, default=None, help="보고서 JSON 파일 경로(기본: stdout)"
+    )
+
+    parse = subparsers.add_parser(
+        "parse",
+        help="문서 파일 또는 폴더(PDF·PPTX·DOCX·HWPX·XLSX·HWP·DOC·PPT)를 구조 분류·추출한다",
+    )
+    parse.add_argument(
+        "file",
+        type=Path,
+        help="입력 문서 파일 또는 폴더(PDF·PPTX·DOCX·HWPX·XLSX·HWP·DOC·PPT 지원)",
+    )
+    parse.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help=(
+            "결과물 번들(parsed.json, document.md, chunks.jsonl, routing_report.*, "
+            "tables/, crops/) 또는 배치 결과 저장 폴더"
+        ),
+    )
+    parse.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="본문·크롭 추출 없이 구조 분류와 파싱 전략 리포트만 생성",
+    )
+    parse.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="폴더 일괄 처리 시 하위 디렉터리 재귀 탐색 비활성화",
+    )
+    parse.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="폴더 일괄 처리 병렬 워커 수(기본: 1)",
+    )
+    parse.add_argument(
+        "--resume",
+        action="store_true",
+        help="폴더 일괄 처리 시 동일 SHA-256으로 이미 완료된 문서 재파싱 건너뛰기",
+    )
+    parse.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="폴더 일괄 처리 시 첫 실패 문서에서 즉시 중단(기본: 오류 격리 후 계속)",
+    )
+    parse.add_argument(
+        "--include-ext",
+        type=str,
+        default=None,
+        help="폴더 일괄 처리 시 특정 확장자만 필터링(쉼표 구분, 예: '.pdf,.hwp,.xlsx')",
+    )
+    parse.add_argument(
+        "--pages",
+        type=str,
+        default=None,
+        help="분석할 페이지/슬라이드 범위(예: '1-3,5'). 생략하면 전체",
+    )
+    parse.add_argument(
+        "--format",
+        choices=["report", "markdown", "json", "chunks"],
+        default="report",
+        help="--out 미지정 시 stdout 출력 형식(기본: report)",
+    )
+    parse.add_argument(
+        "--no-chunks",
+        action="store_true",
+        help="번들 내보내기 시 RAG 구조화 청크(`chunks.jsonl`) 생성 생략",
+    )
+    parse.add_argument(
+        "--chunk-max-chars",
+        type=int,
+        default=1500,
+        help="RAG 청크 1개당 최대 문자 수(기본: 1500, 최소 200)",
+    )
+    parse.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=150,
+        help="동일 섹션 연속 산문 청크 간 오버랩 문자 수(기본: 150)",
+    )
+    parse.add_argument(
+        "--no-crops",
+        action="store_true",
+        help="스캔·그림·도식 영역의 이미지 크롭 추출 생략",
+    )
+    parse.add_argument(
+        "--no-borderless-tables",
+        action="store_true",
+        help="테두리선 없는 무선 표 휴리스틱 탐지 비활성화",
+    )
+    parse.add_argument(
+        "--no-speaker-notes",
+        action="store_true",
+        help="PPTX 슬라이드 발표자 노트(Speaker Notes) 추출 생략",
+    )
+    parse.add_argument(
+        "--include-comments",
+        action="store_true",
+        help="PPTX·DOCX·HWPX·HWP·DOC·XLSX 검토 주석(Comments·숨은설명) 추출 포함",
+    )
+    parse.add_argument(
+        "--pptx-renderer",
+        choices=["none", "libreoffice"],
+        default="none",
+        help="PPTX 벡터 도식·OLE·EMF 크롭 렌더링 백엔드(기본: none — 결정론 유지)",
+    )
+    parse.add_argument(
+        "--dpi",
+        type=int,
+        default=150,
+        help="페이지 렌더러로 크롭할 때의 해상도 DPI(기본: 150)",
+    )
+    parse.add_argument(
+        "--vision",
+        choices=["none", "tesseract", "openai-compat", "ollama", "hybrid"],
+        default="none",
+        help="시각 영역(스캔·그림·차트·도식) OCR/VLM 어댑터(기본: none)",
+    )
+    parse.add_argument(
+        "--vision-model",
+        type=str,
+        default=None,
+        help=(
+            "VLM 모델명(openai-compat·ollama·hybrid용, 예: glm-ocr, PaddleOCR-VL-1.6, qwen2.5vl:7b)"
+        ),
+    )
+    parse.add_argument(
+        "--vision-prompt-preset",
+        choices=["auto", "generic", "glm-ocr", "paddleocr-vl", "deepseek-ocr"],
+        default="auto",
+        help=(
+            "OCR·VLM 프롬프트 프리셋"
+            "(기본: auto — 모델명에서 glm-ocr/paddleocr-vl/deepseek-ocr 자동 감지)"
+        ),
+    )
+    parse.add_argument(
+        "--vision-base-url",
+        type=str,
+        default=None,
+        help="VLM 엔드포인트 URL(기본: openai-compat=http://127.0.0.1:11434/v1, ollama=http://127.0.0.1:11434)",
+    )
+    parse.add_argument(
+        "--vision-api-key-env",
+        type=str,
+        default=None,
+        help="API 키를 읽을 환경변수 이름(키 원문은 CLI 인자로 받지 않음)",
+    )
+    parse.add_argument(
+        "--ocr-lang",
+        type=str,
+        default="kor+eng",
+        help="Tesseract OCR 언어 설정(기본: kor+eng, 미설치 언어는 자동 폴백)",
+    )
+    parse.add_argument(
+        "--allow-external-vision",
+        action="store_true",
+        help="루프백·등록 사내 서버 밖의 외부 VLM 엔드포인트로 이미지 전송을 명시적으로 허용",
+    )
+    parse.add_argument(
+        "--vision-internal-host",
+        action="append",
+        default=None,
+        help="신뢰 구역으로 등록할 사내 사설 IP 주소(반복 지정 가능)",
+    )
+    parse.add_argument(
+        "--layout-detector",
+        choices=["none", "heuristic", "onnx", "http"],
+        default="none",
+        help="스캔 페이지 레이아웃 객체 탐지기(기본: none — 결정론 유지)",
+    )
+    parse.add_argument(
+        "--layout-model-path",
+        type=Path,
+        default=None,
+        help="ONNX 레이아웃 모델 경로(--layout-detector onnx용, 예: PP-DocLayoutV2.onnx)",
+    )
+    parse.add_argument(
+        "--layout-label-preset",
+        choices=[
+            "pp-doclayout-v2",
+            "pp-doclayout-v3",
+            "pp-doclayout-plus-l",
+            "doclaynet",
+            "publaynet",
+        ],
+        default="pp-doclayout-v2",
+        help="ONNX 레이아웃 모델 라벨 프리셋(기본: pp-doclayout-v2)",
+    )
+    parse.add_argument(
+        "--layout-base-url",
+        type=str,
+        default=None,
+        help="HTTP 레이아웃 탐지 서비스 URL(기본: http://127.0.0.1:8001)",
+    )
+    parse.add_argument(
+        "--layout-api-key-env",
+        type=str,
+        default=None,
+        help="HTTP 레이아웃 서비스 API 키 환경변수 이름(키 원문은 CLI 인자로 받지 않음)",
+    )
+    parse.add_argument(
+        "--layout-score-threshold",
+        type=float,
+        default=0.4,
+        help="레이아웃 탐지 최소 신뢰도 임계값(0<t<=1, 기본: 0.4)",
+    )
+    parse.add_argument(
+        "--layout-all-pages",
+        action="store_true",
+        help="스캔 페이지 외 디지털 페이지에도 레이아웃 탐지를 보조 적용",
+    )
+    parse.add_argument(
+        "--allow-external-layout",
+        action="store_true",
+        help="루프백·등록 사내 서버 밖의 외부 HTTP 레이아웃 탐지 엔드포인트 전송을 명시적으로 허용",
+    )
+
+    doctor = subparsers.add_parser(
+        "doctor",
+        help=(
+            "실행 환경과 지원 포맷·선택 백엔드(LibreOffice·렌더러·ONNX·Tesseract) 가용성을 진단한다"
+        ),
+    )
+    doctor.add_argument(
+        "--json",
+        action="store_true",
+        help="진단 결과를 JSON 형식으로 출력",
+    )
+
+    ui = subparsers.add_parser(
+        "ui",
+        help="무의존성 로컬 전용(127.0.0.1) Auto Parser 웹 UI 서버를 기동한다",
+    )
+    ui.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="바인딩 호스트(보안상 기본 루프백 127.0.0.1만 허용)",
+    )
+    ui.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="로컬 HTTP 포트(기본: 8765, 0 지정 시 가용 포트 자동 할당)",
+    )
+    ui.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="서버 시작 시 기본 브라우저 자동 열기 비활성화",
+    )
+
+    args = parser.parse_args(argv)
+    if args.command == "analyze":
+        return _run_analyze(args)
+    if args.command == "parse":
+        return _run_parse(args)
+    if args.command == "doctor":
+        return _run_doctor(args)
+    if args.command == "ui":
+        return _run_ui(args)
+    parser.error("알 수 없는 명령")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
