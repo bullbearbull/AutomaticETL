@@ -961,6 +961,14 @@ def test_rollback_edge_cases_unique_order_generated_col_nocase_cap_and_without_r
     # 선행 배치 미확정 상태의 후속 갱신 배치가 있으면 선행 배치(nc_res1) 롤백도 보수적으로 차단
     with pytest.raises(InputError, match="후속 갱신 배치"):
         rollback_batch(nc_db, nc_res1.batch_id, engine="sqlite")
+    # 반대로 스냅샷 없는 선행 갱신 배치(nc_res2) 이후에 적재된 후속 배치(nc_res3)는 정상 롤백 가능
+    b3_after_nc = tmp_path / "nc2_after" / "branches.csv"
+    b3_after_nc.parent.mkdir()
+    b3_after_nc.write_text("code,name\nFR,Paris\nDE,Berlin\n", encoding="utf-8")
+    _, nc_res3 = load_tables([b3_after_nc], db_path=nc_db, engine="sqlite")
+    nc_rb3 = rollback_batch(nc_db, nc_res3.batch_id, engine="sqlite")
+    assert nc_rb3["total_deleted"] == 2
+    assert nc_rb3["total_restored"] == 0
 
     # 5. MAX_ROLLBACK_SNAPSHOT_ROWS 초과 시 스냅샷 생략 + 경고 + 선행 배치 링크 보존
     cap_db = tmp_path / "cap.sqlite"

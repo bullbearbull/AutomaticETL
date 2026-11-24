@@ -1036,6 +1036,30 @@ def _next_quarantine_id(adapter: _DbAdapter) -> int:
     return int(row[0]) + 1 if row is not None else 1
 
 
+def _next_monotonic_dataset_timestamp(adapter: _DbAdapter, target_table: str) -> str:
+    """테이블 잠금 보유 중 `_etl_datasets.loaded_at`이 커밋 순서대로 단조 증가하도록 생성한다."""
+    now_dt = datetime.now(timezone.utc)
+    prev_row = adapter.fetchone(
+        f'SELECT MAX("loaded_at") FROM "_etl_datasets" '
+        f'WHERE "target_table" = {adapter.placeholder}',
+        (target_table,),
+    )
+    if prev_row is not None and prev_row[0]:
+        prev_str = str(prev_row[0]).strip()
+        try:
+            prev_dt = datetime.fromisoformat(prev_str.replace("Z", "+00:00"))
+            if prev_dt.tzinfo is None:
+                prev_dt = prev_dt.replace(tzinfo=timezone.utc)
+            # 구버전 초 단위 문자열("...01Z")은 문자열 비교 시 ".000001Z"보다 크므로 +1초 올림
+            step = timedelta(microseconds=1) if "." in prev_str else timedelta(seconds=1)
+            min_next = prev_dt + step
+            if now_dt < min_next:
+                now_dt = min_next
+        except ValueError:
+            pass
+    return now_dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 _SNAPSHOT_TYPE_KEY = "__etl_type__"
 _SNAPSHOT_OP_KEY = "__etl_op__"
 _PK_CHUNK_PARAM_LIMIT = 400
@@ -1767,6 +1791,16 @@ def _load_single_table(
                             f"스냅샷({captured_cnt:,}건)과 실제 갱신({actual_updated:,}건)이 "
                             "달라 롤백 스냅샷을 생략했습니다."
                         )
+                    elif (
+                        actual_updated > 0
+                        and actual_inserted > 0
+                        and not any(_SNAPSHOT_OP_KEY in s for s in pre_update_snapshots)
+                        and adapter.has_self_referencing_fk(target_table.name)
+                    ):
+                        table_warnings.append(
+                            f"`{target_table.name}` 자기참조 외래 키 테이블의 혼합 배치 연산 수가 "
+                            "상한을 초과해 삽입 순서 마커를 생략했습니다(배치 롤백이 제한됩니다)."
+                        )
 
     return (
         len(raw_rows),
@@ -2095,6 +2129,7 @@ def load_tables(
                         if predecessor_batch_ids is None
                         else json.dumps(predecessor_batch_ids, ensure_ascii=False)
                     )
+                    ds_loaded_at = _next_monotonic_dataset_timestamp(adapter, t_name)
                     adapter.execute(
                         f'INSERT INTO "_etl_datasets" ('
                         f'"dataset_id", "batch_id", "load_order_index", "target_table", '
@@ -2122,7 +2157,7 @@ def load_tables(
                             rows_loaded,
                             len(q_entries),
                             1 if schema_drift else 0,
-                            loaded_at,
+                            ds_loaded_at,
                             rows_updated,
                             snapshots_json,
                             source_batches_json,
@@ -2526,7 +2561,8 @@ def rollback_batch(
         snap_select = '"rollback_snapshots_json"' if has_snapshot_col else "NULL"
 
         ds_rows = adapter.fetchall(
-            f'SELECT "target_table", "increment_mode", "primary_key_columns", {snap_select} '
+            f'SELECT "target_table", "increment_mode", "primary_key_columns", '
+            f'"loaded_at", {snap_select} '
             f'FROM "_etl_datasets" WHERE "batch_id" = {p} '
             f'ORDER BY "load_order_index" DESC',
             (batch_id,),
@@ -2551,7 +2587,7 @@ def rollback_batch(
             tuple[str, list[str], list[str], list[tuple[str, dict[str, Any]]], bool]
         ] = []
         seen_tables: set[str] = set()
-        for tbl_raw, inc_mode_raw, pk_json_raw, snap_raw in ds_rows:
+        for tbl_raw, inc_mode_raw, pk_json_raw, target_loaded_at_raw, snap_raw in ds_rows:
             tbl = str(tbl_raw)
             if tbl in seen_tables or not adapter.table_exists(tbl):
                 continue
@@ -2625,8 +2661,10 @@ def rollback_batch(
                             f"배치 `{batch_id}`를 먼저 롤백할 수 없습니다. "
                             f"후속 배치(`{later_batch_id}`)를 먼저 롤백해 주세요."
                         )
-            # 스냅샷과 선행 배치 목록이 모두 없는 활성 갱신 배치(rows_updated > 0)는
-            # 커밋 시점·영향 범위를 판별할 수 없으므로 보수적으로 롤백을 차단한다(삽입 전용은 허용).
+            # 스냅샷·선행 배치 목록이 모두 없는 후속 갱신 배치(rows_updated > 0)는
+            # 커밋 순서를 보장하는 단조 증가 loaded_at 기준으로 이후 배치만 차단한다.
+            target_loaded_at = str(target_loaded_at_raw or "")
+            ts_op = ">" if "." in target_loaded_at else ">="
             unknown_upd_filter = (
                 'AND d."rows_updated" > 0 '
                 if has_rows_updated_col
@@ -2643,8 +2681,9 @@ def rollback_batch(
                 f'JOIN "_etl_load_batches" b ON d."batch_id" = b."batch_id" '
                 f'WHERE d."target_table" = {p} AND d."batch_id" != {p} '
                 f"AND b.\"status\" IN ('succeeded', 'partial') "
+                f'AND d."loaded_at" {ts_op} {p} '
                 f"{unknown_upd_filter}{snap_null_filter}{src_null_filter}",
-                (tbl, batch_id),
+                (tbl, batch_id, target_loaded_at),
             )
             if unknown_later_rows:
                 later_bid = str(unknown_later_rows[0][0])
