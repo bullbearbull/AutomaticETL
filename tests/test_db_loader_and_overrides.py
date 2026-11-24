@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import date, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import duckdb
@@ -381,7 +383,7 @@ def test_duplicate_file_skip_schema_drift_and_batch_rollback(tmp_path: Path) -> 
     assert res2.total_rows_loaded == 0
     assert all(t.skipped_duplicate_file for t in res2.tables)
 
-    # 3차: 스키마에 신규 컬럼 추가 후 적재 -> 스키마 드리프트 감지 + 컬럼 자동 진화
+    # 3차: 신규 컬럼 추가 후 적재 -> 스키마 드리프트 감지 + 컬럼 진화 + 기존 3행 UPSERT
     branches_v2 = tmp_path / "branches.csv"
     branches_v2.write_text(
         "지점코드,지점명,국가\nKR,서울본점,대한민국\nUS,뉴욕지사,미국\nJP,도쿄지사,일본\nSG,싱가포르,싱가포르\n",
@@ -392,24 +394,527 @@ def test_duplicate_file_skip_schema_drift_and_batch_rollback(tmp_path: Path) -> 
     assert res3.tables[0].schema_drift_detected is True
     assert res3.tables[0].rows_loaded == 4
 
-    # 4차: orders가 참조 중인 부모 배치(res3)를 먼저 롤백하려 하면 FK 무결성 보호 InputError 발생
-    with pytest.raises(InputError, match="참조하고 있어"):
-        rollback_batch(db_file, res3.batch_id, engine="sqlite")
+    cat_after_v2 = inspect_db_catalog(db_file, engine="sqlite")
+    ds3 = next(d for d in cat_after_v2["datasets"] if d["batch_id"] == res3.batch_id)
+    assert ds3["rows_updated"] == 3
 
-    # 5차: 자식 포함 1차 배치 먼저 역순 롤백(orders -> customers -> branches) 후 3차 롤백
+    # 4차: 후속 배치(res3)가 res1의 기존 행을 갱신한 상태에서 res1을 먼저 롤백하려 하면 차단된다
+    with pytest.raises(InputError, match="후속 배치"):
+        rollback_batch(db_file, res1.batch_id, engine="sqlite")
+
+    # 5차: UPSERT 배치(res3) 롤백 -> 신규 행(SG)만 삭제되고 기존 행(KR/US/JP)은 원복된다
+    rb3 = rollback_batch(db_file, res3.batch_id, engine="sqlite")
+    assert rb3["status"] == "rolled_back"
+    assert rb3["deleted_by_table"]["branches"] == 1
+    assert rb3["restored_by_table"]["branches"] == 3
+    assert rb3["total_deleted"] == 1
+    assert rb3["total_restored"] == 3
+
+    con = sqlite3.connect(str(db_file))
+    try:
+        col_map = {
+            c["source_column"]: c["target_column"]
+            for c in cat_after_v2["columns"]
+            if c["target_table"] == "branches"
+        }
+        code_col = col_map["지점코드"]
+        name_col = col_map["지점명"]
+        country_col = col_map["국가"]
+        rows_after_rb3 = con.execute(
+            f'SELECT "{code_col}", "{name_col}", "{country_col}", "_etl_batch_id" '
+            f'FROM "branches" ORDER BY "{code_col}"'
+        ).fetchall()
+        assert rows_after_rb3 == [
+            ("JP", "도쿄지사", None, res1.batch_id),
+            ("KR", "서울본점", None, res1.batch_id),
+            ("US", "뉴욕지사", None, res1.batch_id),
+        ]
+        ord_cnt = con.execute('SELECT COUNT(*) FROM "orders"').fetchone()
+        assert ord_cnt is not None and ord_cnt[0] == 4
+    finally:
+        con.close()
+
+    # 6차: res3 원복 후 1차 배치 역순 롤백(orders -> customers -> branches)으로 전체 삭제
     rb1 = rollback_batch(db_file, res1.batch_id, engine="sqlite")
     assert rb1["status"] == "rolled_back"
     assert next(iter(rb1["deleted_by_table"].keys())) == "orders"  # 자식(orders) 먼저 삭제!
     assert rb1["deleted_by_table"]["orders"] == 4
+    assert rb1["deleted_by_table"]["customers"] == 3
+    assert rb1["deleted_by_table"]["branches"] == 3
+    assert rb1["total_deleted"] == 10
+    assert rb1["total_restored"] == 0
 
-    rb3 = rollback_batch(db_file, res3.batch_id, engine="sqlite")
-    assert rb3["status"] == "rolled_back"
-    assert rb3["deleted_by_table"]["branches"] == 4
-
-    # 6차: 롤백 완료 후 동일 파일을 다시 넣으면 force 없이도 재적재 가능
+    # 7차: 롤백 완료 후 동일 파일을 다시 넣으면 force 없이도 재적재 가능
     _b4, res4 = load_tables([branches, customers, orders], db_path=db_file, engine="sqlite")
     assert res4.status == "succeeded"
     assert res4.total_rows_loaded == 10
+
+
+def test_upsert_rollback_fk_guard_chain_duckdb_and_legacy_safety(tmp_path: Path) -> None:
+    """UPSERT 롤백 FK 보호·체인 순서 강제·DuckDB 타입 원복·구버전 스냅샷 부재 차단을 검증한다."""
+    # 1. FK 보호: 신규 삽입 부모 행(SG)을 후속 배치의 자식 행이 참조 중이면 부모 배치 롤백 차단
+    fk_dir = tmp_path / "fk_guard"
+    fk_dir.mkdir(parents=True, exist_ok=True)
+    branches = fk_dir / "branches.csv"
+    branches.write_text(
+        "branch_code,branch_name\nKR,Seoul\nUS,NewYork\nJP,Tokyo\n",
+        encoding="utf-8",
+    )
+    orders = fk_dir / "orders.csv"
+    orders.write_text(
+        "order_id,branch_code,amount\n1001,KR,100\n1002,US,200\n1003,JP,300\n1004,KR,150\n",
+        encoding="utf-8",
+    )
+    sqlite_db = tmp_path / "fk_guard.sqlite"
+    _b1, res1 = load_tables([branches, orders], db_path=sqlite_db, engine="sqlite")
+    assert res1.status == "succeeded"
+
+    branches_v2 = tmp_path / "fk_v2" / "branches.csv"
+    branches_v2.parent.mkdir(parents=True, exist_ok=True)
+    branches_v2.write_text(
+        "branch_code,branch_name\nKR,Seoul-HQ\nSG,Singapore\n",
+        encoding="utf-8",
+    )
+    _b2, res2 = load_tables([branches_v2], db_path=sqlite_db, engine="sqlite")
+    assert res2.status == "succeeded"
+
+    orders_sg = tmp_path / "fk_v3" / "orders.csv"
+    orders_sg.parent.mkdir(parents=True, exist_ok=True)
+    orders_sg.write_text(
+        "order_id,branch_code,amount\n1005,SG,400\n1006,KR,500\n1007,SG,450\n",
+        encoding="utf-8",
+    )
+    # branches_v2는 SHA-256 중복으로 건너뛰고 orders만 신규 3건 적재(SG 참조)
+    _b3, res3 = load_tables([branches_v2, orders_sg], db_path=sqlite_db, engine="sqlite")
+    assert res3.status == "succeeded"
+
+    with pytest.raises(InputError, match="참조하고 있어"):
+        rollback_batch(sqlite_db, res2.batch_id, engine="sqlite")
+
+    # 자식 배치(res3)를 먼저 롤백하면 res2도 정상 롤백되어 SG 삭제 + KR 원복된다
+    rb3 = rollback_batch(sqlite_db, res3.batch_id, engine="sqlite")
+    assert rb3["deleted_by_table"]["orders"] == 3
+    rb2 = rollback_batch(sqlite_db, res2.batch_id, engine="sqlite")
+    assert rb2["deleted_by_table"]["branches"] == 1
+    assert rb2["restored_by_table"]["branches"] == 1
+
+    con = sqlite3.connect(str(sqlite_db))
+    try:
+        kr = con.execute(
+            'SELECT "branch_name", "_etl_batch_id" FROM "branches" WHERE "branch_code" = \'KR\''
+        ).fetchone()
+        assert kr == ("Seoul", res1.batch_id)
+        sg = con.execute('SELECT * FROM "branches" WHERE "branch_code" = \'SG\'').fetchone()
+        assert sg is None
+    finally:
+        con.close()
+
+    # 2. DuckDB 다단계 UPSERT 체인(B1 -> B2 -> B3) + DATE/DECIMAL/BOOLEAN 타입 무손실 원복
+    duck_db = tmp_path / "chain.duckdb"
+    p1 = tmp_path / "c1" / "items.csv"
+    p2 = tmp_path / "c2" / "items.csv"
+    p3 = tmp_path / "c3" / "items.csv"
+    for p in (p1, p2, p3):
+        p.parent.mkdir(parents=True, exist_ok=True)
+    p1.write_text(
+        "item_id,item_name,unit_price,effective_date,is_active\n"
+        '1,Alpha,"10,000.50",2025-01-10,true\n'
+        '2,Beta,"20,000.00",2025-01-11,false\n',
+        encoding="utf-8",
+    )
+    p2.write_text(
+        "item_id,item_name,unit_price,effective_date,is_active\n"
+        '1,Alpha-v2,"15,500.25",2025-02-20,false\n'
+        '3,Gamma,"30,000.00",2025-02-21,true\n',
+        encoding="utf-8",
+    )
+    p3.write_text(
+        "item_id,item_name,unit_price,effective_date,is_active\n"
+        '1,Alpha-v3,"19,900.75",2025-03-30,true\n'
+        '4,Delta,"40,000.00",2025-03-31,false\n',
+        encoding="utf-8",
+    )
+    _, d1 = load_tables([p1], db_path=duck_db, engine="duckdb")
+    _, d2 = load_tables([p2], db_path=duck_db, engine="duckdb")
+    _, d3 = load_tables([p3], db_path=duck_db, engine="duckdb")
+    assert d1.status == d2.status == d3.status == "succeeded"
+
+    # 역순 위반 차단: d1, d2는 후속 배치가 갱신했으므로 먼저 롤백할 수 없다
+    with pytest.raises(InputError, match=d2.batch_id):
+        rollback_batch(duck_db, d1.batch_id, engine="duckdb")
+    with pytest.raises(InputError, match=d3.batch_id):
+        rollback_batch(duck_db, d2.batch_id, engine="duckdb")
+
+    # d3 -> d2 -> d1 역순 롤백 시 DECIMAL/DATE/BOOLEAN 값이 정확히 원복된다
+    dr3 = rollback_batch(duck_db, d3.batch_id, engine="duckdb")
+    assert dr3["total_deleted"] == 1 and dr3["total_restored"] == 1
+    dcon = duckdb.connect(str(duck_db), read_only=True)
+    try:
+        row_after_d3 = dcon.execute(
+            "SELECT item_name, unit_price, effective_date, is_active, _etl_batch_id "
+            "FROM items WHERE item_id = 1"
+        ).fetchone()
+        assert row_after_d3 == (
+            "Alpha-v2",
+            Decimal("15500.25"),
+            date(2025, 2, 20),
+            False,
+            d2.batch_id,
+        )
+        assert isinstance(row_after_d3[1], Decimal)
+        assert isinstance(row_after_d3[3], bool)
+    finally:
+        dcon.close()
+
+    dr2 = rollback_batch(duck_db, d2.batch_id, engine="duckdb")
+    assert dr2["total_deleted"] == 1 and dr2["total_restored"] == 1
+    dcon = duckdb.connect(str(duck_db), read_only=True)
+    try:
+        all_after_d2 = dcon.execute(
+            "SELECT item_id, item_name, unit_price, effective_date, is_active, _etl_batch_id "
+            "FROM items ORDER BY item_id"
+        ).fetchall()
+        assert all_after_d2 == [
+            (1, "Alpha", Decimal("10000.50"), date(2025, 1, 10), True, d1.batch_id),
+            (2, "Beta", Decimal("20000.00"), date(2025, 1, 11), False, d1.batch_id),
+        ]
+        assert all(isinstance(r[2], Decimal) and isinstance(r[4], bool) for r in all_after_d2)
+    finally:
+        dcon.close()
+
+    dr1 = rollback_batch(duck_db, d1.batch_id, engine="duckdb")
+    assert dr1["total_deleted"] == 2 and dr1["total_restored"] == 0
+
+    # 3. 구버전 DB(스냅샷 컬럼 NULL)에서 UPSERT 다중 배치 롤백 시 안전하게 차단된다
+    legacy_db = tmp_path / "legacy.sqlite"
+    load_tables([p1], db_path=legacy_db, engine="sqlite")
+    _, l2 = load_tables([p2], db_path=legacy_db, engine="sqlite")
+    lcon = sqlite3.connect(str(legacy_db))
+    try:
+        lcon.execute('UPDATE "_etl_datasets" SET "rollback_snapshots_json" = NULL')
+        lcon.commit()
+    finally:
+        lcon.close()
+    with pytest.raises(InputError, match="스냅샷이 없어"):
+        rollback_batch(legacy_db, l2.batch_id, engine="sqlite")
+    # l1 데이터가 삭제되지 않고 그대로 보호됨 확인
+    lcon = sqlite3.connect(str(legacy_db))
+    try:
+        cnt = lcon.execute("SELECT COUNT(*) FROM items").fetchone()
+        assert cnt is not None and cnt[0] == 3
+    finally:
+        lcon.close()
+
+
+def test_analytics_composite_surrogate_pk_sqlite_and_duckdb(tmp_path: Path) -> None:
+    """Analytics 복합 PK(서로게이트 ID + 시계열)의 시험 적재·SQLite·DuckDB 적재를 검증한다."""
+    data_dir = tmp_path / "analytics_surr"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    users = data_dir / "users.csv"
+    users.write_text(
+        "user_id,user_name\n101,Alice\n102,Bob\n103,Charlie\n",
+        encoding="utf-8",
+    )
+    # 자연 PK가 없는 이벤트 로그(동일 날짜·동일 사용자 중복 포함) + users FK + 시계열 컬럼
+    events = data_dir / "events.csv"
+    events.write_text(
+        "user_id,event_date,event_type,score\n"
+        "101,2026-01-01,click,10\n"
+        "101,2026-01-01,click,10\n"
+        "102,2026-01-01,view,5\n"
+        "103,2026-01-02,purchase,99\n"
+        "102,2026-01-02,view,5\n",
+        encoding="utf-8",
+    )
+
+    # 1. 시험 적재: Analytics 복합 PK에서 동일 날짜 중복이 PK 위반으로 오탐되지 않음
+    analysis = analyze_tables([users, events], purpose=Purpose.ANALYTICS)
+    lp = analysis.load_plan
+    selected = next(c for c in lp.candidates if c.id == lp.selected_candidate_id)
+    ev_tbl = next(t for t in selected.tables if t.name == "events")
+    ev_pks = [c for c in ev_tbl.columns if c.is_primary_key]
+    assert len(ev_pks) == 2
+    surr_col_name = next(c.name for c in ev_pks if c.is_identity)
+    assert any(c.name == "event_date" and not c.is_identity for c in ev_pks)
+
+    sc = next(s for s in lp.scorecards if s.candidate_id == lp.selected_candidate_id)
+    assert sc.validation.trial_load_executed is True
+    assert sc.validation.trial_load_ok is True
+    assert sc.validation.pk_violation_count == 0
+
+    # 2. SQLite 실 적재: 복합 PK에서는 AUTOINCREMENT 미생성이므로 명시 시퀀스 ID가 할당되어야 한다
+    sqlite_db = tmp_path / "analytics_surr.sqlite"
+    _, r1 = load_tables(
+        [users, events], db_path=sqlite_db, engine="sqlite", purpose=Purpose.ANALYTICS
+    )
+    assert r1.status == "succeeded"
+    assert r1.total_rows_loaded == 8
+    assert r1.total_rows_quarantined == 0
+
+    con = sqlite3.connect(str(sqlite_db))
+    try:
+        pragma = con.execute('PRAGMA table_info("events")').fetchall()
+        pk_names = [r[1] for r in pragma if r[5] > 0]
+        assert pk_names == [surr_col_name, "event_date"]
+        surr_ids = [
+            r[0]
+            for r in con.execute(
+                f'SELECT "{surr_col_name}" FROM "events" ORDER BY "{surr_col_name}"'
+            )
+        ]
+        assert surr_ids == [1, 2, 3, 4, 5]
+    finally:
+        con.close()
+
+    # 2차 배치 APPEND 시 기존 MAX(surrogate_id) 이후 번호(6, 7, 8, 9)로 이어서 적재된다
+    events_b2 = tmp_path / "b2" / "events.csv"
+    events_b2.parent.mkdir(parents=True, exist_ok=True)
+    events_b2.write_text(
+        "user_id,event_date,event_type,score\n"
+        "101,2026-01-01,click,10\n"
+        "101,2026-01-01,click,10\n"
+        "102,2026-01-03,view,15\n"
+        "103,2026-01-03,click,20\n",
+        encoding="utf-8",
+    )
+    _, r2 = load_tables(
+        [users, events_b2], db_path=sqlite_db, engine="sqlite", purpose=Purpose.ANALYTICS
+    )
+    assert r2.status == "succeeded"
+    con = sqlite3.connect(str(sqlite_db))
+    try:
+        surr_ids_2 = [
+            r[0]
+            for r in con.execute(
+                f'SELECT "{surr_col_name}" FROM "events" ORDER BY "{surr_col_name}"'
+            )
+        ]
+        assert surr_ids_2 == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    finally:
+        con.close()
+
+    # 2차 배치 롤백 시 6..9번만 삭제되고 1..5는 유지된다
+    rb2 = rollback_batch(sqlite_db, r2.batch_id, engine="sqlite")
+    assert rb2["deleted_by_table"]["events"] == 4
+
+    # 비-IDENTITY 파티션 키(event_date)가 NULL인 행은 NOT NULL 위반으로 격리된다
+    events_null = tmp_path / "b_null" / "events.csv"
+    events_null.parent.mkdir(parents=True, exist_ok=True)
+    events_null.write_text(
+        "user_id,event_date,event_type,score\n"
+        "101,2026-01-01,click,10\n"
+        "101,2026-01-01,click,10\n"
+        "102,,view,15\n"
+        "103,2026-01-04,click,20\n",
+        encoding="utf-8",
+    )
+    _, r_null = load_tables(
+        [users, events_null], db_path=sqlite_db, engine="sqlite", purpose=Purpose.ANALYTICS
+    )
+    assert r_null.status == "partial"
+    assert r_null.total_rows_loaded == 3
+    assert r_null.total_rows_quarantined == 1
+    cat_null = inspect_db_catalog(sqlite_db, engine="sqlite")
+    assert cat_null["quarantine"][0]["error_category"] == "not_null_violation"
+    assert cat_null["quarantine"][0]["error_column"] == "event_date"
+
+    # 3. DuckDB 실 적재에서도 동일하게 1차/2차 모두 성공한다
+    duck_db = tmp_path / "analytics_surr.duckdb"
+    _, d1 = load_tables(
+        [users, events], db_path=duck_db, engine="duckdb", purpose=Purpose.ANALYTICS
+    )
+    _, d2 = load_tables(
+        [users, events_b2], db_path=duck_db, engine="duckdb", purpose=Purpose.ANALYTICS
+    )
+    assert d1.status == "succeeded" and d2.status == "succeeded"
+    dcon = duckdb.connect(str(duck_db), read_only=True)
+    try:
+        ids = [
+            r[0]
+            for r in dcon.execute(
+                f'SELECT "{surr_col_name}" FROM "events" ORDER BY "{surr_col_name}"'
+            ).fetchall()
+        ]
+        assert ids == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    finally:
+        dcon.close()
+
+
+def test_excel_serial_dates_20000_to_25568_trial_load_and_real_load(tmp_path: Path) -> None:
+    """S3 경계(20000~60000) Excel 시리얼 날짜가 시험 적재·SQLite·DuckDB에서 격리 없이 변환된다."""
+    serials = [20000, 22000, 25000, 25568, 25569, 45000, 60000]
+    csv_lines = ["record_id,record_date,label"] + [
+        f"{idx},{serial},s{serial}" for idx, serial in enumerate(serials, start=1)
+    ]
+    csv_path = tmp_path / "historical_dates.csv"
+    csv_path.write_text("\n".join(csv_lines) + "\n", encoding="utf-8")
+
+    expected_dates = [
+        (idx, date(1899, 12, 30) + timedelta(days=serial))
+        for idx, serial in enumerate(serials, start=1)
+    ]
+
+    analysis = analyze_tables([csv_path], purpose=Purpose.OLTP)
+    date_type = next(t for t in analysis.tables[0].types if t.column == "record_date")
+    assert date_type.physical_type.value == "date"
+    sc = next(
+        s
+        for s in analysis.load_plan.scorecards
+        if s.candidate_id == analysis.load_plan.selected_candidate_id
+    )
+    assert sc.validation.trial_load_executed is True
+    assert sc.validation.trial_load_ok is True
+    assert sc.validation.cast_failure_count == 0
+
+    sqlite_db = tmp_path / "excel_dates.sqlite"
+    _, s_res = load_tables([csv_path], db_path=sqlite_db, engine="sqlite")
+    assert s_res.status == "succeeded"
+    assert s_res.total_rows_loaded == 7
+    assert s_res.total_rows_quarantined == 0
+    scon = sqlite3.connect(str(sqlite_db))
+    try:
+        rows = scon.execute(
+            "SELECT record_id, record_date FROM historical_dates ORDER BY record_id"
+        ).fetchall()
+        assert rows == [(rid, d.isoformat()) for rid, d in expected_dates]
+    finally:
+        scon.close()
+
+    duck_db = tmp_path / "excel_dates.duckdb"
+    _, d_res = load_tables([csv_path], db_path=duck_db, engine="duckdb")
+    assert d_res.status == "succeeded"
+    assert d_res.total_rows_loaded == 7
+    assert d_res.total_rows_quarantined == 0
+    dcon = duckdb.connect(str(duck_db), read_only=True)
+    try:
+        rows = dcon.execute(
+            "SELECT record_id, record_date FROM historical_dates ORDER BY record_id"
+        ).fetchall()
+        assert rows == expected_dates
+    finally:
+        dcon.close()
+
+
+def test_rollback_edge_cases_unique_order_generated_col_nocase_cap_and_without_rowid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """역순 UNIQUE 복원·GENERATED 컬럼 제외·COLLATE NOCASE·상한 보호·WITHOUT ROWID를 검증."""
+    from autoetl.core import db_loader
+
+    # 1. SQLite WITHOUT ROWID 테이블은 단일 INTEGER PK라도 자동 증가 생략 대상이 아니다
+    wr_db = tmp_path / "without_rowid.sqlite"
+    con = sqlite3.connect(str(wr_db))
+    try:
+        con.execute('CREATE TABLE "t_wr" ("id" INTEGER PRIMARY KEY, "v" TEXT) WITHOUT ROWID')
+        con.execute('CREATE TABLE "t_normal" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "v" TEXT)')
+        con.commit()
+    finally:
+        con.close()
+    adapter = db_loader._DbAdapter(wr_db, "sqlite")
+    try:
+        assert adapter.sqlite_single_identity_pk("t_wr", "id") is False
+        assert adapter.sqlite_single_identity_pk("t_normal", "id") is True
+    finally:
+        adapter.close()
+
+    # 2. UNIQUE 값 이동((1, X),(2, Y) -> (1, Z),(2, X)) 후 역순 복원 + GENERATED 컬럼 + 삭제 행 오류
+    u_db = tmp_path / "unique_gen.sqlite"
+    con = sqlite3.connect(str(u_db))
+    try:
+        con.execute(
+            'CREATE TABLE "codes" ('
+            '"id" INTEGER PRIMARY KEY, '
+            '"code" TEXT NOT NULL UNIQUE, '
+            '"qty" INTEGER NOT NULL, '
+            '"doubled" INTEGER GENERATED ALWAYS AS ("qty" * 2) STORED, '
+            '"_etl_batch_id" TEXT NOT NULL, '
+            '"_etl_dataset_id" TEXT NOT NULL, '
+            '"_etl_loaded_at" TEXT NOT NULL'
+            ")"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    c1 = tmp_path / "u1" / "codes.csv"
+    c2 = tmp_path / "u2" / "codes.csv"
+    c1.parent.mkdir()
+    c2.parent.mkdir()
+    c1.write_text("id,code,qty\n1,X,10\n2,Y,20\n", encoding="utf-8")
+    c2.write_text("id,code,qty\n1,Z,30\n2,X,40\n", encoding="utf-8")
+    _, res1 = load_tables([c1], db_path=u_db, engine="sqlite")
+    _, res2 = load_tables([c2], db_path=u_db, engine="sqlite")
+    assert res1.status == res2.status == "succeeded"
+
+    rb2 = rollback_batch(u_db, res2.batch_id, engine="sqlite")
+    assert rb2["total_restored"] == 2
+    con = sqlite3.connect(str(u_db))
+    try:
+        rows = con.execute(
+            'SELECT "id", "code", "qty", "doubled", "_etl_batch_id" FROM "codes" ORDER BY "id"'
+        ).fetchall()
+        assert rows == [
+            (1, "X", 10, 20, res1.batch_id),
+            (2, "Y", 20, 40, res1.batch_id),
+        ]
+    finally:
+        con.close()
+
+    # 3. 갱신 행이 외부에서 삭제된 경우 전용 오류 메시지로 차단
+    c3 = tmp_path / "u3" / "codes.csv"
+    c3.parent.mkdir()
+    c3.write_text("id,code,qty\n1,W,50\n2,Q,60\n", encoding="utf-8")
+    _, res3 = load_tables([c3], db_path=u_db, engine="sqlite")
+    con = sqlite3.connect(str(u_db))
+    try:
+        con.execute('DELETE FROM "codes" WHERE "id" = 1')
+        con.commit()
+    finally:
+        con.close()
+    with pytest.raises(InputError, match="이미 삭제되어"):
+        rollback_batch(u_db, res3.batch_id, engine="sqlite")
+
+    # 4. 외부 COLLATE NOCASE PK로 스냅샷과 실제 갱신 수가 어긋나면 스냅샷 생략 + 롤백 차단
+    nc_db = tmp_path / "nocase.sqlite"
+    con = sqlite3.connect(str(nc_db))
+    try:
+        con.execute(
+            'CREATE TABLE "branches" ('
+            '"code" TEXT NOT NULL, '
+            '"name" TEXT NOT NULL, '
+            '"_etl_batch_id" TEXT NOT NULL, '
+            '"_etl_dataset_id" TEXT NOT NULL, '
+            '"_etl_loaded_at" TEXT NOT NULL, '
+            'PRIMARY KEY ("code" COLLATE NOCASE)'
+            ")"
+        )
+        con.commit()
+    finally:
+        con.close()
+    b1 = tmp_path / "nc1" / "branches.csv"
+    b2 = tmp_path / "nc2" / "branches.csv"
+    b1.parent.mkdir()
+    b2.parent.mkdir()
+    b1.write_text("code,name\nKR,Seoul\nUS,NewYork\n", encoding="utf-8")
+    b2.write_text("code,name\nkr,Seoul-v2\nJP,Tokyo\n", encoding="utf-8")
+    load_tables([b1], db_path=nc_db, engine="sqlite")
+    _, nc_res2 = load_tables([b2], db_path=nc_db, engine="sqlite")
+    assert any("PK 비교 규칙 차이" in w for w in nc_res2.warnings)
+    with pytest.raises(InputError, match="스냅샷이 없어"):
+        rollback_batch(nc_db, nc_res2.batch_id, engine="sqlite")
+
+    # 5. MAX_ROLLBACK_SNAPSHOT_ROWS 초과 시 스냅샷 생략 + 경고 + 롤백 차단
+    cap_db = tmp_path / "cap.sqlite"
+    load_tables([b1], db_path=cap_db, engine="sqlite")
+    b_cap = tmp_path / "nc3" / "branches.csv"
+    b_cap.parent.mkdir()
+    b_cap.write_text("code,name\nKR,Seoul-3\nUS,NY-3\n", encoding="utf-8")
+    monkeypatch.setattr(db_loader, "MAX_ROLLBACK_SNAPSHOT_ROWS", 1)
+    _, cap_res = load_tables([b_cap], db_path=cap_db, engine="sqlite")
+    assert any("스냅샷 상한" in w for w in cap_res.warnings)
+    with pytest.raises(InputError, match="스냅샷이 없어"):
+        rollback_batch(cap_db, cap_res.batch_id, engine="sqlite")
 
 
 def test_mask_value_formats_and_management_ddl_dialects() -> None:

@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 from sqlglot import exp
 
+from autoetl.adapters.detectors.builtin import EXCEL_SERIAL_MAX, EXCEL_SERIAL_MIN
 from autoetl.contracts import (
     ColumnClassification,
     ColumnMapping,
@@ -827,7 +828,8 @@ def _trial_cast_expr(
             f"CAST(TRY_STRPTIME(trim({qcol}), '%Y.%m.%d') AS DATE), "
             f"CAST(TRY_STRPTIME(trim({qcol}), '%Y%m%d') AS DATE), "
             f"CASE WHEN regexp_matches(trim({qcol}), '^\\d+$') "
-            f"AND TRY_CAST(trim({qcol}) AS INTEGER) BETWEEN 25569 AND 73050 "
+            f"AND TRY_CAST(trim({qcol}) AS INTEGER) "
+            f"BETWEEN {EXCEL_SERIAL_MIN} AND {EXCEL_SERIAL_MAX} "
             f"THEN DATE '1899-12-30' + TRY_CAST(trim({qcol}) AS INTEGER) ELSE NULL END"
             ")"
         )
@@ -987,29 +989,35 @@ def _run_trial_load(
                     failed_cast_rows += int(row_res[1] or 0)
 
             # PK 무결성 검사 (NULL 및 중복 행)
+            # 서로게이트 IDENTITY 컬럼이 포함된 복합 PK(예: Analytics 파티션 키)는
+            # 비-IDENTITY PK 컬럼의 NULL 여부만 검사하고 중복 검사는 생략한다.
+            all_pk_cols = [c.name for c in target_table.columns if c.is_primary_key]
             pk_cols = [
                 c.name for c in target_table.columns if c.is_primary_key and not c.is_identity
             ]
+            has_identity_pk = len(all_pk_cols) != len(pk_cols)
             if pk_cols:
                 pk_aliases = [col_aliases[c] for c in pk_cols]
                 null_cond = " OR ".join(f"{a} IS NULL" for a in pk_aliases)
-                not_null_cond = " AND ".join(f"{a} IS NOT NULL" for a in pk_aliases)
                 pk_null_row = conn.execute(
                     f"SELECT COUNT(*) FROM temp.main.{temp_tbl} WHERE {null_cond}"
                 ).fetchone()
                 pk_nulls = int(pk_null_row[0]) if pk_null_row is not None else 0
-                group_expr = ", ".join(pk_aliases)
-                pk_dup_row = conn.execute(
-                    f"SELECT COALESCE(SUM(cnt - 1), 0) FROM ("
-                    f"SELECT COUNT(*) AS cnt FROM temp.main.{temp_tbl} "
-                    f"WHERE {not_null_cond} GROUP BY {group_expr} HAVING COUNT(*) > 1)"
-                ).fetchone()
-                pk_dups = int(pk_dup_row[0]) if pk_dup_row is not None else 0
+                pk_dups = 0
+                if not has_identity_pk:
+                    not_null_cond = " AND ".join(f"{a} IS NOT NULL" for a in pk_aliases)
+                    group_expr = ", ".join(pk_aliases)
+                    pk_dup_row = conn.execute(
+                        f"SELECT COALESCE(SUM(cnt - 1), 0) FROM ("
+                        f"SELECT COUNT(*) AS cnt FROM temp.main.{temp_tbl} "
+                        f"WHERE {not_null_cond} GROUP BY {group_expr} HAVING COUNT(*) > 1)"
+                    ).fetchone()
+                    pk_dups = int(pk_dup_row[0]) if pk_dup_row is not None else 0
                 pk_violation_count += pk_nulls + pk_dups
 
             # 사용자 확정 UNIQUE 컬럼 중복 검사 (NULL 제외)
             for uq_col in built.confirmed_unique_cols.get(t_name, ()):
-                if pk_cols == [uq_col]:
+                if all_pk_cols == [uq_col]:
                     continue
                 uq_alias = col_aliases.get(uq_col)
                 if uq_alias is None:
