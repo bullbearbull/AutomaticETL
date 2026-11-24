@@ -490,6 +490,32 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
         )
         reranker_kind = str(req.get("reranker", "none") or "none").strip().lower()
         reranker_model = str(req.get("reranker_model", "") or "").strip()
+        synonyms_raw = req.get("synonyms")
+        synonyms: dict[str, list[str]] | None = None
+        if isinstance(synonyms_raw, dict):
+            synonyms = {
+                str(k).strip(): (
+                    [str(v).strip()]
+                    if isinstance(v, str) and v.strip()
+                    else [str(x).strip() for x in v if str(x).strip()]
+                    if isinstance(v, list)
+                    else []
+                )
+                for k, v in synonyms_raw.items()
+                if str(k).strip()
+            }
+            synonyms = {k: v for k, v in synonyms.items() if v} or None
+        elif isinstance(synonyms_raw, str) and synonyms_raw.strip():
+            parsed_syn: dict[str, list[str]] = {}
+            for entry in synonyms_raw.split(","):
+                if "=" not in entry:
+                    continue
+                left, right = entry.split("=", 1)
+                key = left.strip()
+                vals = [v.strip() for v in right.split("|") if v.strip()]
+                if key and vals:
+                    parsed_syn.setdefault(key, []).extend(vals)
+            synonyms = parsed_syn or None
 
         try:
             reranker_obj: Any = None
@@ -501,7 +527,12 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
                 )
 
             with DocumentToolkit(db_path, reranker=reranker_obj) as kit:
-                pack = kit.search_documents(query_text, top_k=top_k, doc_id=doc_id)
+                pack = kit.search_documents(
+                    query_text,
+                    top_k=top_k,
+                    doc_id=doc_id,
+                    synonyms=synonyms,
+                )
             self._send_json(HTTPStatus.OK, pack)
         except ParserInputError as exc:
             self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})

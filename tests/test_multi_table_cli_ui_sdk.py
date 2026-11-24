@@ -108,11 +108,12 @@ def test_ui_server_analyze_tables_e2e_and_zip_download(tmp_path: Path) -> None:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     with create_ui_server(host="127.0.0.1", port=0) as srv:
-        # 1. GET / 에 다중 테이블 ETL 분석 탭 존재 확인
+        # 1. GET / 에 엑셀·CSV 구조 분석 탭 존재 확인
         with opener.open(f"{srv.url}/") as resp:
             assert resp.status == 200
             html = resp.read().decode("utf-8")
-            assert "다중 테이블 ETL 분석" in html
+            assert "엑셀·CSV 구조 분석" in html
+            assert "etlModePanel" in html
 
         # 2. POST /api/analyze-tables
         files_payload = [

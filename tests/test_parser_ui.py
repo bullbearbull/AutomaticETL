@@ -71,7 +71,8 @@ def test_ui_server_end_to_end_parse_and_zip_download() -> None:
         with opener.open(f"{srv.url}/") as resp:
             assert resp.status == 200
             html = resp.read().decode("utf-8")
-            assert "Auto Parser" in html
+            assert "AutoETL" in html
+            assert "문서 글·표 추출" in html
 
         # 2. GET /api/doctor
         with opener.open(f"{srv.url}/api/doctor") as resp:

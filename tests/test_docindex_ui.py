@@ -108,7 +108,7 @@ def test_ui_server_docindex_e2e_and_security_guards() -> None:
         with opener.open(f"{srv.url}/") as resp:
             assert resp.status == 200
             html = resp.read().decode("utf-8")
-            assert "원문 문서 인덱스 · 검색" in html
+            assert "문서 내용 검색" in html
             assert "docIndexModePanel" in html
 
         # 2. POST /api/docindex/build
@@ -143,7 +143,7 @@ def test_ui_server_docindex_e2e_and_security_guards() -> None:
             sqlite_bytes = resp.read()
             assert sqlite_bytes.startswith(b"SQLite format 3\x00")
 
-        # 4. POST /api/docindex/query (0MB SQLite FTS5 한글 2-gram 검색)
+        # 4. POST /api/docindex/query (0MB SQLite FTS5 한글 2-gram 검색 + 동의어 확장)
         q_res = _post_json(
             opener,
             f"{srv.url}/api/docindex/query",
@@ -153,6 +153,20 @@ def test_ui_server_docindex_e2e_and_security_guards() -> None:
         hits = q_res["hits"]
         assert isinstance(hits, list) and len(hits) >= 1
         assert "ERR-2026" in hits[0]["full_text"]
+
+        q_syn = _post_json(
+            opener,
+            f"{srv.url}/api/docindex/query",
+            {
+                "index_id": index_id,
+                "query": "사고 조치",
+                "top_k": 3,
+                "synonyms": "사고=장애,조치=복구",
+            },
+        )
+        syn_hits = q_syn["hits"]
+        assert isinstance(syn_hits, list) and len(syn_hits) >= 1
+        assert "ERR-2026" in syn_hits[0]["full_text"]
 
         # 5. POST /api/docindex/section (청크 절단 없는 원문 섹션 조회)
         sec_id = str(hits[0]["section_id"])

@@ -7,6 +7,7 @@ LangGraph·MCP·OpenAI Tool Calling·Anthropic Tool Use·사내 자체 봇 등 �
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,7 @@ class DocumentToolkit:
         *,
         top_k: int = 5,
         doc_id: str | None = None,
+        synonyms: Mapping[str, Sequence[str]] | None = None,
     ) -> dict[str, Any]:
         """질의에 가장 관련 높은 원문 섹션 전체와 관련 표 목록(EvidencePack)을 반환한다."""
         pack = self._index.search(
@@ -55,6 +57,7 @@ class DocumentToolkit:
             top_k=max(1, min(20, int(top_k))),
             doc_id=doc_id,
             reranker=self._reranker,
+            synonyms=synonyms,
         )
         return pack.model_dump(mode="json")
 
