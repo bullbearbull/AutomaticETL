@@ -12,6 +12,7 @@ PDF, Office 문서, 한글(HWP/HWPX) 파일에서 코드로 읽을 수 있는 �
 > 현재 **`v0.1.0-beta.1`** 베타 상태입니다. 아직 PyPI에는 올리지 않았고 Git으로 설치해 쓸 수 있습니다.
 > - **문서 파서 (`parse`, `ui`, `doctor`)**: 8개 포맷 파싱, RAG 청킹, 폴더 일괄 처리, 로컬 웹 UI, 선택 레이아웃·OCR/VLM 연동까지 바로 사용 가능
 > - **결정론 정형 ETL (`analyze`, `ui`)**: 여러 CSV·TSV·XLSX 파일의 결측치·10종 칼럼 유형 분류·규칙 문자열 내부 분해·테이블 간 FK(숨은 문자열 슬롯 FK 포함)·최적 PK 선정·PostgreSQL DDL·Mermaid ERD·위상 적재 계획(Load Plan)을 **AI/LLM 없이(0MB)** 바로 생성
+> - **원문 문서 인덱스·리트리벌 (`index`, `query`)**: VectorDB·생성 LLM 없이 **SQLite FTS5(한글 2-gram) + 목차 트리 + DuckDB 표 SQL**(0MB 기본)과 선택 **초경량 CPU ONNX 리랭커**(100M–280M)로 청크 절단 없는 원문 `EvidencePack` 반환
 
 ---
 
@@ -26,6 +27,7 @@ PDF, Office 문서, 한글(HWP/HWPX) 파일에서 코드로 읽을 수 있는 �
 | 적용 구간 | 역할 | 지원하는 모델 / 백엔드 | CLI 플래그 |
 | --- | --- | --- | --- |
 | **정형 ETL 결정론 엔진** *(0MB AI)* | 여러 CSV·TSV·XLSX의 결측치·칼럼 유형(범주·이산·연속·규칙 문자열 분해·날짜·인덱스)·내부/교차 FK·최적 PK·PostgreSQL DDL·위상 적재 계획 생성 | **AI 모델 불필요** (격리 DuckDB + `sqlglot` 검증 + 결정론 통계·정규식 엔진) | `autoetl analyze <dir\|files...> --out ./etl_plan` |
+| **원문 문서 인덱스 + 선택 리랭커** *(0MB 기본)* | VectorDB 없이 SQLite FTS5(한글 2-gram) + 목차 + DuckDB 표 SQL로 원문 섹션 전체 검색. 필요 시 CPU Cross-Encoder로 Top-20만 정밀 재정렬(환각 0%) | **기본 0MB**: SQLite FTS5 BM25 + 목차 + DuckDB SQL<br>**선택 CPU ONNX 리랭커**: `bge-reranker-v2-m3(-ko)` (INT8 ~280MB), `bge-reranker-base` (~110MB), `ms-marco-MiniLM-L-6-v2` (~25MB) | `autoetl index <dir> --out ./doc.sqlite`<br>`autoetl query ./doc.sqlite "질문" [--reranker onnx --reranker-model ...]` |
 | **AI ① 레이아웃 객체 탐지** | 스캔 PDF·이미지 슬라이드를 표·차트·수식·본문 영역으로 자동 분할 크롭 | **ONNX**(`onnxruntime`): `PP-DocLayoutV2`, `PP-DocLayoutV3`, `PP-DocLayout_plus-L`, `DocLayNet`, `PubLayNet`<br>**HTTP**: 로컬/사내 레이아웃 탐지 서버<br>*(모델 없이도 내장 `heuristic` 픽셀 탐지기로 동작)* | `--layout-detector onnx\|http\|heuristic`<br>`--layout-label-preset` |
 | **AI ② OCR · VLM 시각 해석** | 크롭된 스캔 영역·차트·도식·수식을 Markdown과 표로 변환 | **경량 문서 특화 OCR-VLM** *(모델명 자동 감지·전용 프롬프트 내장)*: `PaddleOCR-VL` (0.9B), `GLM-OCR` (0.9B), `DeepSeek-OCR` (3B)<br>**범용 VLM**: Ollama / vLLM / llama-server / LM Studio의 `Qwen2.5-VL` 등 모든 Vision 모델, 외부 OpenAI 호환 API (`gpt-4o` 등)<br>**하이브리드**: 단순 텍스트는 로컬 `Tesseract` OCR, 차트·도식만 VLM으로 자동 분배 | `--vision ollama\|openai-compat\|hybrid\|tesseract`<br>`--vision-model`<br>`--vision-prompt-preset auto` |
 
@@ -145,7 +147,21 @@ autoetl ui
 별도 프런트엔드 빌드나 외부 서버 없이 `http://127.0.0.1:8765`에 로컬 웹 UI가 뜹니다.  
 **문서 파서** 모드와 **다중 테이블 ETL 분석** 모드를 전환해 파일을 끌어다 놓으면 칼럼 유형·문자열 분해·PK/FK·DDL·ERD·문서 파싱 결과를 탭별로 확인하고 전체 번들을 ZIP으로 받을 수 있습니다. 기본적으로 루프백(`127.0.0.1`)에만 열립니다.
 
-### 6. Python에서 불러 쓰기
+### 6. VectorDB 없이 원문 문서 색인·검색하기 (0MB 기본 + 선택 CPU ONNX 리랭커)
+
+파싱 번들(`parsed.json`)이나 원본 문서 폴더를 단일 SQLite 파일(`FTS5` 한글 2-gram + 목차 트리 + 추출 표)로 색인해 청크 절단 없는 원문 섹션 전체(`EvidencePack`)를 바로 꺼내 쓸 수 있습니다.
+
+```bash
+# 0MB 기본 모드: SQLite FTS5(한글 2-gram) + 목차 트리 + DuckDB 표 SQL
+autoetl index ./docs --out ./doc_index.sqlite
+autoetl query ./doc_index.sqlite "개인정보 암호화 보관 기간"
+
+# 선택 초경량 CPU ONNX Cross-Encoder 리랭커(100M~280M INT8, 환각 0%)
+autoetl query ./doc_index.sqlite "개인정보 암호화 보관 기간" \
+  --reranker onnx --reranker-model ./models/bge-reranker-v2-m3-int8.onnx --format json
+```
+
+### 7. Python에서 불러 쓰기
 
 ```python
 import autoetl
@@ -153,6 +169,12 @@ import autoetl
 # 다중 테이블 결정론 분석 & DB 적재 계획 (0MB AI)
 etl = autoetl.analyze_tables(["./sales_data"], purpose="oltp", out_dir="./etl_plan")
 print(etl.load_plan.selected_candidate_id, etl.load_plan.ddl_sql)
+
+# VectorDB 없는 원문 문서 인덱스 & 에이전트/MCP 도구 5종
+autoetl.build_document_index("./docs", "./doc_index.sqlite")
+with autoetl.DocumentToolkit("./doc_index.sqlite") as kit:
+    evidence = kit.search_documents("개인정보 암호화 보관", top_k=5)
+    tools_schema = kit.tool_schemas()  # OpenAI / MCP / 사내 봇에 그대로 연결
 
 # 문서 파싱 & 청킹
 doc = autoetl.parse("notice.hwp")
@@ -163,7 +185,7 @@ manifest = autoetl.export_bundle(doc, "./out_hwp")
 batch = autoetl.parse_batch("./docs", "./batch_out", workers=4, resume=True)
 ```
 
-### 7. 환경 점검
+### 8. 환경 점검
 
 ```bash
 autoetl doctor

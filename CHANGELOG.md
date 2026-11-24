@@ -13,6 +13,10 @@
   - 내부·교차 테이블 관계 분석 및 최적 PK 선정(`relations_multi`, `pk_selector`): FD·상관·산술 파생·범주 계층, 테이블 간 FK(규칙 문자열 가변 슬롯 속 숨은 FK 포함), 피참조 횟수 기반 단일/복합 PK 및 서로게이트 키 권고
   - 최적 DB 스키마 채점·위상 적재 플랜·번들 내보내기(`load_planner`, `analyze_tables`): 목적(`oltp`/`analytics`/`archive`)별 후보 채점, `sqlglot` 재파싱 검증 PostgreSQL DDL + 인덱스 DDL, Kahn 위상 적재 순서, `UPSERT`/`WATERMARK`/`APPEND` 증분 전략, Mermaid ERD(`erd.mmd`) 및 한국어 분석 리포트(`analysis_report.md`)
   - CLI(`autoetl analyze <dir|files...> --out ./etl_plan`), 최상위 Python SDK(`autoetl.analyze_tables`), 로컬 웹 UI(`autoetl ui` 다중 테이블 ETL 분석 모드 + `/api/analyze-tables` + ZIP 다운로드)
+- **VectorDB 없는 원문 문서 인덱스·리트리벌 및 선택 초경량 CPU ONNX 리랭커 (Milestones D1–D2)**:
+  - `src/autoetl/docindex/`: 0MB 기본 **SQLite FTS5(한글 2-gram + 공백 혼합 토크나이저) + 제목 계층 목차 트리 + 원문 섹션 전체 조회 + 격리 DuckDB 표 SQL(`SELECT/WITH` 읽기 전용 검증)** 엔진(`DocumentIndex`, `build_document_index`, `EvidencePack`)
+  - 선택 초경량 CPU ONNX Cross-Encoder 리랭커(`OnnxCrossEncoderReranker`): `bge-reranker-v2-m3(-ko)` / `bge-reranker-base` 등 100M–280M INT8 모델 지연 로딩, 장문 슬라이딩 창 최대 점수 집계, 원문 전체 무손실 반환
+  - 프레임워크 비종속 에이전트/MCP 표준 도구 인터페이스(`DocumentToolkit` — `search_documents`, `get_outline`, `read_section`, `list_tables`, `query_table` 5종 + JSON Schema 스펙 + 단일 디스패처) 및 CLI(`autoetl index`, `autoetl query`)
 
 ## [0.1.0-beta.1] — 2026-11-23 (`0.1.0b1`)
 

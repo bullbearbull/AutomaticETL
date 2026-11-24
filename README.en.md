@@ -12,6 +12,7 @@ Deterministic code extracts digital text and native tables from PDF, Microsoft O
 > Status: **`v0.1.0-beta.1`** (installable from Git; not yet on PyPI).
 > - **Document parser (`parse`, `ui`, `doctor`)**: ready to use across 8 formats, with RAG chunking, folder batching, a local web UI, and optional ONNX layout / OCR-VLM backends.
 > - **Deterministic Structured ETL (`analyze`, `ui`)**: zero-AI (0MB) multi-file CSV/TSV/XLSX analysis — missing values, 10-role column classification, structured string pattern decomposition, cross-table FKs (including hidden string-slot FKs), optimal PK selection, verified PostgreSQL DDL, Mermaid ERD, and topological Load Plan.
+> - **Original-Text Document Index & Retrieval (`index`, `query`)**: VectorDB-free, LLM-free **SQLite FTS5 (Korean 2-gram) + outline tree + sandboxed DuckDB table SQL** (0MB default) plus optional **ultra-lightweight CPU ONNX Cross-Encoder reranker** (100M–280M) returning full unbroken original-text `EvidencePack`s and agent/MCP tool schemas.
 
 ---
 
@@ -26,6 +27,7 @@ Instead of sending every page to an expensive VLM, AutoETL runs a format-native 
 | Stage | What it does | Supported models & backends | CLI flags |
 | --- | --- | --- | --- |
 | **Deterministic Structured ETL** *(0MB AI)* | Multi-file CSV/TSV/XLSX profiling, 10-role column typing, string pattern decomposition, internal/cross-table FKs, PK selection, verified PostgreSQL DDL & topological Load Plan | **No AI model required** (sandboxed DuckDB + `sqlglot` DDL verification + deterministic stats/regex engine) | `autoetl analyze <dir\|files...> --out ./etl_plan` |
+| **Original-Text Doc Index + Optional Reranker** *(0MB default)* | VectorDB-free SQLite FTS5 + outline tree + DuckDB table SQL returning full original sections, with optional CPU Cross-Encoder Top-20 reranking (0% hallucination) | **Default 0MB**: SQLite FTS5 BM25 + Outline + DuckDB SQL<br>**Optional CPU ONNX Reranker**: `bge-reranker-v2-m3(-ko)` (INT8 ~280MB), `bge-reranker-base` (~110MB), `ms-marco-MiniLM-L-6-v2` (~25MB) | `autoetl index <dir> --out ./doc.sqlite`<br>`autoetl query ./doc.sqlite "question" [--reranker onnx --reranker-model ...]` |
 | **AI 1 — Layout Object Detection** | Splits scanned PDFs or image slides into typed regions (tables, charts, formulas, text) before OCR/VLM | **ONNX** (`onnxruntime`): `PP-DocLayoutV2`, `PP-DocLayoutV3`, `PP-DocLayout_plus-L`, `DocLayNet`, `PubLayNet`<br>**HTTP**: local/internal layout detection service<br>*(Built-in `heuristic` pixel detector works with zero model files)* | `--layout-detector onnx\|http\|heuristic`<br>`--layout-label-preset` |
 | **AI 2 — OCR & VLM Understanding** | Converts cropped scans, charts, diagrams, and equations into Markdown and tables | **Specialized OCR-VLMs** *(auto-detected from model name with built-in task prompts)*: `PaddleOCR-VL` (0.9B), `GLM-OCR` (0.9B), `DeepSeek-OCR` (3B)<br>**General VLMs**: any Vision model on Ollama / vLLM / llama-server / LM Studio (e.g. `Qwen2.5-VL`), or external OpenAI-compatible APIs (`gpt-4o`)<br>**Hybrid**: routes plain text scans to local `Tesseract` and only charts/figures to VLM | `--vision ollama\|openai-compat\|hybrid\|tesseract`<br>`--vision-model`<br>`--vision-prompt-preset auto` |
 
@@ -144,7 +146,21 @@ autoetl ui
 
 Starts a stdlib-only web UI on `http://127.0.0.1:8765` (loopback only by default). Switch between **Document Parser** and **Multi-Table ETL Analysis** to inspect column roles, decomposed string patterns, PK/FK graphs, verified DDL, Mermaid ERD, or parsed document outputs, and download the full bundle as a ZIP.
 
-### 6. Python API
+### 6. VectorDB-free original-text document index & retrieval (0MB default + optional CPU ONNX reranker)
+
+Index parsed bundles (`parsed.json`) or raw documents into a single SQLite file (FTS5 with Korean 2-gram + heading outline tree + extracted tables) and retrieve complete, unbroken original sections (`EvidencePack`):
+
+```bash
+# Default 0MB mode: SQLite FTS5 + outline tree + DuckDB table SQL
+autoetl index ./docs --out ./doc_index.sqlite
+autoetl query ./doc_index.sqlite "encryption retention policy"
+
+# Optional ultra-lightweight CPU ONNX Cross-Encoder reranker (100M–280M INT8, 0% hallucination)
+autoetl query ./doc_index.sqlite "encryption retention policy" \
+  --reranker onnx --reranker-model ./models/bge-reranker-v2-m3-int8.onnx --format json
+```
+
+### 7. Python API
 
 ```python
 import autoetl
@@ -152,6 +168,12 @@ import autoetl
 # Multi-table deterministic ETL analysis & DB load plan (0MB AI)
 etl = autoetl.analyze_tables(["./sales_data"], purpose="oltp", out_dir="./etl_plan")
 print(etl.load_plan.selected_candidate_id, etl.load_plan.ddl_sql)
+
+# VectorDB-free original-text document index & 5 agent/MCP tools
+autoetl.build_document_index("./docs", "./doc_index.sqlite")
+with autoetl.DocumentToolkit("./doc_index.sqlite") as kit:
+    evidence = kit.search_documents("encryption retention policy", top_k=5)
+    tools_schema = kit.tool_schemas()  # drop directly into OpenAI / MCP / custom agents
 
 # Document parsing & chunking
 doc = autoetl.parse("notice.hwp")
@@ -161,7 +183,7 @@ manifest = autoetl.export_bundle(doc, "./out_hwp")
 batch = autoetl.parse_batch("./docs", "./batch_out", workers=4, resume=True)
 ```
 
-### 7. Environment check
+### 8. Environment check
 
 ```bash
 autoetl doctor

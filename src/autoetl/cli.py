@@ -383,6 +383,94 @@ def _run_ui(args: argparse.Namespace) -> int:
         return 1
 
 
+def _run_index(args: argparse.Namespace) -> int:
+    from autoetl.docindex import build_document_index
+    from autoetl.parser.adapters import ParserInputError
+
+    inputs: list[Path] = list(args.inputs)
+    for src in inputs:
+        if not src.exists():
+            print(f"인덱싱 대상 파일 또는 폴더가 없다: {src}", file=sys.stderr)
+            return 2
+
+    try:
+        summary = build_document_index(
+            inputs,
+            args.out,
+            recursive=not args.no_recursive,
+            replace=args.replace,
+        )
+    except ParserInputError as exc:
+        print(f"문서 인덱싱에 실패했다: {exc}", file=sys.stderr)
+        return 1
+    except Exception:
+        print(
+            "문서 인덱싱 중 내부 오류가 발생했다(문서 본문 보호를 위해 상세 원문 생략).",
+            file=sys.stderr,
+        )
+        return 3
+
+    if args.json:
+        print(summary.model_dump_json(indent=2))
+    else:
+        print(
+            f"문서 원문 인덱스 구축 완료: {summary.db_path} "
+            f"(신규 {summary.documents_indexed}건, 건너뜀 {summary.documents_skipped}건, "
+            f"섹션 {summary.sections_indexed}개, 표 {summary.tables_indexed}개, "
+            f"{summary.elapsed_seconds:.2f}s)"
+        )
+        for warn in summary.warnings:
+            print(f"- 경고: {warn}")
+    return 0
+
+
+def _run_query(args: argparse.Namespace) -> int:
+    from autoetl.docindex import (
+        DocumentIndex,
+        create_reranker,
+        render_evidence_pack_markdown,
+    )
+    from autoetl.parser.adapters import ParserInputError
+
+    db_path: Path = args.index_db
+    if not db_path.is_file():
+        print(f"문서 인덱스 DB 파일이 없다: {db_path}", file=sys.stderr)
+        return 2
+    if args.top_k <= 0:
+        print("--top-k는 1 이상이어야 한다.", file=sys.stderr)
+        return 2
+
+    try:
+        reranker = create_reranker(
+            args.reranker,
+            model_path=args.reranker_model,
+            tokenizer_path=args.reranker_tokenizer,
+        )
+        with DocumentIndex(db_path) as idx:
+            pack = idx.search(
+                args.question,
+                top_k=args.top_k,
+                candidate_k=max(args.top_k, args.candidate_k),
+                doc_id=args.doc_id,
+                reranker=reranker,
+            )
+    except ParserInputError as exc:
+        print(f"문서 검색에 실패했다: {exc}", file=sys.stderr)
+        return 1
+    except Exception:
+        print(
+            "문서 검색 중 내부 오류가 발생했다(문서 본문 보호를 위해 상세 원문 생략).",
+            file=sys.stderr,
+        )
+        return 3
+
+    if args.format == "json":
+        print(pack.model_dump_json(indent=2))
+    else:
+        print(render_evidence_pack_markdown(pack), end="")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="autoetl", description="결정론 엔진과 LLM 하네스 기반 로컬 ETL·문서 파서"
@@ -695,11 +783,102 @@ def main(argv: list[str] | None = None) -> int:
         help="서버 시작 시 기본 브라우저 자동 열기 비활성화",
     )
 
+    index_cmd = subparsers.add_parser(
+        "index",
+        help=(
+            "파싱된 번들(parsed.json) 또는 원본 문서를 VectorDB 없는 "
+            "SQLite FTS5 원문 인덱스로 구축한다"
+        ),
+    )
+    index_cmd.add_argument(
+        "inputs",
+        nargs="+",
+        type=Path,
+        help="인덱싱할 `parsed.json`, 원본 문서 파일, 또는 폴더(복수 지정 가능)",
+    )
+    index_cmd.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="생성/갱신할 SQLite 원문 인덱스 파일 경로(예: ./doc_index.sqlite)",
+    )
+    index_cmd.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="폴더 입력 시 하위 디렉터리 재귀 탐색 비활성화",
+    )
+    index_cmd.add_argument(
+        "--replace",
+        action="store_true",
+        help="동일 SHA-256 문서가 이미 있어도 기존 색인을 덮어쓰기",
+    )
+    index_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="인덱싱 요약을 JSON 형식으로 출력",
+    )
+
+    query_cmd = subparsers.add_parser(
+        "query",
+        help=(
+            "SQLite FTS5 원문 인덱스(+선택 초경량 CPU ONNX 리랭커)에서 "
+            "원문 근거(EvidencePack)를 검색한다"
+        ),
+    )
+    query_cmd.add_argument("index_db", type=Path, help="문서 인덱스 SQLite 파일 경로")
+    query_cmd.add_argument("question", type=str, help="검색할 질문 또는 키워드")
+    query_cmd.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="반환할 상위 원문 섹션 수(기본: 5)",
+    )
+    query_cmd.add_argument(
+        "--candidate-k",
+        type=int,
+        default=20,
+        help="1단계 FTS5 후보 추출 수(기본: 20)",
+    )
+    query_cmd.add_argument(
+        "--doc-id",
+        type=str,
+        default=None,
+        help="특정 문서로 검색 범위 제한",
+    )
+    query_cmd.add_argument(
+        "--reranker",
+        choices=["none", "onnx"],
+        default="none",
+        help="2단계 Cross-Encoder 리랭커(기본: none — 0MB FTS5 BM25+목차)",
+    )
+    query_cmd.add_argument(
+        "--reranker-model",
+        type=Path,
+        default=None,
+        help="CPU ONNX 리랭커 모델 경로(예: bge-reranker-v2-m3-int8.onnx)",
+    )
+    query_cmd.add_argument(
+        "--reranker-tokenizer",
+        type=Path,
+        default=None,
+        help="리랭커 tokenizer.json 경로(생략 시 모델과 같은 폴더의 tokenizer.json 사용)",
+    )
+    query_cmd.add_argument(
+        "--format",
+        choices=["markdown", "json"],
+        default="markdown",
+        help="출력 형식(기본: markdown)",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "analyze":
         return _run_analyze(args)
     if args.command == "parse":
         return _run_parse(args)
+    if args.command == "index":
+        return _run_index(args)
+    if args.command == "query":
+        return _run_query(args)
     if args.command == "doctor":
         return _run_doctor(args)
     if args.command == "ui":
