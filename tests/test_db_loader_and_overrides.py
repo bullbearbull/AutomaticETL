@@ -1207,6 +1207,11 @@ def test_rollback_snapshot_preserves_json_nested_and_uuid_types(tmp_path: Path) 
         assert getattr(pg_arr_bound[2], "obj", None) == {"b": True}
     assert db_loader._bind_restore_value([1, 2], "int4[]", "postgres") == [1, 2]
     assert db_loader._bind_restore_value([1, 2], "array", "postgres") == [1, 2]
+    # pg_catalog 정규화 캐스트 및 구버전 다차원 jsonb[] 중첩 리스트 안전 거부 검증
+    assert db_loader._PG_TEXT_CAST_TYPES["jsonb"] == "pg_catalog.jsonb"
+    assert db_loader._PG_TEXT_CAST_TYPES["jsonb[]"] == "pg_catalog.jsonb[]"
+    with pytest.raises(InputError, match="배열 차원"):
+        db_loader._bind_restore_value([[None, None], [None, None]], "jsonb[]", "postgres")
     # SQLite fallback도 유효 JSON 문자열로 직렬화
     assert json.loads(db_loader._bind_restore_value({"active": True}, "text", "sqlite")) == {
         "active": True
@@ -1496,3 +1501,126 @@ def test_rollback_interleaved_order_self_fk_cascade_and_unique_reuse(tmp_path: P
     finally:
         con.close()
     assert slot_rows == [("S1", "OLD", ur1.batch_id), ("S3", "KEEP", ur1.batch_id)]
+
+
+def test_rollback_hardening_insert_cap_fallback_numeric_pk_and_delete_trigger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """대량 삽입+소량 갱신 폴백, SQLite NUMERIC PK 동등성, 삭제 무시 트리거 차단을 검증한다."""
+    from autoetl.core import db_loader
+
+    # 1. 대량 삽입 + 소량 갱신 혼합 배치에서 삽입 마커가 행 상한을 넘어도
+    #    일반 테이블은 갱신 스냅샷만 보존하는 폴백으로 정상 롤백되어야 한다.
+    fb_db = tmp_path / "fallback.sqlite"
+    f1 = tmp_path / "fb1" / "branches.csv"
+    f2 = tmp_path / "fb2" / "branches.csv"
+    f1.parent.mkdir()
+    f2.parent.mkdir()
+    f1.write_text("code,name\nKR,Seoul\nUS,NY\n", encoding="utf-8")
+    # 갱신 1건(KR) + 신규 삽입 3건(JP, DE, FR) = 총 4행 > MAX_ROLLBACK_SNAPSHOT_ROWS(2)
+    f2.write_text(
+        "code,name\nKR,Seoul-v2\nJP,Tokyo\nDE,Berlin\nFR,Paris\n",
+        encoding="utf-8",
+    )
+    _, fb_r1 = load_tables([f1], db_path=fb_db, engine="sqlite")
+    monkeypatch.setattr(db_loader, "MAX_ROLLBACK_SNAPSHOT_ROWS", 2)
+    _, fb_r2 = load_tables([f2], db_path=fb_db, engine="sqlite")
+    monkeypatch.setattr(db_loader, "MAX_ROLLBACK_SNAPSHOT_ROWS", 50_000)
+    assert fb_r2.status == "succeeded"
+    assert not any("스냅샷 상한" in w for w in fb_r2.warnings)
+
+    fb_rb = rollback_batch(fb_db, fb_r2.batch_id, engine="sqlite")
+    assert fb_rb["total_deleted"] == 3
+    assert fb_rb["total_restored"] == 1
+    con = sqlite3.connect(str(fb_db))
+    try:
+        fb_rows = con.execute(
+            'SELECT "code", "name", "_etl_batch_id" FROM "branches" ORDER BY "code"'
+        ).fetchall()
+    finally:
+        con.close()
+    assert fb_rows == [("KR", "Seoul", fb_r1.batch_id), ("US", "NY", fb_r1.batch_id)]
+
+    # 2. SQLite NUMERIC PK("001" -> 1): 혼합 배치 롤백 소유권 검증·삭제가 DB 동등성으로 통과
+    num_db = tmp_path / "numeric_pk.sqlite"
+    con = sqlite3.connect(str(num_db))
+    try:
+        con.execute(
+            'CREATE TABLE "codes" ('
+            '"code_id" NUMERIC PRIMARY KEY, '
+            '"label" TEXT NOT NULL, '
+            '"_etl_batch_id" TEXT NOT NULL, '
+            '"_etl_dataset_id" TEXT NOT NULL, '
+            '"_etl_loaded_at" TEXT NOT NULL)'
+        )
+        con.commit()
+    finally:
+        con.close()
+    c1 = tmp_path / "num1" / "codes.csv"
+    c2 = tmp_path / "num2" / "codes.csv"
+    c1.parent.mkdir()
+    c2.parent.mkdir()
+    c1.write_text("code_id,label\nA1,Alpha\nB2,Beta\n", encoding="utf-8")
+    # A1 갱신 + "001" 신규 삽입(SQLite NUMERIC 친화도로 정수 1로 저장됨)
+    c2.write_text("code_id,label\nA1,Alpha-v2\n001,NumericOne\n", encoding="utf-8")
+    _, nr1 = load_tables([c1], db_path=num_db, engine="sqlite")
+    _, nr2 = load_tables([c2], db_path=num_db, engine="sqlite")
+    assert nr2.status == "succeeded"
+
+    nrb = rollback_batch(num_db, nr2.batch_id, engine="sqlite")
+    assert nrb["total_deleted"] == 1
+    assert nrb["total_restored"] == 1
+    con = sqlite3.connect(str(num_db))
+    try:
+        num_rows = con.execute(
+            'SELECT "code_id", "label", "_etl_batch_id" FROM "codes" ORDER BY "code_id"'
+        ).fetchall()
+    finally:
+        con.close()
+    assert num_rows == [("A1", "Alpha", nr1.batch_id), ("B2", "Beta", nr1.batch_id)]
+
+    # 3. BEFORE DELETE 트리거가 신규 행 삭제를 무시(RAISE(IGNORE))할 때 잔존 행을 감지해 롤백 중단
+    trg_db = tmp_path / "skip_delete_trigger.sqlite"
+    con = sqlite3.connect(str(trg_db))
+    try:
+        con.execute(
+            'CREATE TABLE "nodes" ('
+            '"node_id" TEXT PRIMARY KEY, '
+            '"val" TEXT NOT NULL, '
+            '"_etl_batch_id" TEXT NOT NULL, '
+            '"_etl_dataset_id" TEXT NOT NULL, '
+            '"_etl_loaded_at" TEXT NOT NULL)'
+        )
+        con.execute(
+            'CREATE TRIGGER skip_b_del BEFORE DELETE ON "nodes" '
+            "WHEN OLD.\"node_id\" = 'B' BEGIN SELECT RAISE(IGNORE); END"
+        )
+        con.commit()
+    finally:
+        con.close()
+    t1 = tmp_path / "trg1" / "nodes.csv"
+    t2 = tmp_path / "trg2" / "nodes.csv"
+    t1.parent.mkdir()
+    t2.parent.mkdir()
+    t1.write_text("node_id,val\nA,v1\nC,v1\n", encoding="utf-8")
+    t2.write_text("node_id,val\nB,new\nA,v2\n", encoding="utf-8")
+    load_tables([t1], db_path=trg_db, engine="sqlite")
+    _, tr2 = load_tables([t2], db_path=trg_db, engine="sqlite")
+
+    with pytest.raises(InputError, match="삭제 후에도 남아"):
+        rollback_batch(trg_db, tr2.batch_id, engine="sqlite")
+    # 트랜잭션 전체가 롤백되어 A도 v2 그대로, 배치 상태도 succeeded 그대로여야 한다.
+    con = sqlite3.connect(str(trg_db))
+    try:
+        after_fail = con.execute(
+            'SELECT "node_id", "val" FROM "nodes" ORDER BY "node_id"'
+        ).fetchall()
+        st = con.execute(
+            'SELECT "status" FROM "_etl_load_batches" WHERE "batch_id" = ?',
+            (tr2.batch_id,),
+        ).fetchone()
+    finally:
+        con.close()
+    assert after_fail == [("A", "v2"), ("B", "new"), ("C", "v1")]
+    assert st == ("succeeded",)

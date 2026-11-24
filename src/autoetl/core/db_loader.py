@@ -442,6 +442,15 @@ class _DbAdapter:
                 res = self._conn.execute(sql, list(row)).fetchone()
                 total += int(res[0]) if res is not None and res[0] is not None else 0
             return total
+        if _pg_supports_batched_rowcount():
+            with self._conn.cursor() as cur:
+                cur.executemany(sql, rows)
+                rc = cur.rowcount
+                if rc is not None and rc >= 0:
+                    return int(rc)
+                raise InputError(
+                    "PostgreSQL executemany가 갱신 행 수를 보고하지 않아 복원을 검증할 수 없습니다."
+                )
         total = 0
         with self._conn.cursor() as cur:
             for row in rows:
@@ -585,16 +594,23 @@ class _DbAdapter:
         p = self.placeholder
         if self.engine == "postgres":
             rows = self.fetchall(
-                f"SELECT column_name, data_type, udt_name FROM information_schema.columns "
+                f"SELECT column_name, data_type, udt_name, udt_schema "
+                f"FROM information_schema.columns "
                 f"WHERE table_schema=current_schema() AND table_name={p}",
                 (table_name,),
             )
             types_out: dict[str, str] = {}
-            for col_name, dtype_raw, udt_raw in rows:
+            for col_name, dtype_raw, udt_raw, udt_schema_raw in rows:
                 dtype = str(dtype_raw).strip().lower()
                 udt = str(udt_raw or "").strip().lower()
+                udt_schema = str(udt_schema_raw or "").strip().lower()
                 if dtype == "array" and udt.startswith("_"):
-                    types_out[str(col_name)] = f"{udt[1:]}[]"
+                    if udt_schema == "pg_catalog":
+                        types_out[str(col_name)] = f"{udt[1:]}[]"
+                    else:
+                        types_out[str(col_name)] = f"{udt_schema}.{udt[1:]}[]"
+                elif udt_schema and udt_schema != "pg_catalog":
+                    types_out[str(col_name)] = f"{udt_schema}.{udt or dtype}"
                 else:
                     types_out[str(col_name)] = dtype
             return types_out
@@ -1027,11 +1043,34 @@ MAX_ROLLBACK_SNAPSHOT_ROWS = 50_000
 MAX_ROLLBACK_SNAPSHOT_BYTES = 32 * 1024 * 1024
 
 _PG_TEXT_CAST_TYPES: dict[str, str] = {
-    "json": "json",
-    "jsonb": "jsonb",
-    "json[]": "json[]",
-    "jsonb[]": "jsonb[]",
+    "json": "pg_catalog.json",
+    "jsonb": "pg_catalog.jsonb",
+    "json[]": "pg_catalog.json[]",
+    "jsonb[]": "pg_catalog.jsonb[]",
 }
+
+
+def _pg_supports_batched_rowcount() -> bool:
+    """Psycopg 3.1+ 및 libpq 14+의 executemany 파이프라인 누적 rowcount 지원 여부를 판정한다."""
+    try:
+        import psycopg
+    except ImportError:
+        return False
+    ver_str = str(getattr(psycopg, "__version__", "0.0"))
+    parts: list[int] = []
+    for tok in ver_str.split(".")[:2]:
+        digits = "".join(ch for ch in tok if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    if tuple(parts) < (3, 1):
+        return False
+    pq_mod = getattr(psycopg, "pq", None)
+    pq_ver_fn = getattr(pq_mod, "version", None)
+    if callable(pq_ver_fn):
+        try:
+            return int(pq_ver_fn()) >= 140000
+        except (TypeError, ValueError):
+            return False
+    return False
 
 
 class _PgTypedText:
@@ -1165,6 +1204,11 @@ def _bind_restore_value(val: Any, col_type: str, engine: str) -> Any:
             pg_json, pg_jsonb = wrappers
             return pg_json(val) if norm_type == "json" else pg_jsonb(val)
         if norm_type in {"json[]", "jsonb[]"} and isinstance(val, list):
+            if any(isinstance(el, list) for el in val):
+                raise InputError(
+                    f"구버전 `{norm_type}` 스냅샷에 중첩 리스트가 포함되어 "
+                    "배열 차원을 안전하게 판별할 수 없어 복원을 중단합니다."
+                )
             wrappers = _import_pg_json_wrappers()
             if wrappers is None:
                 return [None if el is None else json.dumps(el, ensure_ascii=False) for el in val]
@@ -1284,8 +1328,9 @@ def _fetch_existing_rows_by_pks(
                 order_idx = cf_idx if cf_idx is not None else len(pk_tuples)
             found.append((order_idx, snap_dict))
     found.sort(key=lambda item: item[0])
+    restore_only = [snap for _, snap in found]
     if not include_insert_ops or not found:
-        return [snap for _, snap in found], None
+        return restore_only, None
 
     # 입력 위치가 매칭되지 않은 행이 있으면 삽입/갱신 순서를 확정할 수 없으므로 스냅샷 생략
     if any(idx >= len(pk_tuples) for idx, _ in found):
@@ -1295,10 +1340,14 @@ def _fetch_existing_rows_by_pks(
     if len(found_by_idx) != len(found):
         return None, "order"
 
+    # 삽입 마커를 포함한 전체 연산 수가 상한을 넘으면 갱신 스냅샷만 보존하는 폴백으로 전환한다.
+    # (일반 테이블은 롤백 가능성을 유지하고, 자기참조 FK 테이블은 rollback_batch가 안전 차단)
+    if len(pk_tuples) > row_limit:
+        return restore_only, None
+
     ops: list[dict[str, Any]] = []
+    ops_bytes = total_bytes
     for idx, pk_tup in enumerate(pk_tuples):
-        if len(ops) >= row_limit:
-            return None, "rows"
         if idx in found_by_idx:
             ops.append(found_by_idx[idx])
         else:
@@ -1309,9 +1358,9 @@ def _fetch_existing_rows_by_pks(
                     for col, val in zip(pk_cols, pk_tup, strict=True)
                 },
             }
-            total_bytes += len(json.dumps(del_op, ensure_ascii=False).encode("utf-8")) + 2
-            if total_bytes > byte_limit:
-                return None, "bytes"
+            ops_bytes += len(json.dumps(del_op, ensure_ascii=False).encode("utf-8")) + 2
+            if ops_bytes > byte_limit:
+                return restore_only, None
             ops.append(del_op)
     return ops, None
 
@@ -2477,8 +2526,7 @@ def rollback_batch(
         snap_select = '"rollback_snapshots_json"' if has_snapshot_col else "NULL"
 
         ds_rows = adapter.fetchall(
-            f'SELECT "target_table", "increment_mode", "primary_key_columns", '
-            f'"loaded_at", {snap_select} '
+            f'SELECT "target_table", "increment_mode", "primary_key_columns", {snap_select} '
             f'FROM "_etl_datasets" WHERE "batch_id" = {p} '
             f'ORDER BY "load_order_index" DESC',
             (batch_id,),
@@ -2503,7 +2551,7 @@ def rollback_batch(
             tuple[str, list[str], list[str], list[tuple[str, dict[str, Any]]], bool]
         ] = []
         seen_tables: set[str] = set()
-        for tbl_raw, inc_mode_raw, pk_json_raw, target_loaded_at_raw, snap_raw in ds_rows:
+        for tbl_raw, inc_mode_raw, pk_json_raw, snap_raw in ds_rows:
             tbl = str(tbl_raw)
             if tbl in seen_tables or not adapter.table_exists(tbl):
                 continue
@@ -2577,9 +2625,8 @@ def rollback_batch(
                             f"배치 `{batch_id}`를 먼저 롤백할 수 없습니다. "
                             f"후속 배치(`{later_batch_id}`)를 먼저 롤백해 주세요."
                         )
-            # 스냅샷과 선행 배치 목록이 모두 없는 후속 갱신 배치(rows_updated > 0)는
-            # 영향 범위를 판별할 수 없으므로 선행 배치 롤백을 차단한다(신규 삽입 전용 배치는 허용).
-            target_loaded_at = str(target_loaded_at_raw or "")
+            # 스냅샷과 선행 배치 목록이 모두 없는 활성 갱신 배치(rows_updated > 0)는
+            # 커밋 시점·영향 범위를 판별할 수 없으므로 보수적으로 롤백을 차단한다(삽입 전용은 허용).
             unknown_upd_filter = (
                 'AND d."rows_updated" > 0 '
                 if has_rows_updated_col
@@ -2596,9 +2643,8 @@ def rollback_batch(
                 f'JOIN "_etl_load_batches" b ON d."batch_id" = b."batch_id" '
                 f'WHERE d."target_table" = {p} AND d."batch_id" != {p} '
                 f"AND b.\"status\" IN ('succeeded', 'partial') "
-                f'AND d."loaded_at" >= {p} '
                 f"{unknown_upd_filter}{snap_null_filter}{src_null_filter}",
-                (tbl, batch_id, target_loaded_at),
+                (tbl, batch_id),
             )
             if unknown_later_rows:
                 later_bid = str(unknown_later_rows[0][0])
@@ -2614,16 +2660,19 @@ def rollback_batch(
                 for raw_snap in parsed_snaps:
                     if not isinstance(raw_snap, dict):
                         continue
-                    if raw_snap.get(_SNAPSHOT_OP_KEY) == "delete":
-                        raw_pk = raw_snap.get("pk")
-                        if isinstance(raw_pk, dict):
-                            has_delete_ops = True
-                            rollback_ops.append(
-                                (
-                                    "delete",
-                                    {str(k): _decode_snapshot_value(v) for k, v in raw_pk.items()},
-                                )
+                    if (
+                        raw_snap.get(_SNAPSHOT_OP_KEY) == "delete"
+                        and set(raw_snap.keys()) == {_SNAPSHOT_OP_KEY, "pk"}
+                        and isinstance(raw_snap.get("pk"), dict)
+                    ):
+                        raw_pk = raw_snap["pk"]
+                        has_delete_ops = True
+                        rollback_ops.append(
+                            (
+                                "delete",
+                                {str(k): _decode_snapshot_value(v) for k, v in raw_pk.items()},
                             )
+                        )
                     else:
                         rollback_ops.append(
                             (
@@ -2655,9 +2704,18 @@ def rollback_batch(
                     for o_row in owner_rows:
                         norm_pk = tuple(_normalize_key_for_lookup(v) for v in o_row[:-1])
                         current_owner_by_pk[norm_pk] = str(o_row[-1])
+                where_one_pk = " AND ".join(f"{_qi(c)} = {p}" for c in pk_cols)
                 for op_kind, op_d in rollback_ops:
                     norm_pk = tuple(_normalize_key_for_lookup(op_d[c]) for c in pk_cols)
                     owner = current_owner_by_pk.get(norm_pk)
+                    if owner is None:
+                        # SQLite NUMERIC/COLLATE 등 DB 동등성과 Python 비교가 다를 때 단건 DB 재확인
+                        single_row = adapter.fetchone(
+                            f'SELECT "_etl_batch_id" FROM {_qi(tbl)} WHERE {where_one_pk} LIMIT 1',
+                            [op_d[c] for c in pk_cols],
+                        )
+                        if single_row is not None and single_row[0] is not None:
+                            owner = str(single_row[0])
                     target_label = "갱신 대상 행" if op_kind == "restore" else "신규 삽입 행"
                     if owner is None:
                         raise InputError(
@@ -2671,9 +2729,13 @@ def rollback_batch(
                             "후속 배치를 먼저 롤백해 주세요."
                         )
 
-                # 구버전 스냅샷(삽입 연산 순서 미기록)이 자기참조 FK 테이블에 혼합 삽입·갱신을
-                # 포함하면 삭제 시 CASCADE/참조 위반 위험이 있으므로 삭제 전에 미리 차단한다.
-                if decoded_snapshots and not has_delete_ops:
+                # 구버전·폴백 스냅샷(삽입 마커 없음)은 저비용 자기참조 FK 여부를 먼저 검사하고,
+                # 참일 때만 미기록 삽입 행 존재 여부를 확인해 불필요한 전체 PK 조회를 피한다.
+                if (
+                    decoded_snapshots
+                    and not has_delete_ops
+                    and adapter.has_self_referencing_fk(tbl)
+                ):
                     snap_pk_set = {
                         tuple(_normalize_key_for_lookup(snap[c]) for c in pk_cols)
                         for snap in decoded_snapshots
@@ -2686,7 +2748,7 @@ def rollback_batch(
                         tuple(_normalize_key_for_lookup(v) for v in row) not in snap_pk_set
                         for row in batch_pk_rows
                     )
-                    if has_unrecorded_inserts and adapter.has_self_referencing_fk(tbl):
+                    if has_unrecorded_inserts:
                         raise InputError(
                             f"`{tbl}` 테이블에 자기참조 외래 키가 있고 배치 `{batch_id}`의 "
                             "삽입·갱신 실행 순서 정보가 없어 안전하게 롤백할 수 없습니다."
@@ -2721,6 +2783,15 @@ def rollback_batch(
                             "참조하는 자식 배치를 먼저 롤백해 주세요."
                         ) from exc
                     raise
+                leftover_row = adapter.fetchone(
+                    f'SELECT 1 FROM {_qi(tbl)} WHERE "_etl_batch_id" = {p} LIMIT 1',
+                    (batch_id,),
+                )
+                if leftover_row is not None:
+                    raise InputError(
+                        f"`{tbl}` 테이블의 배치 `{batch_id}` 행이 삭제 후에도 남아 있어 "
+                        "롤백을 중단했습니다."
+                    )
             else:
                 col_types = adapter.column_data_types(tbl)
                 has_self_fk = adapter.has_self_referencing_fk(tbl)
@@ -2754,6 +2825,16 @@ def rollback_batch(
                                     "참조하는 자식 배치를 먼저 롤백해 주세요."
                                 ) from exc
                             raise
+                        leftover_del = adapter.fetchone(
+                            f'SELECT 1 FROM {_qi(_tbl)} WHERE "_etl_batch_id" = {p} '
+                            f"AND {where_pk_chunk} LIMIT 1",
+                            [batch_id, *pk_params],
+                        )
+                        if leftover_del is not None:
+                            raise InputError(
+                                f"`{_tbl}` 테이블의 삭제 대상 신규 행이 삭제 후에도 남아 있어 "
+                                f"배치 `{batch_id}` 롤백을 중단했습니다."
+                            )
                     return len(pk_tuples_to_del)
 
                 def _exec_restore_run(
