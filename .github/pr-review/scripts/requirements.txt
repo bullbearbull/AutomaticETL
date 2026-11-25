@@ -1,2 +1,3 @@
 claude-agent-sdk==0.2.188
 requests>=2.31
+markdown-it-py==4.3.0

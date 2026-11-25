@@ -10,12 +10,12 @@ PR이 열리거나 갱신되거나 초안(Draft)에서 해제될 때마다 Claud
    - CLI 예시: `gh secret set ANTHROPIC_API_KEY -R bullbearbull/AutomaticETL`
    - 시크릿이 아직 등록되지 않은 경우 워크플로는 실패 코멘트 없이 정상 종료(건너뜀)합니다.
 2. `.github/pr-review/`와 `.github/workflows/code-review.yml`이 이 저장소의 리뷰 구성입니다.
-3. (선택) 저장소의 `CLAUDE.md` / `CONTRIBUTING.md`는 리뷰 기준에 자동으로 포함됩니다.
-   리뷰 규칙은 `.github/pr-review/scripts/review_prompt.md`에서 수정합니다.
+3. 자동 리뷰는 PR 기준 커밋의 `.github/pr-review/scripts/review_prompt.md`에서 리뷰 규칙을 읽습니다. `--diff-file`로 로컬에서 실행하면 스크립트와 함께 제공된 규칙을 사용합니다.
 
 ## 환경 변수
 | 이름 | 기본값 | 설명 |
 |---|---|---|
+| `REVIEW_SYSTEM_PROMPT` | 기준 커밋의 리뷰 규칙 | 실행 환경에서 시스템 프롬프트를 지정할 때 사용 |
 | `REVIEW_MODEL` | `claude-opus-5-5` | 사용할 모델 |
 | `REVIEW_MAX_TURNS` | `20` | 에이전트 최대 턴 |
 | `REVIEW_MAX_BUDGET_USD` | `2.0` | 실행당 비용 상한(클라이언트 측 추정치) |
@@ -38,6 +38,8 @@ ANTHROPIC_API_KEY=... uv run --no-project --python 3.12 --with-requirements .git
 
 ## 동작과 제약
 - 에이전트 도구는 `Read`, `Grep`, `Glob`만 허용하고 `.env`·키 파일·`/proc`·`/sys`·홈 숨김 경로(`~/.*`, `~/.*/**`)는 읽기·검색을 거부합니다. 추가로 `PreToolUse` 훅(`on_failure="block"`)이 저장소 작업 디렉터리 외부 경로 및 심볼릭 링크 이탈을 원천 차단합니다.
+- 리뷰 작업 공간에는 크기 제한을 적용한 diff에 포함된 Git 추적 파일 중 비민감 일반 파일만 복사합니다.
+- 모델 요약과 지적의 Markdown을 검사합니다. 본문의 링크, 멘션, 이슈 참조, HTML과 특수 렌더링 코드 블록이 포함되면 리뷰 내용 대신 실패 안내를 게시합니다.
 - fork PR, draft PR, dependabot PR, 문서만 바뀐 PR은 건너뜁니다. `pull_request_target`은 사용하지 않습니다.
 - 같은 커밋 SHA는 다시 리뷰하지 않습니다. 실패한 리뷰는 재실행하면 다시 시도하며, 이전 성공 요약이 이미 있으면 덮어쓰지 않고 하단에 실패 안내만 덧붙입니다.
 - 요약·인라인 코멘트는 지정 봇 계정(`github-actions[bot]`) 작성분만 매칭해 타 계정·타 봇의 마커 스푸핑을 차단하며, GitHub 65,536자 코멘트 길이 상한을 넘지 않도록 안전하게 절단합니다.

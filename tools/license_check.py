@@ -182,13 +182,13 @@ def resolve_license(md: metadata.PackageMetadata) -> tuple[str, bool, str]:
         except ValueError as exc:
             return expr, False, f"SPDX 식 파싱 실패({exc})"
 
-    spdx_ids = [
-        spdx
-        for classifier in md.get_all("Classifier") or []
-        if (spdx := CLASSIFIER_TO_SPDX.get(classifier.strip()))
+    raw_classifiers = [
+        c.strip() for c in (md.get_all("Classifier") or []) if c.strip().startswith("License ::")
     ]
-    if spdx_ids:
-        unique = list(dict.fromkeys(spdx_ids))
+    effective_classifiers = [c for c in raw_classifiers if c != "License :: OSI Approved"]
+    if effective_classifiers:
+        mapped = [CLASSIFIER_TO_SPDX.get(c, c) for c in effective_classifiers]
+        unique = list(dict.fromkeys(mapped))
         return ", ".join(unique), all(s in ALLOWED_LICENSES for s in unique), "Classifier"
 
     field = _header(md, "License")

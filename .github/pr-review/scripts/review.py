@@ -6,8 +6,10 @@ import argparse
 import asyncio
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from collections.abc import Callable
@@ -21,9 +23,11 @@ from comments import (
     format_summary,
     has_reviewed_sha,
     inline_comment,
+    model_comment_policy_error,
     split_findings,
+    summary_comment_policy_error,
 )
-from diffutil import filter_files, parse_diff, truncate_files
+from diffutil import filter_files, is_sensitive_path, parse_diff, truncate_files
 from github_api import GitHubClient
 from prompting import build_user_prompt, load_system_prompt
 from reviewer import ReviewResult, build_options, run_review
@@ -64,6 +68,29 @@ def _local_git_diff(repo_dir: Path, base_sha: str | None, head_sha: str) -> str 
     except (OSError, subprocess.SubprocessError):
         return None
     return proc.stdout if proc.returncode == 0 else None
+
+
+def _copy_review_workspace(repo_dir: Path, workspace: Path, review_paths: set[str]) -> None:
+    """리뷰 범위에 속하고 Git이 추적하는 비민감 일반 파일만 복사한다."""
+    repo_dir = repo_dir.resolve()
+    if not (repo_dir / ".git").exists():
+        return  # Git 체크아웃이 없는 로컬 diff 리뷰는 diff만 사용한다.
+    tracked = subprocess.run(
+        ["git", "ls-files", "--cached", "-z"],
+        cwd=repo_dir,
+        capture_output=True,
+        timeout=60,
+        check=True,
+    ).stdout
+    for name in os.fsdecode(tracked).split("\0"):
+        if name not in review_paths or is_sensitive_path(name):
+            continue
+        source = repo_dir / name
+        if source.is_symlink() or source.resolve() != source or not source.is_file():
+            continue
+        target = workspace / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
 
 
 def write_usage(result: ReviewResult, elapsed: float, model: str) -> None:
@@ -108,6 +135,7 @@ def _run(argv: list[str] | None) -> int:
     repo_dir = Path(os.environ.get("GITHUB_WORKSPACE", "."))
     client: GitHubClient | None = None
     existing_body: str | None = None
+    base_sha: str | None = None
     dry_run = bool(args.dry_run or args.diff_file)
     if args.diff_file:
         sha, diff_text = "local", Path(args.diff_file).read_text(encoding="utf-8")
@@ -172,24 +200,44 @@ def _run(argv: list[str] | None) -> int:
         previous = extract_previous_summary(existing_body)
 
     model = os.environ.get("REVIEW_MODEL", "claude-opus-5-5")
-    options = build_options(
-        load_system_prompt(repo_dir),
-        repo_dir,
-        model,
-        _env_num("REVIEW_MAX_TURNS", 20, int),
-        _env_num("REVIEW_MAX_BUDGET_USD", 2.0, float),
-    )
     # 에이전트 하위 프로세스는 부모 환경을 상속하므로 GitHub 토큰을 사전에 제거한다.
     os.environ.pop("GITHUB_TOKEN", None)
     started = time.monotonic()
-    result = asyncio.run(
-        _review_with_timeout(
-            build_user_prompt(kept, omitted, previous),
-            options,
-            _env_num("REVIEW_TIMEOUT_SECONDS", 720.0, float),
+    try:
+        system_prompt = os.environ.get("REVIEW_SYSTEM_PROMPT", "").strip()
+        if not system_prompt:
+            if not args.diff_file and (not base_sha or not _HEX_SHA_RE.fullmatch(base_sha)):
+                raise ValueError("PR 기준 커밋 SHA를 확인할 수 없습니다.")
+            system_prompt = load_system_prompt(repo_dir, base_sha=base_sha)
+        with tempfile.TemporaryDirectory(prefix="autoetl-review-") as workdir:
+            workspace = Path(workdir)
+            _copy_review_workspace(repo_dir, workspace, {file.path for file in kept})
+            options = build_options(
+                system_prompt,
+                workspace,
+                model,
+                _env_num("REVIEW_MAX_TURNS", 20, int),
+                _env_num("REVIEW_MAX_BUDGET_USD", 2.0, float),
+            )
+            result = asyncio.run(
+                _review_with_timeout(
+                    build_user_prompt(kept, omitted, previous),
+                    options,
+                    _env_num("REVIEW_TIMEOUT_SECONDS", 720.0, float),
+                )
+            )
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        result = ReviewResult(
+            ok=False, error=f"리뷰 준비 실패 ({type(exc).__name__}): {exc!s}"[:240]
         )
-    )
     elapsed = time.monotonic() - started
+
+    if result.ok:
+        policy_error = model_comment_policy_error(result, omitted, sha)
+        if policy_error:
+            result = ReviewResult(
+                ok=False, error=policy_error, usage=result.usage, cost_usd=result.cost_usd
+            )
 
     if not result.ok:
         print(f"review failed: {result.error}", file=sys.stderr)
@@ -241,6 +289,9 @@ def _run(argv: list[str] | None) -> int:
             failed = comments
         demoted += [f for f, c in zip(inline, comments, strict=True) if c in failed]
     body = format_summary(result, demoted, omitted, sha)
+    # GitHub에 일부 인라인 코멘트가 실패하면 실제 요약의 구성이 바뀐다.
+    if summary_error := summary_comment_policy_error(body, sha):
+        body = format_failure_preserving_previous(existing_body, summary_error, sha)
     if dry_run:
         print(body)
         for c in comments:

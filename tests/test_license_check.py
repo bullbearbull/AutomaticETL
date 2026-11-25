@@ -112,6 +112,67 @@ class TestResolveLicense:
         _display, allowed, _basis = license_check.resolve_license(dist.metadata)
         assert not allowed
 
+    def test_mixed_allowed_and_unmapped_or_denied_classifiers_fail(self) -> None:
+        dist = make_dist(
+            "mixed-gpl",
+            headers=[
+                "Classifier: License :: OSI Approved :: MIT License",
+                "Classifier: License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+            ],
+        )
+        display, allowed, basis = license_check.resolve_license(dist.metadata)
+        assert not allowed
+        assert "MIT" in display
+        assert "GNU General Public License v3 (GPLv3)" in display
+        assert basis == "Classifier"
+
+        dist_prop = make_dist(
+            "mixed-prop",
+            headers=[
+                "Classifier: License :: OSI Approved :: MIT License",
+                "Classifier: License :: Other/Proprietary License",
+            ],
+        )
+        _disp2, allowed2, _basis2 = license_check.resolve_license(dist_prop.metadata)
+        assert not allowed2
+
+    def test_unmapped_classifier_does_not_fall_back_to_permissive_license_field(self) -> None:
+        dist = make_dist(
+            "sneaky",
+            headers=[
+                "License: MIT",
+                "Classifier: License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+            ],
+        )
+        _display, allowed, basis = license_check.resolve_license(dist.metadata)
+        assert not allowed
+        assert basis == "Classifier"
+
+    def test_generic_osi_approved_classifier_handling(self) -> None:
+        dist_with_mit = make_dist(
+            "osi-mit",
+            headers=[
+                "Classifier: License :: OSI Approved",
+                "Classifier: License :: OSI Approved :: MIT License",
+            ],
+        )
+        display, allowed, basis = license_check.resolve_license(dist_with_mit.metadata)
+        assert allowed
+        assert display == "MIT"
+        assert basis == "Classifier"
+
+        dist_header_only = make_dist(
+            "osi-only",
+            headers=[
+                "License: MIT",
+                "Classifier: License :: OSI Approved",
+            ],
+        )
+        display2, allowed2, basis2 = license_check.resolve_license(dist_header_only.metadata)
+        assert allowed2
+        assert display2 == "MIT"
+        assert basis2 == "License 필드"
+
     def test_license_field_alias(self) -> None:
         dist = make_dist("qux", headers=["License: Apache License, Version 2.0"])
         _display, allowed, basis = license_check.resolve_license(dist.metadata)

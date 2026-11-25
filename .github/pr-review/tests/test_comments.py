@@ -57,6 +57,14 @@ def test_format_failure_has_markers_and_reason():
     assert "reviewed-sha" not in text
 
 
+def test_published_metadata_omits_active_content():
+    disallowed_path = "see https://example.invalid/fixture"
+    summary = format_summary(result([]), [finding(path=disallowed_path)], [disallowed_path], "sha")
+    failure = format_failure(disallowed_path, "sha")
+    assert disallowed_path not in summary
+    assert disallowed_path not in failure
+
+
 def test_extract_previous_summary_strips_markers():
     body = format_summary(result([]), [], [], "abc123")
     prev = extract_previous_summary(body)

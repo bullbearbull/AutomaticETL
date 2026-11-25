@@ -1,8 +1,10 @@
 import asyncio
 import os
 import subprocess
+from pathlib import Path
 from typing import ClassVar
 
+import pytest
 import review
 from comments import SUMMARY_MARKER
 from reviewer import ReviewResult
@@ -116,6 +118,7 @@ def setup(monkeypatch, tmp_path, result=None, **client_kw):
         "GITHUB_TOKEN": "t",
         "GITHUB_REPOSITORY": "o/r",
         "PR_NUMBER": "7",
+        "REVIEW_SYSTEM_PROMPT": "Test review rules",
         "GITHUB_WORKSPACE": str(tmp_path),
     }.items():
         monkeypatch.setenv(k, v)
@@ -150,6 +153,7 @@ def test_dry_run_prints_and_does_not_post(monkeypatch, tmp_path, capsys):
 
 def test_diff_file_mode_makes_no_github_calls(monkeypatch, tmp_path, capsys):
     calls = setup(monkeypatch, tmp_path)
+    monkeypatch.delenv("REVIEW_SYSTEM_PROMPT")
     f = tmp_path / "x.diff"
     f.write_text(DIFF)
     assert review.main(["--diff-file", str(f)]) == 0
@@ -323,6 +327,178 @@ def test_github_token_not_visible_while_model_runs(monkeypatch, tmp_path):
     monkeypatch.setattr(review, "run_review", spy)
     review.main([])
     assert seen["token"] is None
+
+
+@pytest.mark.parametrize(
+    ("field", "disallowed"),
+    [
+        ("summary", "참고 https://example.invalid/review"),
+        ("title", "팀 멘션 @example-team"),
+        ("body", "[리뷰 참고](./notes)"),
+        ("body", "<span>외부 표시</span>"),
+        ("body", "[리뷰 참고]: ./notes"),
+        ("body", "이슈 참조 GH-123"),
+        ("body", "메일 주소 reviewer@example.invalid"),
+        ("body", "닫히지 않은 코드 `@example-team"),
+        ("body", "```mermaid\nflowchart LR\n```"),
+    ],
+)
+def test_disallowed_model_content_never_reaches_github(monkeypatch, tmp_path, field, disallowed):
+    finding = {"path": "a.py", "line": 2, "severity": "major", "title": "결과", "body": "수정 필요"}
+    summary = "요약"
+    if field == "summary":
+        summary = disallowed
+    else:
+        finding[field] = disallowed
+    previous = f"{SUMMARY_MARKER}\n<!-- reviewed-sha: oldsha -->\n이전 검토"
+    setup(
+        monkeypatch,
+        tmp_path,
+        previous=previous,
+        result=ReviewResult(ok=True, summary=summary, findings=[finding]),
+    )
+
+    assert review.main([]) == 0
+    client = FakeClient.instances[0]
+    assert client.reviews == []
+    [body] = client.summaries
+    assert "이전 검토" in body
+    assert "<!-- review-failed-sha: sha1 -->" in body
+    assert "게시 정책" in body
+    assert disallowed not in body
+
+
+@pytest.mark.parametrize("line", [2, 99])
+def test_publishable_literal_code_is_preserved(monkeypatch, tmp_path, line):
+    summary = "코드 `@dataclass`와 `<diff>`를 확인했습니다."
+    body = "다음 예를 확인하세요.\n\n```python\n@pytest.fixture\ndef values(): ...\n```"
+    finding = {
+        "path": "a.py",
+        "line": line,
+        "severity": "major",
+        "title": "코드 검토",
+        "body": body,
+    }
+    setup(monkeypatch, tmp_path, result=ReviewResult(ok=True, summary=summary, findings=[finding]))
+
+    assert review.main([]) == 0
+    client = FakeClient.instances[0]
+    [published] = client.summaries
+    assert "<!-- reviewed-sha: sha1 -->" in published
+    assert summary in published
+    if line == 2:
+        [[inline]] = client.reviews
+        assert "@pytest.fixture" in inline["body"]
+    else:
+        assert "@pytest.fixture" in published
+
+
+def test_model_workspace_includes_only_reviewable_tracked_files(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    diff = DIFF + DIFF.replace("a.py", "omitted.py")
+    setup(monkeypatch, repo, diff=diff)
+    monkeypatch.setenv("REVIEW_MAX_DIFF_CHARS", str(len(DIFF)))
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "secrets").mkdir()
+    (repo / "secrets" / "fixture.txt").write_text("fixture", encoding="utf-8")
+    (repo / ".env.local").mkdir()
+    (repo / ".env.local" / "fixture.txt").touch()
+    (repo / "untracked.txt").touch()
+    (repo / "unrelated.py").touch()
+    (repo / "omitted.py").touch()
+    (repo / "alias.py").symlink_to("a.py")
+    subprocess.run(
+        [
+            "git",
+            "add",
+            "-f",
+            "a.py",
+            "secrets/fixture.txt",
+            ".env.local/fixture.txt",
+            "alias.py",
+            "unrelated.py",
+            "omitted.py",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    seen = []
+
+    async def spy(prompt, options):
+        workspace = Path(options.cwd)
+        names = sorted(p.name for p in workspace.iterdir())
+        content = (workspace / "a.py").read_text(encoding="utf-8")
+        seen.append((workspace, names, content))
+        return ReviewResult(ok=True, summary="요약", usage=USAGE)
+
+    monkeypatch.setattr(review, "run_review", spy)
+    assert review.main([]) == 0
+    [(workspace, names, content)] = seen
+    assert names == ["a.py"]
+    assert content == "x = 1\n"
+    assert not workspace.exists()
+
+
+def test_workflow_uses_review_rules_from_pr_base_commit(monkeypatch, tmp_path):
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    rules = tmp_path / ".github/pr-review/scripts/review_prompt.md"
+    rules.parent.mkdir(parents=True)
+    base_rules = "기준 커밋의 리뷰 규칙\n"
+    rules.write_text(base_rules, encoding="utf-8")
+    subprocess.run(["git", "add", str(rules)], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Tester", "-c", "user.email=t@example.com", "commit", "-m", "base"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    base_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, text=True
+    ).strip()
+    rules.write_text("검토 대상의 리뷰 규칙\n", encoding="utf-8")
+    (tmp_path / "CLAUDE.md").write_text("검토 대상의 가이드 문서\n", encoding="utf-8")
+    setup(monkeypatch, tmp_path, base_sha=base_sha)
+    monkeypatch.delenv("REVIEW_SYSTEM_PROMPT")
+    seen = []
+
+    async def spy(prompt, options):
+        seen.append(options.system_prompt)
+        return ReviewResult(ok=True, summary="요약", usage=USAGE)
+
+    monkeypatch.setattr(review, "run_review", spy)
+    assert review.main([]) == 0
+    assert seen == [base_rules]
+
+
+def test_missing_base_rules_reports_failure_without_model_call(monkeypatch, tmp_path):
+    calls = setup(monkeypatch, tmp_path, base_sha=None)
+    monkeypatch.delenv("REVIEW_SYSTEM_PROMPT")
+
+    assert review.main([]) == 0
+    assert not calls
+    [body] = FakeClient.instances[0].summaries
+    assert "<!-- review-failed-sha: sha1 -->" in body
+    assert "기준 커밋" in body
+
+
+def test_workspace_copy_failure_preserves_previous_summary(monkeypatch, tmp_path):
+    previous = f"{SUMMARY_MARKER}\n<!-- reviewed-sha: oldsha -->\n이전 성공 내용"
+    calls = setup(monkeypatch, tmp_path, previous=previous)
+
+    def fail_copy(*_args):
+        raise OSError("workspace copy failed")
+
+    monkeypatch.setattr(review, "_copy_review_workspace", fail_copy)
+    assert review.main([]) == 0
+    assert not calls
+    [body] = FakeClient.instances[0].summaries
+    assert "<!-- reviewed-sha: oldsha -->" in body
+    assert "<!-- review-failed-sha: sha1 -->" in body
+    assert "이전 성공 내용" in body
+    assert "workspace copy failed" in body
 
 
 def test_model_timeout_posts_failure_comment(monkeypatch, tmp_path):

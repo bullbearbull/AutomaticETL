@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import fnmatch
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -21,11 +23,13 @@ ALLOWED_TOOLS = ["Read", "Grep", "Glob"]
 SENSITIVE_PATH_PATTERNS: tuple[str, ...] = (
     ".env*",
     "**/.env*",
+    "secrets/**",
     "**/secrets/**",
     "**/*.pem",
     "**/*.key",
     "**/*.p12",
     "**/*.pfx",
+    ".git/**",
     ".git/config",
     "//proc/**",
     "//sys/**",
@@ -66,13 +70,62 @@ def _deny_tool(reason: str) -> SyncHookJSONOutput:
     }
 
 
+_SENSITIVE_GLOB_SAMPLES: tuple[str, ...] = (
+    ".env",
+    ".env.local",
+    "x.pem",
+    "x.key",
+    "x.p12",
+    "x.pfx",
+    "secrets",
+    ".git",
+)
+_INNER_BRACE_RE = re.compile(r"\{([^{}]*)\}")
+
+
 def _has_unsafe_glob_pattern(pattern: str) -> bool:
-    """저장소 루트 밖을 향하는 glob/패턴(절대경로·홈경로·상위 디렉터리 이동)을 판정한다."""
-    stripped = pattern.strip()
-    if stripped.startswith(("/", "~")):
+    """전개된 패턴이 절대·홈 경로 또는 상위 디렉터리를 가리키는지 판정한다."""
+    norm = pattern.strip().replace("\\", "/")
+    return norm.startswith(("/", "~")) or any(part.strip() == ".." for part in norm.split("/"))
+
+
+def _expand_glob_braces(pattern: str, *, max_variants: int = 32) -> list[str] | None:
+    """``{a,b}`` 중괄호 글롭을 최대 ``max_variants``개까지 전개한다. 초과/불완전 구문은 None."""
+    variants = [pattern]
+    while any("{" in v or "}" in v for v in variants):
+        next_variants: list[str] = []
+        progressed = False
+        for v in variants:
+            m = _INNER_BRACE_RE.search(v)
+            if m is None:
+                return None
+            progressed = True
+            prefix = v[: m.start()]
+            suffix = v[m.end() :]
+            for alt in m.group(1).split(","):
+                next_variants.append(f"{prefix}{alt}{suffix}")
+                if len(next_variants) > max_variants:
+                    return None
+        if not progressed:
+            return None
+        variants = next_variants
+    return variants
+
+
+def _glob_may_match_sensitive(pattern: str) -> bool:
+    """민감 경로와 매치되는 세그먼트를 거부한다. `*.*`도 키 확장자와 매치된다.
+
+    재귀 검색의 파일 범위는 CLI가 준비한 비민감 작업 디렉터리로 제한한다.
+    """
+    norm = pattern.replace("\\", "/").lower()
+    if is_sensitive_path(norm):
         return True
-    parts = stripped.replace("\\", "/").split("/")
-    return ".." in parts
+    for seg in norm.split("/"):
+        if not seg or seg in {"*", "**"}:
+            continue
+        if any(fnmatch.fnmatch(sample, seg) for sample in _SENSITIVE_GLOB_SAMPLES):
+            return True
+    return False
 
 
 def make_workspace_guard(cwd: Path) -> HookCallback:
@@ -106,9 +159,10 @@ def make_workspace_guard(cwd: Path) -> HookCallback:
         if pat_key is not None:
             raw_pat = tool_input.get(pat_key)
             if isinstance(raw_pat, str) and raw_pat.strip():
-                if _has_unsafe_glob_pattern(raw_pat):
+                variants = _expand_glob_braces(raw_pat.strip())
+                if variants is None or any(_has_unsafe_glob_pattern(p) for p in variants):
                     return _deny_tool("저장소 외부 경로를 가리키는 패턴은 허용되지 않습니다.")
-                if is_sensitive_path(raw_pat):
+                if any(_glob_may_match_sensitive(p) for p in variants):
                     return _deny_tool("민감 경로 패턴은 검색할 수 없습니다.")
 
         return {}

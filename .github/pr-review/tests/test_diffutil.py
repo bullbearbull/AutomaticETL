@@ -1,6 +1,7 @@
 from diffutil import (
     FileDiff,
     filter_files,
+    is_sensitive_path,
     is_valid_line,
     parse_diff,
     truncate_files,
@@ -170,3 +171,28 @@ def test_parse_diff_preserves_line_numbers_with_form_feed_and_crlf():
     assert f.valid_lines == {1, 2, 3}
     assert is_valid_line([f], "pdf.py", 3) is True
     assert is_valid_line([f], "pdf.py", 4) is False
+
+
+def test_is_sensitive_path_blocks_git_and_bare_sensitive_dirs():
+    for sensitive in (
+        ".git",
+        ".git/",
+        ".git/config",
+        ".git/HEAD",
+        "sub/.git/HEAD",
+        "secrets",
+        "./secrets/",
+        "sub/secrets",
+        "secrets/a.txt",
+        ".env.local",
+        "a/cert.pem",
+    ):
+        assert is_sensitive_path(sensitive) is True, sensitive
+
+    for safe in (
+        "src/secrets_manager.py",
+        "src/git_helper.py",
+        ".github/workflows/ci.yml",
+        "docs/readme.md",
+    ):
+        assert is_sensitive_path(safe) is False, safe

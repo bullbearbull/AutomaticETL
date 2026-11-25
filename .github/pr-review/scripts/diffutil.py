@@ -147,8 +147,7 @@ _GENERATED = [
 ]
 _GENERATED_DIRS = ("dist/", "build/", "node_modules/", "vendor/")
 _SENSITIVE = (".env*", "*.pem", "*.key", "*.p12", "*.pfx")
-_SENSITIVE_DIRS = ("secrets/",)
-_SENSITIVE_EXACT = frozenset({".git/config"})
+_SENSITIVE_DIRS = frozenset({"secrets", ".git"})
 
 
 def _is_generated(path: str) -> bool:
@@ -159,17 +158,15 @@ def _is_generated(path: str) -> bool:
 
 
 def is_sensitive_path(path: str) -> bool:
-    """민감 경로(.env·키 파일·secrets/ 등)가 모델 프롬프트나 도구로 노출되지 않게 판정한다."""
-    norm = path
+    """민감 경로(.env·키 파일·secrets/·.git/ 등)가 모델 프롬프트나 도구로 노출되지 않게 판정한다."""
+    norm = path.replace("\\", "/")
     while norm.startswith("./"):
         norm = norm[2:]
-    norm = norm.lstrip("/").lower()
-    if norm in _SENSITIVE_EXACT:
-        return True
-    base = norm.rsplit("/", 1)[-1]
-    if any(fnmatch.fnmatch(base, pat) for pat in _SENSITIVE):
-        return True
-    return any(norm.startswith(d) or f"/{d}" in norm for d in _SENSITIVE_DIRS)
+    norm = norm.strip("/").lower()
+    return any(
+        segment in _SENSITIVE_DIRS or any(fnmatch.fnmatch(segment, pat) for pat in _SENSITIVE)
+        for segment in norm.split("/")
+    )
 
 
 def filter_files(files: list[FileDiff]) -> list[FileDiff]:
