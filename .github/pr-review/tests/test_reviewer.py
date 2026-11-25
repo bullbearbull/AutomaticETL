@@ -150,6 +150,8 @@ def test_workspace_guard_allows_repo_files_and_blocks_outside_or_sensitive(tmp_p
     assert check("Grep", {"pattern": ".env", "path": "src"}) == {}
     assert check("Grep", {"pattern": "secrets/", "path": "src"}) == {}
     assert check("Glob", {"pattern": "src/**/*.py"}) == {}
+    assert check("Glob", {"pattern": "src/{api,lib}/**/*.py"}) == {}
+    assert check("Grep", {"pattern": "class", "glob": "{src,tests}/**/*.py"}) == {}
     assert check("Glob", {"pattern": "**/*.md"}) == {}
     assert check("Glob", {"pattern": "src/**/*"}) == {}
     assert check("Grep", {"pattern": "def", "glob": "*.py"}) == {}
@@ -185,6 +187,7 @@ def test_workspace_guard_allows_repo_files_and_blocks_outside_or_sensitive(tmp_p
         ("Glob", {"pattern": "secrets"}),
         ("Glob", {"pattern": ".git/*"}),
         ("Glob", {"pattern": "**/.*"}),
+        ("Glob", {"pattern": "*.*"}),
         ("Glob", {"pattern": "*.{pem,txt}"}),
     ):
         res = check(tool, inp)

@@ -84,15 +84,9 @@ _INNER_BRACE_RE = re.compile(r"\{([^{}]*)\}")
 
 
 def _has_unsafe_glob_pattern(pattern: str) -> bool:
-    """저장소 루트 밖을 향하는 glob/패턴(절대경로·홈경로·상위 디렉터리 이동)을 판정한다."""
-    stripped = pattern.strip()
-    if stripped.startswith(("/", "~")):
-        return True
-    for branch in re.split(r"[{},]", stripped):
-        if branch.strip().startswith(("/", "~")):
-            return True
-    parts = [p.strip() for p in re.split(r"[/\\{},]", stripped)]
-    return ".." in parts
+    """전개된 패턴이 절대·홈 경로 또는 상위 디렉터리를 가리키는지 판정한다."""
+    norm = pattern.strip().replace("\\", "/")
+    return norm.startswith(("/", "~")) or any(part.strip() == ".." for part in norm.split("/"))
 
 
 def _expand_glob_braces(pattern: str, *, max_variants: int = 32) -> list[str] | None:
@@ -119,19 +113,18 @@ def _expand_glob_braces(pattern: str, *, max_variants: int = 32) -> list[str] | 
 
 
 def _glob_may_match_sensitive(pattern: str) -> bool:
-    """와일드카드/문자셋/중괄호 글롭 패턴이 민감 파일·디렉터리에 매칭될 가능성을 검사한다."""
-    expanded = _expand_glob_braces(pattern.strip())
-    if expanded is None:
+    """민감 경로와 매치되는 세그먼트를 거부한다. `*.*`도 키 확장자와 매치된다.
+
+    재귀 검색의 파일 범위는 CLI가 준비한 비민감 작업 디렉터리로 제한한다.
+    """
+    norm = pattern.replace("\\", "/").lower()
+    if is_sensitive_path(norm):
         return True
-    for variant in expanded:
-        norm = variant.replace("\\", "/").lower()
-        if is_sensitive_path(norm):
+    for seg in norm.split("/"):
+        if not seg or seg in {"*", "**"}:
+            continue
+        if any(fnmatch.fnmatch(sample, seg) for sample in _SENSITIVE_GLOB_SAMPLES):
             return True
-        for seg in norm.split("/"):
-            if not seg or seg in {"*", "**"}:
-                continue
-            if any(fnmatch.fnmatch(sample, seg) for sample in _SENSITIVE_GLOB_SAMPLES):
-                return True
     return False
 
 
@@ -166,9 +159,10 @@ def make_workspace_guard(cwd: Path) -> HookCallback:
         if pat_key is not None:
             raw_pat = tool_input.get(pat_key)
             if isinstance(raw_pat, str) and raw_pat.strip():
-                if _has_unsafe_glob_pattern(raw_pat):
+                variants = _expand_glob_braces(raw_pat.strip())
+                if variants is None or any(_has_unsafe_glob_pattern(p) for p in variants):
                     return _deny_tool("저장소 외부 경로를 가리키는 패턴은 허용되지 않습니다.")
-                if is_sensitive_path(raw_pat) or _glob_may_match_sensitive(raw_pat):
+                if any(_glob_may_match_sensitive(p) for p in variants):
                     return _deny_tool("민감 경로 패턴은 검색할 수 없습니다.")
 
         return {}

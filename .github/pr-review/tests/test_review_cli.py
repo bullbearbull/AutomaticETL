@@ -1,6 +1,7 @@
 import asyncio
 import os
 import subprocess
+from pathlib import Path
 from typing import ClassVar
 
 import review
@@ -323,6 +324,39 @@ def test_github_token_not_visible_while_model_runs(monkeypatch, tmp_path):
     monkeypatch.setattr(review, "run_review", spy)
     review.main([])
     assert seen["token"] is None
+
+
+def test_model_workspace_includes_only_reviewable_tracked_files(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    setup(monkeypatch, repo)
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "secrets").mkdir()
+    (repo / "secrets" / "fixture.txt").write_text("fixture", encoding="utf-8")
+    (repo / ".env.local").mkdir()
+    (repo / ".env.local" / "fixture.txt").touch()
+    (repo / "untracked.txt").touch()
+    (repo / "alias.py").symlink_to("a.py")
+    subprocess.run(
+        ["git", "add", "-f", "a.py", "secrets/fixture.txt", ".env.local/fixture.txt", "alias.py"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    seen = []
+
+    async def spy(prompt, options):
+        workspace = Path(options.cwd)
+        seen.append((workspace, sorted(p.name for p in workspace.iterdir())))
+        assert (workspace / "a.py").read_text(encoding="utf-8") == "x = 1\n"
+        return ReviewResult(ok=True, summary="요약", usage=USAGE)
+
+    monkeypatch.setattr(review, "run_review", spy)
+    assert review.main([]) == 0
+    [(workspace, names)] = seen
+    assert names == ["a.py"]
+    assert not workspace.exists()
 
 
 def test_model_timeout_posts_failure_comment(monkeypatch, tmp_path):
