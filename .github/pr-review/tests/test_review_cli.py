@@ -339,6 +339,8 @@ def test_github_token_not_visible_while_model_runs(monkeypatch, tmp_path):
         ("body", "[리뷰 참고]: ./notes"),
         ("body", "이슈 참조 GH-123"),
         ("body", "메일 주소 reviewer@example.invalid"),
+        ("body", "닫히지 않은 코드 `@example-team"),
+        ("body", "```mermaid\nflowchart LR\n```"),
     ],
 )
 def test_disallowed_model_content_never_reaches_github(monkeypatch, tmp_path, field, disallowed):
@@ -364,6 +366,31 @@ def test_disallowed_model_content_never_reaches_github(monkeypatch, tmp_path, fi
     assert "<!-- review-failed-sha: sha1 -->" in body
     assert "게시 정책" in body
     assert disallowed not in body
+
+
+@pytest.mark.parametrize("line", [2, 99])
+def test_publishable_literal_code_is_preserved(monkeypatch, tmp_path, line):
+    summary = "코드 `@dataclass`와 `<diff>`를 확인했습니다."
+    body = "다음 예를 확인하세요.\n\n```python\n@pytest.fixture\ndef values(): ...\n```"
+    finding = {
+        "path": "a.py",
+        "line": line,
+        "severity": "major",
+        "title": "코드 검토",
+        "body": body,
+    }
+    setup(monkeypatch, tmp_path, result=ReviewResult(ok=True, summary=summary, findings=[finding]))
+
+    assert review.main([]) == 0
+    client = FakeClient.instances[0]
+    [published] = client.summaries
+    assert "<!-- reviewed-sha: sha1 -->" in published
+    assert summary in published
+    if line == 2:
+        [[inline]] = client.reviews
+        assert "@pytest.fixture" in inline["body"]
+    else:
+        assert "@pytest.fixture" in published
 
 
 def test_model_workspace_includes_only_reviewable_tracked_files(monkeypatch, tmp_path):

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import html
 import re
+from textwrap import indent
 from typing import Any
 from unicodedata import normalize
 
 from diffutil import FileDiff, is_valid_line
+from markdown_it import MarkdownIt
 from reviewer import ReviewResult
 
 SUMMARY_MARKER = "<!-- claude-pr-review -->"
@@ -39,15 +41,44 @@ _CODE_SPAN_UNSAFE_RE = re.compile(r"[\x00-\x1f\x7f`]")
 _POLICY_ERROR = "자동 코멘트 게시 정책 위반으로 리뷰 내용을 생략했습니다."
 
 
-def _has_active_content(value: str) -> bool:
-    normalized = normalize("NFKC", html.unescape(value))
-    return _ACTIVE_CONTENT_RE.search(normalized) is not None
+_MARKDOWN = MarkdownIt("commonmark").enable(["table", "strikethrough"])
+_ACTIVE_TOKENS = frozenset({"link_open", "image", "html_block", "html_inline"})
+_RICH_FENCES = frozenset(
+    {"mermaid", "geojson", "topojson", "stl", "math", "suggestion", "csv", "tsv"}
+)
 
 
-def model_comment_policy_error(result: ReviewResult) -> str | None:
-    """요약과 지적에 링크, 알림, HTML 또는 잘못된 필드가 있으면 게시를 차단한다."""
-    if _has_active_content(result.summary):
-        return _POLICY_ERROR
+def _looks_active(value: str) -> bool:
+    return _ACTIVE_CONTENT_RE.search(normalize("NFKC", html.unescape(value))) is not None
+
+
+def _has_active_content(markdown: str) -> bool:
+    """게시될 Markdown을 파싱해 실제 링크/HTML과 코드 밖의 자동 참조를 차단한다."""
+    env: dict[str, Any] = {}
+    tokens = _MARKDOWN.parse(markdown, env)
+    if env.get("references"):
+        return True
+    for block in tokens:
+        for token in (block, *(block.children or ())):
+            if token.type in _ACTIVE_TOKENS:
+                return True
+            if token.type in {"text", "text_special"} and _looks_active(token.content):
+                return True
+            if (
+                token.type == "fence"
+                and token.info.strip().lower().partition(" ")[0] in _RICH_FENCES
+            ):
+                return True
+    return False
+
+
+def summary_comment_policy_error(body: str, sha: str) -> str | None:
+    content = body.removeprefix(f"{_markers(sha)}\n\n")
+    return _POLICY_ERROR if _has_active_content(content) else None
+
+
+def model_comment_policy_error(result: ReviewResult, omitted: list[str], sha: str) -> str | None:
+    """인라인과 요약 경로에 게시 가능한 모델 출력인지 검증한다."""
     for finding in result.findings:
         if not isinstance(finding, dict):
             return _POLICY_ERROR
@@ -60,15 +91,14 @@ def model_comment_policy_error(result: ReviewResult) -> str | None:
             or severity not in SEVERITY_LABEL
             or not isinstance(title, str)
             or not isinstance(body, str)
-            or _has_active_content(title)
-            or _has_active_content(body)
+            or _has_active_content(inline_comment(finding)["body"])
         ):
             return _POLICY_ERROR
-    return None
+    return summary_comment_policy_error(format_summary(result, result.findings, omitted, sha), sha)
 
 
 def _comment_literal(value: str) -> str:
-    if _CODE_SPAN_UNSAFE_RE.search(value) or _has_active_content(value):
+    if _CODE_SPAN_UNSAFE_RE.search(value) or _looks_active(value):
         value = "게시 정책으로 표시 생략"
     return f"`{value}`"
 
@@ -138,7 +168,8 @@ def format_summary(
         for f in sorted(demoted, key=_rank):
             label = SEVERITY_LABEL.get(f["severity"], f["severity"])
             location = _comment_literal(f"{f['path']}:{f['line']}")
-            lines.append(f"- **[{label}]** {location} — {f['title']}\n  {f['body']}")
+            finding_body = indent(f["body"], "  ")
+            lines.append(f"- **[{label}]** {location} — {f['title']}\n\n{finding_body}")
         parts.append("\n".join(lines))
     if omitted:
         parts.append(

@@ -25,6 +25,7 @@ from comments import (
     inline_comment,
     model_comment_policy_error,
     split_findings,
+    summary_comment_policy_error,
 )
 from diffutil import filter_files, is_sensitive_path, parse_diff, truncate_files
 from github_api import GitHubClient
@@ -232,7 +233,7 @@ def _run(argv: list[str] | None) -> int:
     elapsed = time.monotonic() - started
 
     if result.ok:
-        policy_error = model_comment_policy_error(result)
+        policy_error = model_comment_policy_error(result, omitted, sha)
         if policy_error:
             result = ReviewResult(
                 ok=False, error=policy_error, usage=result.usage, cost_usd=result.cost_usd
@@ -288,6 +289,9 @@ def _run(argv: list[str] | None) -> int:
             failed = comments
         demoted += [f for f, c in zip(inline, comments, strict=True) if c in failed]
     body = format_summary(result, demoted, omitted, sha)
+    # GitHub에 일부 인라인 코멘트가 실패하면 실제 요약의 구성이 바뀐다.
+    if summary_error := summary_comment_policy_error(body, sha):
+        body = format_failure_preserving_previous(existing_body, summary_error, sha)
     if dry_run:
         print(body)
         for c in comments:
