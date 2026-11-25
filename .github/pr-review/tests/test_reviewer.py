@@ -150,6 +150,10 @@ def test_workspace_guard_allows_repo_files_and_blocks_outside_or_sensitive(tmp_p
     assert check("Grep", {"pattern": ".env", "path": "src"}) == {}
     assert check("Grep", {"pattern": "secrets/", "path": "src"}) == {}
     assert check("Glob", {"pattern": "src/**/*.py"}) == {}
+    assert check("Glob", {"pattern": "**/*.md"}) == {}
+    assert check("Glob", {"pattern": "src/**/*"}) == {}
+    assert check("Grep", {"pattern": "def", "glob": "*.py"}) == {}
+    assert check("Grep", {"pattern": "def", "glob": "tests/test_*.py"}) == {}
 
     # 저장소 외부·홈 숨김 경로·심볼릭 링크 이탈·저장소 내부 민감 경로는 모두 거부
     for tool, inp in (
@@ -162,12 +166,26 @@ def test_workspace_guard_allows_repo_files_and_blocks_outside_or_sensitive(tmp_p
         ("Read", {"file_path": ".env"}),
         ("Read", {"file_path": "secrets/creds.json"}),
         ("Read", {"file_path": ".git/config"}),
+        ("Read", {"file_path": ".git/HEAD"}),
         ("Grep", {"pattern": "x", "path": "~/.ssh"}),
+        ("Grep", {"pattern": "x", "path": ".git"}),
+        ("Grep", {"pattern": "x", "path": "secrets"}),
         ("Grep", {"pattern": "x", "glob": "../**/*.py"}),
         ("Grep", {"pattern": "x", "glob": ".env*"}),
         ("Grep", {"pattern": "x", "glob": "**/*.key"}),
+        ("Grep", {"pattern": "x", "glob": "*.p?m"}),
+        ("Grep", {"pattern": "x", "glob": "*.[k]ey"}),
+        ("Grep", {"pattern": "x", "glob": "*.{key,py}"}),
+        ("Grep", {"pattern": "x", "glob": "s?crets/*"}),
+        ("Grep", {"pattern": "x", "glob": ".g?t/*"}),
+        ("Grep", {"pattern": "x", "glob": "{/etc,src}/*"}),
+        ("Grep", {"pattern": "x", "glob": "{~/.ssh,src}/*"}),
         ("Glob", {"pattern": "~/.aws/**"}),
         ("Glob", {"pattern": ".env*"}),
+        ("Glob", {"pattern": "secrets"}),
+        ("Glob", {"pattern": ".git/*"}),
+        ("Glob", {"pattern": "**/.*"}),
+        ("Glob", {"pattern": "*.{pem,txt}"}),
     ):
         res = check(tool, inp)
         assert res["hookSpecificOutput"]["permissionDecision"] == "deny", (tool, inp)
