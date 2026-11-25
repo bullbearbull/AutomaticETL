@@ -23,6 +23,7 @@ from comments import (
     format_summary,
     has_reviewed_sha,
     inline_comment,
+    model_comment_policy_error,
     split_findings,
 )
 from diffutil import filter_files, is_sensitive_path, parse_diff, truncate_files
@@ -68,8 +69,8 @@ def _local_git_diff(repo_dir: Path, base_sha: str | None, head_sha: str) -> str 
     return proc.stdout if proc.returncode == 0 else None
 
 
-def _copy_review_workspace(repo_dir: Path, workspace: Path) -> None:
-    """검색에는 추적 중인 비민감 일반 파일만 제공한다."""
+def _copy_review_workspace(repo_dir: Path, workspace: Path, review_paths: set[str]) -> None:
+    """리뷰 범위에 속하고 Git이 추적하는 비민감 일반 파일만 복사한다."""
     repo_dir = repo_dir.resolve()
     if not (repo_dir / ".git").exists():
         return  # Git 체크아웃이 없는 로컬 diff 리뷰는 diff만 사용한다.
@@ -81,7 +82,7 @@ def _copy_review_workspace(repo_dir: Path, workspace: Path) -> None:
         check=True,
     ).stdout
     for name in os.fsdecode(tracked).split("\0"):
-        if not name or is_sensitive_path(name):
+        if name not in review_paths or is_sensitive_path(name):
             continue
         source = repo_dir / name
         if source.is_symlink() or source.resolve() != source or not source.is_file():
@@ -209,7 +210,7 @@ def _run(argv: list[str] | None) -> int:
             system_prompt = load_system_prompt(repo_dir, base_sha=base_sha)
         with tempfile.TemporaryDirectory(prefix="autoetl-review-") as workdir:
             workspace = Path(workdir)
-            _copy_review_workspace(repo_dir, workspace)
+            _copy_review_workspace(repo_dir, workspace, {file.path for file in kept})
             options = build_options(
                 system_prompt,
                 workspace,
@@ -229,6 +230,13 @@ def _run(argv: list[str] | None) -> int:
             ok=False, error=f"리뷰 준비 실패 ({type(exc).__name__}): {exc!s}"[:240]
         )
     elapsed = time.monotonic() - started
+
+    if result.ok:
+        policy_error = model_comment_policy_error(result)
+        if policy_error:
+            result = ReviewResult(
+                ok=False, error=policy_error, usage=result.usage, cost_usd=result.cost_usd
+            )
 
     if not result.ok:
         print(f"review failed: {result.error}", file=sys.stderr)

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import html
 import re
 from typing import Any
+from unicodedata import normalize
 
 from diffutil import FileDiff, is_valid_line
 from reviewer import ReviewResult
@@ -26,6 +28,49 @@ _FAILURE_NOTICE_RE = re.compile(
     re.escape(FAILURE_NOTICE_START) + r".*?" + re.escape(FAILURE_NOTICE_END),
     flags=re.S,
 )
+
+
+_ACTIVE_CONTENT_RE = re.compile(
+    r"[a-z][a-z0-9+.-]*://|\bwww\.|\b(?:mailto|tel):|@[a-z0-9]|(?:#|\bGH-)\d+"
+    r"|\]\s*\(|\[[^\[\]\r\n]+\][ \t]*:|<[a-z!/?]",
+    flags=re.IGNORECASE,
+)
+_CODE_SPAN_UNSAFE_RE = re.compile(r"[\x00-\x1f\x7f`]")
+_POLICY_ERROR = "자동 코멘트 게시 정책 위반으로 리뷰 내용을 생략했습니다."
+
+
+def _has_active_content(value: str) -> bool:
+    normalized = normalize("NFKC", html.unescape(value))
+    return _ACTIVE_CONTENT_RE.search(normalized) is not None
+
+
+def model_comment_policy_error(result: ReviewResult) -> str | None:
+    """요약과 지적에 링크, 알림, HTML 또는 잘못된 필드가 있으면 게시를 차단한다."""
+    if _has_active_content(result.summary):
+        return _POLICY_ERROR
+    for finding in result.findings:
+        if not isinstance(finding, dict):
+            return _POLICY_ERROR
+        path, line, severity = finding.get("path"), finding.get("line"), finding.get("severity")
+        title, body = finding.get("title"), finding.get("body")
+        if (
+            not isinstance(path, str)
+            or type(line) is not int
+            or not isinstance(severity, str)
+            or severity not in SEVERITY_LABEL
+            or not isinstance(title, str)
+            or not isinstance(body, str)
+            or _has_active_content(title)
+            or _has_active_content(body)
+        ):
+            return _POLICY_ERROR
+    return None
+
+
+def _comment_literal(value: str) -> str:
+    if _CODE_SPAN_UNSAFE_RE.search(value) or _has_active_content(value):
+        value = "게시 정책으로 표시 생략"
+    return f"`{value}`"
 
 
 def _markers(sha: str) -> str:
@@ -92,11 +137,13 @@ def format_summary(
         lines = ["### 라인에 직접 달 수 없는 지적"]
         for f in sorted(demoted, key=_rank):
             label = SEVERITY_LABEL.get(f["severity"], f["severity"])
-            lines.append(f"- **[{label}]** `{f['path']}:{f['line']}` — {f['title']}\n  {f['body']}")
+            location = _comment_literal(f"{f['path']}:{f['line']}")
+            lines.append(f"- **[{label}]** {location} — {f['title']}\n  {f['body']}")
         parts.append("\n".join(lines))
     if omitted:
         parts.append(
-            "### 크기 제한으로 리뷰하지 못한 파일\n" + "\n".join(f"- `{p}`" for p in omitted)
+            "### 크기 제한으로 리뷰하지 못한 파일\n"
+            + "\n".join(f"- {_comment_literal(p)}" for p in omitted)
         )
     return _cap_comment_body("\n\n".join(parts) + "\n")
 
@@ -105,7 +152,7 @@ def format_failure(error: str, sha: str) -> str:
     """이전 성공 요약이 없을 때 사용하는 실패 안내 코멘트를 생성한다."""
     body = (
         f"{SUMMARY_MARKER}\n<!-- review-failed-sha: {sha} -->\n## 🤖 자동 코드 리뷰\n"
-        f"리뷰를 완료하지 못했습니다 (`{error}`). 이 실패는 머지를 막지 않습니다. "
+        f"리뷰를 완료하지 못했습니다 ({_comment_literal(error)}). 이 실패는 머지를 막지 않습니다. "
         "새 커밋을 푸시하거나 워크플로를 다시 실행하면 재시도합니다.\n"
     )
     return _cap_comment_body(body)
@@ -124,7 +171,8 @@ def format_failure_preserving_previous(
         f"{FAILURE_NOTICE_START}\n"
         f"<!-- review-failed-sha: {sha} -->\n"
         "---\n"
-        f"> ⚠️ 최근 커밋(`{sha[:7]}`)의 자동 리뷰를 완료하지 못했습니다 (`{error}`). "
+        f"> ⚠️ 최근 커밋(`{sha[:7]}`)의 자동 리뷰를 완료하지 못했습니다 "
+        f"({_comment_literal(error)}). "
         "이전 리뷰 요약은 유지되며, 이 실패는 머지를 막지 않습니다. "
         "새 커밋을 푸시하거나 워크플로를 다시 실행하면 재시도합니다.\n"
         f"{FAILURE_NOTICE_END}\n"

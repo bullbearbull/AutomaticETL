@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 from typing import ClassVar
 
+import pytest
 import review
 from comments import SUMMARY_MARKER
 from reviewer import ReviewResult
@@ -328,10 +329,49 @@ def test_github_token_not_visible_while_model_runs(monkeypatch, tmp_path):
     assert seen["token"] is None
 
 
+@pytest.mark.parametrize(
+    ("field", "disallowed"),
+    [
+        ("summary", "참고 https://example.invalid/review"),
+        ("title", "팀 멘션 @example-team"),
+        ("body", "[리뷰 참고](./notes)"),
+        ("body", "<span>외부 표시</span>"),
+        ("body", "[리뷰 참고]: ./notes"),
+        ("body", "이슈 참조 GH-123"),
+        ("body", "메일 주소 reviewer@example.invalid"),
+    ],
+)
+def test_disallowed_model_content_never_reaches_github(monkeypatch, tmp_path, field, disallowed):
+    finding = {"path": "a.py", "line": 2, "severity": "major", "title": "결과", "body": "수정 필요"}
+    summary = "요약"
+    if field == "summary":
+        summary = disallowed
+    else:
+        finding[field] = disallowed
+    previous = f"{SUMMARY_MARKER}\n<!-- reviewed-sha: oldsha -->\n이전 검토"
+    setup(
+        monkeypatch,
+        tmp_path,
+        previous=previous,
+        result=ReviewResult(ok=True, summary=summary, findings=[finding]),
+    )
+
+    assert review.main([]) == 0
+    client = FakeClient.instances[0]
+    assert client.reviews == []
+    [body] = client.summaries
+    assert "이전 검토" in body
+    assert "<!-- review-failed-sha: sha1 -->" in body
+    assert "게시 정책" in body
+    assert disallowed not in body
+
+
 def test_model_workspace_includes_only_reviewable_tracked_files(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
-    setup(monkeypatch, repo)
+    diff = DIFF + DIFF.replace("a.py", "omitted.py")
+    setup(monkeypatch, repo, diff=diff)
+    monkeypatch.setenv("REVIEW_MAX_DIFF_CHARS", str(len(DIFF)))
     subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
     (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
     (repo / "secrets").mkdir()
@@ -339,9 +379,21 @@ def test_model_workspace_includes_only_reviewable_tracked_files(monkeypatch, tmp
     (repo / ".env.local").mkdir()
     (repo / ".env.local" / "fixture.txt").touch()
     (repo / "untracked.txt").touch()
+    (repo / "unrelated.py").touch()
+    (repo / "omitted.py").touch()
     (repo / "alias.py").symlink_to("a.py")
     subprocess.run(
-        ["git", "add", "-f", "a.py", "secrets/fixture.txt", ".env.local/fixture.txt", "alias.py"],
+        [
+            "git",
+            "add",
+            "-f",
+            "a.py",
+            "secrets/fixture.txt",
+            ".env.local/fixture.txt",
+            "alias.py",
+            "unrelated.py",
+            "omitted.py",
+        ],
         cwd=repo,
         check=True,
         capture_output=True,
