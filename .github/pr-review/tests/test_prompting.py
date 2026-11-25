@@ -31,22 +31,13 @@ def test_omitted_files_listed():
     assert "big/one.py" in prompt
 
 
-def test_system_prompt_appends_claude_md_when_present(tmp_path):
-    (tmp_path / "CLAUDE.md").write_text("규칙: 탭 대신 스페이스")
+def test_local_system_prompt_keeps_default_review_rules(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text("로컬 가이드 문서", encoding="utf-8")
     prompt = load_system_prompt(tmp_path)
-    assert "규칙: 탭 대신 스페이스" in prompt
-    assert "CLAUDE.md" in prompt
-
-
-def test_system_prompt_without_guideline_files(tmp_path):
-    assert "CLAUDE.md" not in load_system_prompt(tmp_path)
-
-
-def test_system_prompt_stable_across_calls(tmp_path):
-    (tmp_path / "CONTRIBUTING.md").write_text("x" * 50_000)
-    a, b = load_system_prompt(tmp_path), load_system_prompt(tmp_path)
-    assert a == b
-    assert len(a) < 60_000  # each guideline file capped at 20k chars
+    assert "한국어" in prompt
+    assert "심각도" in prompt
+    assert "보안 규칙" in prompt
+    assert "로컬 가이드 문서" not in prompt
 
 
 def test_schema_requires_summary_and_findings():
@@ -54,18 +45,3 @@ def test_schema_requires_summary_and_findings():
     item = REVIEW_SCHEMA["properties"]["findings"]["items"]
     assert set(item["required"]) == {"path", "line", "severity", "title", "body"}
     assert item["properties"]["severity"]["enum"] == ["critical", "major", "minor", "nit"]
-
-
-def test_system_prompt_ignores_symlink_to_sensitive_or_outside_files(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".env").write_text("SECRET_TOKEN=leaked", encoding="utf-8")
-    outside = tmp_path / "outside.txt"
-    outside.write_text("OUTSIDE_SECRET=leaked", encoding="utf-8")
-
-    (repo / "CLAUDE.md").symlink_to(repo / ".env")
-    (repo / "CONTRIBUTING.md").symlink_to(outside)
-
-    prompt = load_system_prompt(repo)
-    assert "SECRET_TOKEN" not in prompt
-    assert "OUTSIDE_SECRET" not in prompt

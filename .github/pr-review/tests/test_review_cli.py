@@ -117,6 +117,7 @@ def setup(monkeypatch, tmp_path, result=None, **client_kw):
         "GITHUB_TOKEN": "t",
         "GITHUB_REPOSITORY": "o/r",
         "PR_NUMBER": "7",
+        "REVIEW_SYSTEM_PROMPT": "Test review rules",
         "GITHUB_WORKSPACE": str(tmp_path),
     }.items():
         monkeypatch.setenv(k, v)
@@ -151,6 +152,7 @@ def test_dry_run_prints_and_does_not_post(monkeypatch, tmp_path, capsys):
 
 def test_diff_file_mode_makes_no_github_calls(monkeypatch, tmp_path, capsys):
     calls = setup(monkeypatch, tmp_path)
+    monkeypatch.delenv("REVIEW_SYSTEM_PROMPT")
     f = tmp_path / "x.diff"
     f.write_text(DIFF)
     assert review.main(["--diff-file", str(f)]) == 0
@@ -348,15 +350,76 @@ def test_model_workspace_includes_only_reviewable_tracked_files(monkeypatch, tmp
 
     async def spy(prompt, options):
         workspace = Path(options.cwd)
-        seen.append((workspace, sorted(p.name for p in workspace.iterdir())))
-        assert (workspace / "a.py").read_text(encoding="utf-8") == "x = 1\n"
+        names = sorted(p.name for p in workspace.iterdir())
+        content = (workspace / "a.py").read_text(encoding="utf-8")
+        seen.append((workspace, names, content))
         return ReviewResult(ok=True, summary="요약", usage=USAGE)
 
     monkeypatch.setattr(review, "run_review", spy)
     assert review.main([]) == 0
-    [(workspace, names)] = seen
+    [(workspace, names, content)] = seen
     assert names == ["a.py"]
+    assert content == "x = 1\n"
     assert not workspace.exists()
+
+
+def test_workflow_uses_review_rules_from_pr_base_commit(monkeypatch, tmp_path):
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    rules = tmp_path / ".github/pr-review/scripts/review_prompt.md"
+    rules.parent.mkdir(parents=True)
+    base_rules = "기준 커밋의 리뷰 규칙\n"
+    rules.write_text(base_rules, encoding="utf-8")
+    subprocess.run(["git", "add", str(rules)], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Tester", "-c", "user.email=t@example.com", "commit", "-m", "base"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    base_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, text=True
+    ).strip()
+    rules.write_text("검토 대상의 리뷰 규칙\n", encoding="utf-8")
+    (tmp_path / "CLAUDE.md").write_text("검토 대상의 가이드 문서\n", encoding="utf-8")
+    setup(monkeypatch, tmp_path, base_sha=base_sha)
+    monkeypatch.delenv("REVIEW_SYSTEM_PROMPT")
+    seen = []
+
+    async def spy(prompt, options):
+        seen.append(options.system_prompt)
+        return ReviewResult(ok=True, summary="요약", usage=USAGE)
+
+    monkeypatch.setattr(review, "run_review", spy)
+    assert review.main([]) == 0
+    assert seen == [base_rules]
+
+
+def test_missing_base_rules_reports_failure_without_model_call(monkeypatch, tmp_path):
+    calls = setup(monkeypatch, tmp_path, base_sha=None)
+    monkeypatch.delenv("REVIEW_SYSTEM_PROMPT")
+
+    assert review.main([]) == 0
+    assert not calls
+    [body] = FakeClient.instances[0].summaries
+    assert "<!-- review-failed-sha: sha1 -->" in body
+    assert "기준 커밋" in body
+
+
+def test_workspace_copy_failure_preserves_previous_summary(monkeypatch, tmp_path):
+    previous = f"{SUMMARY_MARKER}\n<!-- reviewed-sha: oldsha -->\n이전 성공 내용"
+    calls = setup(monkeypatch, tmp_path, previous=previous)
+
+    def fail_copy(*_args):
+        raise OSError("workspace copy failed")
+
+    monkeypatch.setattr(review, "_copy_review_workspace", fail_copy)
+    assert review.main([]) == 0
+    assert not calls
+    [body] = FakeClient.instances[0].summaries
+    assert "<!-- reviewed-sha: oldsha -->" in body
+    assert "<!-- review-failed-sha: sha1 -->" in body
+    assert "이전 성공 내용" in body
+    assert "workspace copy failed" in body
 
 
 def test_model_timeout_posts_failure_comment(monkeypatch, tmp_path):

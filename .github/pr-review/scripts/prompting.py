@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any
 
-from diffutil import FileDiff, is_sensitive_path
+from diffutil import FileDiff
 
-GUIDELINE_FILES = ("CLAUDE.md", "CONTRIBUTING.md")
-GUIDELINE_CHAR_LIMIT = 20_000
-_PROMPT_FILE = Path(__file__).parent / "review_prompt.md"
+_PROMPT_REPO_PATH = ".github/pr-review/scripts/review_prompt.md"
+_PROMPT_FILE = Path(__file__).with_name("review_prompt.md")
 
 REVIEW_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -34,20 +34,23 @@ REVIEW_SCHEMA: dict[str, Any] = {
 }
 
 
-def load_system_prompt(repo_dir: Path) -> str:
-    """고정 리뷰 규칙과 저장소 가이드라인 문서를 결정론적으로 결합한다(프롬프트 캐시 재사용)."""
-    repo_root = Path(repo_dir).resolve()
-    parts = [_PROMPT_FILE.read_text(encoding="utf-8").rstrip()]
-    for name in GUIDELINE_FILES:
-        candidate = (repo_root / name).resolve()
-        if not candidate.is_relative_to(repo_root) or not candidate.is_file():
-            continue
-        rel = candidate.relative_to(repo_root).as_posix()
-        if rel and rel != "." and is_sensitive_path(rel):
-            continue
-        text = candidate.read_text(encoding="utf-8", errors="replace")[:GUIDELINE_CHAR_LIMIT]
-        parts.append(f"## 저장소 가이드라인 ({name})\n{text.rstrip()}")
-    return "\n\n".join(parts) + "\n"
+def load_system_prompt(repo_dir: Path, *, base_sha: str | None = None) -> str:
+    """PR 기준 커밋의 리뷰 규칙을 읽는다. 로컬 diff는 배포된 리뷰 규칙을 사용한다."""
+    if base_sha is None:
+        prompt = _PROMPT_FILE.read_text(encoding="utf-8")
+    else:
+        prompt = subprocess.run(
+            ["git", "show", "--no-ext-diff", "--end-of-options", f"{base_sha}:{_PROMPT_REPO_PATH}"],
+            cwd=repo_dir,
+            capture_output=True,
+            encoding="utf-8",
+            timeout=60,
+            check=True,
+        ).stdout
+    prompt = prompt.rstrip()
+    if not prompt:
+        raise ValueError("기본 리뷰 규칙이 비어 있습니다.")
+    return prompt + "\n"
 
 
 def _escape(text: str, tag: str) -> str:

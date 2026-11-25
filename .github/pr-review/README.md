@@ -10,12 +10,12 @@ PR이 열리거나 갱신되거나 초안(Draft)에서 해제될 때마다 Claud
    - CLI 예시: `gh secret set ANTHROPIC_API_KEY -R bullbearbull/AutomaticETL`
    - 시크릿이 아직 등록되지 않은 경우 워크플로는 실패 코멘트 없이 정상 종료(건너뜀)합니다.
 2. `.github/pr-review/`와 `.github/workflows/code-review.yml`이 이 저장소의 리뷰 구성입니다.
-3. (선택) 저장소의 `CLAUDE.md` / `CONTRIBUTING.md`는 리뷰 기준에 자동으로 포함됩니다.
-   리뷰 규칙은 `.github/pr-review/scripts/review_prompt.md`에서 수정합니다.
+3. 자동 리뷰는 PR 기준 커밋의 `.github/pr-review/scripts/review_prompt.md`에서 리뷰 규칙을 읽습니다. `--diff-file`로 로컬에서 실행하면 스크립트와 함께 제공된 규칙을 사용합니다.
 
 ## 환경 변수
 | 이름 | 기본값 | 설명 |
 |---|---|---|
+| `REVIEW_SYSTEM_PROMPT` | 기준 커밋의 리뷰 규칙 | 실행 환경에서 시스템 프롬프트를 지정할 때 사용 |
 | `REVIEW_MODEL` | `claude-opus-5-5` | 사용할 모델 |
 | `REVIEW_MAX_TURNS` | `20` | 에이전트 최대 턴 |
 | `REVIEW_MAX_BUDGET_USD` | `2.0` | 실행당 비용 상한(클라이언트 측 추정치) |
