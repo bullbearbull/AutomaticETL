@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import autoetl
 import autoetl.parser.ui
 import autoetl.parser.ui.server
@@ -26,6 +29,19 @@ def test_parser_ui_server_module_reexports_autoetl_ui() -> None:
     assert autoetl.parser.ui.server.serve_ui is autoetl.ui.serve_ui
     assert autoetl.parser.ui.server.__all__ == _PUBLIC_NAMES
     assert autoetl.ui.server.create_ui_server is autoetl.ui.create_ui_server
+
+
+def test_importing_parser_ui_still_loads_its_server_module() -> None:
+    """`import autoetl.parser.ui`만으로도 예전처럼 `autoetl.parser.ui.server`를 쓸 수 있다."""
+    code = (
+        "import autoetl.parser.ui as pkg\n"
+        "import autoetl.ui\n"
+        "assert pkg.server.create_ui_server is autoetl.ui.create_ui_server\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=60, check=False
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_top_level_sdk_exports_point_to_autoetl_ui() -> None:

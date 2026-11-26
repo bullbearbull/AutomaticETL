@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from autoetl.ui import LocalParserUiServer, create_ui_server, serve_ui
+from autoetl.parser.ui.server import LocalParserUiServer, create_ui_server, serve_ui
 
 __all__ = [
     "LocalParserUiServer",
