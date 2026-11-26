@@ -52,13 +52,20 @@ _UNSAFE_FILENAME_RE = re.compile(r'[\x00-\x1f\x7f/\\:*?"<>|]+')
 
 
 def _parse_host_header(raw: str | None) -> str | None:
-    """`Host` 헤더 값에서 포트를 뗀 소문자 호스트명을 반환한다(비었거나 형식 오류면 `None`)."""
+    """`Host` 헤더 값에서 포트를 뗀 소문자 호스트명을 반환한다(비었거나 형식 오류면 `None`).
+
+    대괄호 안에는 IPv6 주소만 받는다.
+    """
     value = (raw or "").strip()
     if value.startswith("["):
         end = value.find("]")
         if end < 0:
             return None
         hostname, rest = value[1:end], value[end + 1 :]
+        try:
+            ipaddress.IPv6Address(hostname)
+        except ValueError:
+            return None
         port = rest[1:] if rest.startswith(":") else None
         if rest and port is None:
             return None
@@ -1179,7 +1186,12 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
 
 
 class LocalParserUiServer:
-    """컨텍스트 매니저로 수명 주기를 관리하는 Auto Parser 로컬 웹 UI 서버."""
+    """컨텍스트 매니저로 수명 주기를 관리하는 Auto Parser 로컬 웹 UI 서버.
+
+    `allow_non_loopback=True`이면 루프백이 아닌 주소에도 바인딩할 수 있다. 이때도 요청의
+    Host 헤더는 루프백 이름, IP 주소, 바인딩한 호스트 이름만 받으므로 다른 호스트 이름으로
+    접속하면 403으로 거절된다.
+    """
 
     def __init__(
         self,
@@ -1242,7 +1254,10 @@ def create_ui_server(
     port: int = 8765,
     allow_non_loopback: bool = False,
 ) -> LocalParserUiServer:
-    """백그라운드 테스트 또는 인터랙티브 실행용 `LocalParserUiServer` 인스턴스를 생성한다."""
+    """백그라운드 테스트 또는 인터랙티브 실행용 `LocalParserUiServer` 인스턴스를 생성한다.
+
+    `allow_non_loopback=True`일 때는 IP 주소나 바인딩한 호스트 이름으로 접속해야 한다.
+    """
     return LocalParserUiServer(host=host, port=port, allow_non_loopback=allow_non_loopback)
 
 

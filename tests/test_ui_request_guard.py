@@ -99,6 +99,9 @@ def ui_server() -> Iterator[LocalParserUiServer]:
         ("[::1", None),
         ("[::1]x", None),
         ("[]:8765", None),
+        ("[localhost]:8765", None),
+        ("[127.0.0.1]", None),
+        ("[2001:db8::1]:8765", "2001:db8::1"),
         ("::1", None),
         (":8765", None),
     ],
@@ -145,12 +148,13 @@ def test_get_rejects_foreign_host_with_json_error(
         "127.0.0.1.evil.example",
         "localhost.evil.example",
         "192.0.2.10:{port}",
+        "[localhost]:{port}",
         "",
         None,
     ],
 )
 def test_get_rejects_invalid_host_headers(ui_server: LocalParserUiServer, host: str | None) -> None:
-    """루프백 이름을 앞에 붙인 도메인, 기본 모드의 IP, 빈 Host, Host 없음은 모두 403이다."""
+    """루프백 이름을 붙인 도메인, 기본 모드의 IP, 대괄호 속 이름, 빈 Host, Host 없음은 403이다."""
     port = ui_server.port
     sent = None if host is None else host.format(port=port)
     status, ctype, raw = _request(port, "GET", "/", host=sent)
