@@ -57,6 +57,7 @@ from autoetl.parser.contracts import (
 from autoetl.parser.docx.ooxml import clamp, make_bbox, probe_image_dimensions
 from autoetl.parser.hwp._loader import load_rhwp, load_rhwp_nodes, rhwp_available
 from autoetl.parser.image_io import (
+    DecodedImage,
     EncodedImage,
     crop_decoded_image,
     decode_png,
@@ -97,6 +98,7 @@ class _ContainerMetadata:
     author: str | None = None
     para_to_page: dict[tuple[int, int], int] = field(default_factory=dict)
     section_start_page: dict[int, int] = field(default_factory=dict)
+    page_to_section: dict[int, int] = field(default_factory=dict)
     page_size_pt: dict[int, tuple[float, float]] = field(default_factory=dict)
     page_columns: dict[int, int] = field(default_factory=dict)
     total_pages: int = 1
@@ -230,6 +232,7 @@ def _scan_hwp_section_records(
     *,
     start_page: int,
     para_to_page: dict[tuple[int, int], int],
+    page_to_section: dict[int, int],
     page_size_pt: dict[int, tuple[float, float]],
     page_columns: dict[int, int],
 ) -> int:
@@ -239,6 +242,7 @@ def _scan_hwp_section_records(
     pos = 0
     end = len(data)
     default_size = page_size_pt.get(cur_page, (_A4_WIDTH_PT, _A4_HEIGHT_PT))
+    page_to_section[cur_page] = sec_idx
 
     while pos + 4 <= end:
         hdr = struct.unpack_from("<I", data, pos)[0]
@@ -261,6 +265,7 @@ def _scan_hwp_section_records(
                 col_div = payload[11]
                 if para_idx > 0 and (col_div & 0x04):
                     cur_page += 1
+                    page_to_section[cur_page] = sec_idx
                     page_size_pt.setdefault(cur_page, default_size)
             para_to_page[(sec_idx, para_idx)] = cur_page
             para_idx += 1
@@ -330,6 +335,7 @@ def _validate_hwp_container(source_path: Path) -> _ContainerMetadata:
 
         para_to_page: dict[tuple[int, int], int] = {}
         section_start_page: dict[int, int] = {}
+        page_to_section: dict[int, int] = {}
         page_size_pt: dict[int, tuple[float, float]] = {}
         page_columns: dict[int, int] = {}
         cur_page = 0
@@ -337,6 +343,7 @@ def _validate_hwp_container(source_path: Path) -> _ContainerMetadata:
         for sec_idx, sec_name in enumerate(section_names):
             cur_page += 1
             section_start_page[sec_idx] = cur_page
+            page_to_section[cur_page] = sec_idx
             raw_sec = cfb.read_stream(sec_name)
             if not raw_sec:
                 continue
@@ -350,6 +357,7 @@ def _validate_hwp_container(source_path: Path) -> _ContainerMetadata:
                 sec_idx,
                 start_page=cur_page,
                 para_to_page=para_to_page,
+                page_to_section=page_to_section,
                 page_size_pt=page_size_pt,
                 page_columns=page_columns,
             )
@@ -359,6 +367,7 @@ def _validate_hwp_container(source_path: Path) -> _ContainerMetadata:
             author=summary.author,
             para_to_page=para_to_page,
             section_start_page=section_start_page,
+            page_to_section=page_to_section,
             page_size_pt=page_size_pt,
             page_columns=page_columns,
             total_pages=max(1, cur_page),
@@ -407,6 +416,7 @@ def _scan_hwpx_sections(
 ) -> tuple[
     dict[tuple[int, int], int],
     dict[int, int],
+    dict[int, int],
     dict[int, tuple[float, float]],
     dict[int, int],
     int,
@@ -414,6 +424,7 @@ def _scan_hwpx_sections(
     """HWPX `Contents/section*.xml`에서 물리 페이지·용지 크기·다단 정보를 읽는다."""
     para_to_page: dict[tuple[int, int], int] = {}
     section_start_page: dict[int, int] = {}
+    page_to_section: dict[int, int] = {}
     page_size_pt: dict[int, tuple[float, float]] = {}
     page_columns: dict[int, int] = {}
     cur_page = 0
@@ -421,6 +432,7 @@ def _scan_hwpx_sections(
     for sec_idx, sec_info in enumerate(section_infos):
         cur_page += 1
         section_start_page[sec_idx] = cur_page
+        page_to_section[cur_page] = sec_idx
         sec_default_size = (_A4_WIDTH_PT, _A4_HEIGHT_PT)
         page_size_pt.setdefault(cur_page, sec_default_size)
         try:
@@ -435,6 +447,7 @@ def _scan_hwpx_sections(
             pb = (child.attrib.get("pageBreak") or "").strip().lower()
             if para_idx > 0 and pb in ("1", "true"):
                 cur_page += 1
+                page_to_section[cur_page] = sec_idx
                 page_size_pt.setdefault(cur_page, sec_default_size)
 
             para_to_page[(sec_idx, para_idx)] = cur_page
@@ -464,7 +477,14 @@ def _scan_hwpx_sections(
                     if col_cnt > 1:
                         page_columns[cur_page] = col_cnt
 
-    return para_to_page, section_start_page, page_size_pt, page_columns, max(1, cur_page)
+    return (
+        para_to_page,
+        section_start_page,
+        page_to_section,
+        page_size_pt,
+        page_columns,
+        max(1, cur_page),
+    )
 
 
 def _validate_hwpx_container(source_path: Path) -> _ContainerMetadata:
@@ -509,12 +529,13 @@ def _validate_hwpx_container(source_path: Path) -> _ContainerMetadata:
                     f"본문 섹션(Contents/section*.xml)이 없는 HWPX 문서다: {source_path.name}"
                 )
             title, author = _extract_hwpx_opf_metadata(zf, lower_names)
-            p2p, sec_start, p_sizes, p_cols, tot_pages = _scan_hwpx_sections(zf, section_infos)
+            p2p, sec_start, p2s, p_sizes, p_cols, tot_pages = _scan_hwpx_sections(zf, section_infos)
             return _ContainerMetadata(
                 title=title,
                 author=author,
                 para_to_page=p2p,
                 section_start_page=sec_start,
+                page_to_section=p2s,
                 page_size_pt=p_sizes,
                 page_columns=p_cols,
                 total_pages=tot_pages,
@@ -525,15 +546,33 @@ def _validate_hwpx_container(source_path: Path) -> _ContainerMetadata:
         raise ParserInputError(f"HWPX 파일을 열 수 없다: {source_path.name}") from exc
 
 
-def _resolve_prov_page(prov: Provenance, meta: _ContainerMetadata) -> int:
-    """`Provenance`의 `page_range` → `para_idx` → `section_idx` 순으로 1-based 페이지 결정."""
-    if prov.page_range is not None:
+def _resolve_prov_page(
+    prov: Provenance,
+    meta: _ContainerMetadata,
+    *,
+    use_ir_page_ranges: bool,
+) -> int:
+    """문서 내 일관된 단일 기준으로 `Provenance`의 1-based 페이지를 결정한다."""
+    if use_ir_page_ranges and prov.page_range is not None:
         return max(1, prov.page_range[0] + 1)
     if prov.para_idx is not None:
         mapped = meta.para_to_page.get((prov.section_idx, prov.para_idx))
         if mapped is not None:
             return mapped
     return meta.section_start_page.get(prov.section_idx, max(1, prov.section_idx + 1))
+
+
+def _resolve_section_furniture(
+    by_section: dict[int, list[str]],
+    sec_idx: int,
+) -> list[str]:
+    """해당 섹션의 머리글/바닥글을 조회하되 없으면 직전 정의 섹션에서 상속한다."""
+    if sec_idx in by_section:
+        return by_section[sec_idx]
+    prev_secs = [s for s in by_section if s <= sec_idx]
+    if prev_secs:
+        return by_section[max(prev_secs)]
+    return []
 
 
 def _make_slot_bbox(
@@ -723,6 +762,76 @@ def _render_page_or_region(
     return None
 
 
+@dataclass
+class _PageRenderCache:
+    """한 페이지 안에서 전체 페이지 렌더링(`bbox=None`)을 1회만 수행해 재사용하는 캐시."""
+
+    doc: rhwp.Document
+    source_path: Path
+    page_num: int
+    render_page_num: int | None
+    dpi: int
+    page_renderer: PageRenderer | None
+    total_logical_pages: int
+    layout_page_count: int
+    warnings: list[str]
+    _attempted: bool = False
+    _full_image: EncodedImage | None = None
+    _full_decoded: DecodedImage | None = None
+    _mismatch_warned: bool = False
+
+    def _warn_mismatch_once(self) -> None:
+        if not self._mismatch_warned:
+            self._mismatch_warned = True
+            self.warnings.append(
+                f"페이지 {self.page_num}: 논리 페이지 수({self.total_logical_pages})와 "
+                f"rhwp 조판 페이지 수({self.layout_page_count})가 달라 오렌더링 방지를 위해 "
+                "페이지 렌더링을 건너뛰었다."
+            )
+
+    def get_full_page(self) -> EncodedImage | None:
+        if self.render_page_num is None:
+            self._warn_mismatch_once()
+            return None
+        if not self._attempted:
+            self._attempted = True
+            self._full_image = _render_page_or_region(
+                self.doc,
+                self.source_path,
+                self.render_page_num,
+                None,
+                dpi=self.dpi,
+                page_renderer=self.page_renderer,
+            )
+            if self._full_image is not None and self._full_image.extension == ".png":
+                self._full_decoded = decode_png(self._full_image.data)
+        return self._full_image
+
+    def get_region(self, bbox: BBox | None) -> EncodedImage | None:
+        if self.render_page_num is None:
+            self._warn_mismatch_once()
+            return None
+        if bbox is None:
+            return self.get_full_page()
+        full_img = self.get_full_page()
+        if self._full_decoded is not None:
+            px0 = int(bbox.norm_x0 * self._full_decoded.width)
+            py0 = int(bbox.norm_top * self._full_decoded.height)
+            px1 = int(bbox.norm_x1 * self._full_decoded.width)
+            py1 = int(bbox.norm_bottom * self._full_decoded.height)
+            return crop_decoded_image(self._full_decoded, px0, py0, px1, py1)
+        if full_img is not None:
+            return _render_page_or_region(
+                self.doc,
+                self.source_path,
+                self.render_page_num,
+                bbox,
+                dpi=self.dpi,
+                page_renderer=self.page_renderer,
+            )
+        return None
+
+
 def _build_picture_artifacts(
     doc: rhwp.Document,
     pic_blk: PictureBlock,
@@ -874,21 +983,22 @@ class RhwpDocumentAdapter:
         file_bytes = source_path.read_bytes()
         sha256_hex = hashlib.sha256(file_bytes).hexdigest()
 
+        use_ir_page_ranges = bool(ir.body) and all(b.prov.page_range is not None for b in ir.body)
         blocks_by_page: dict[int, list[Block]] = defaultdict(list)
         max_grouped_page = 1
         for blk in ir.body:
-            p_num = _resolve_prov_page(blk.prov, container_meta)
+            p_num = _resolve_prov_page(
+                blk.prov, container_meta, use_ir_page_ranges=use_ir_page_ranges
+            )
             max_grouped_page = max(max_grouped_page, p_num)
             blocks_by_page[p_num].append(blk)
 
-        has_ir_page_ranges = any(b.prov.page_range is not None for b in ir.body)
-        total_pages = max(
-            1,
-            container_meta.total_pages,
-            len(ir.sections),
-            max_grouped_page,
-            doc.page_count if has_ir_page_ranges else 1,
-        )
+        if use_ir_page_ranges:
+            total_pages = max(1, doc.page_count, max_grouped_page)
+        else:
+            total_pages = max(1, container_meta.total_pages, len(ir.sections), max_grouped_page)
+        layout_page_count = doc.page_count
+        layout_pages_aligned = use_ir_page_ranges or (layout_page_count == total_pages)
         if options.pages is not None:
             invalid = [p for p in options.pages if p < 1 or p > total_pages]
             if invalid:
@@ -910,10 +1020,12 @@ class RhwpDocumentAdapter:
             else None
         )
 
-        # 각주(본문과 동일한 페이지 매핑 사용) / 미주 텍스트 미리 수집
+        # 각주(본문과 동일한 단일 페이지 체계 사용) / 미주 텍스트 미리 수집
         footnotes_by_page: dict[int, list[str]] = defaultdict(list)
         for fn in ir.furniture.footnotes:
-            fn_page = _resolve_prov_page(fn.marker_prov, container_meta)
+            fn_page = _resolve_prov_page(
+                fn.marker_prov, container_meta, use_ir_page_ranges=use_ir_page_ranges
+            )
             fn_text = _flatten_blocks_text(fn.blocks, include_comments=options.include_comments)
             if fn_text:
                 footnotes_by_page[fn_page].append(f"[각주 {fn.number}] {fn_text}")
@@ -924,12 +1036,17 @@ class RhwpDocumentAdapter:
             if en_text:
                 endnote_texts.append(f"[미주 {en.number}] {en_text}")
 
-        hf_template_texts: list[str] = []
+        headers_by_section: dict[int, list[str]] = defaultdict(list)
+        footers_by_section: dict[int, list[str]] = defaultdict(list)
         if options.detect_running_headers_footers:
-            for hf_blk in [*ir.furniture.page_headers, *ir.furniture.page_footers]:
-                hf_txt = _flatten_block_text(hf_blk, include_comments=options.include_comments)
-                if hf_txt:
-                    hf_template_texts.append(hf_txt)
+            for hdr_blk in ir.furniture.page_headers:
+                hf_txt = _flatten_block_text(hdr_blk, include_comments=options.include_comments)
+                if hf_txt and hf_txt not in headers_by_section[hdr_blk.prov.section_idx]:
+                    headers_by_section[hdr_blk.prov.section_idx].append(hf_txt)
+            for ftr_blk in ir.furniture.page_footers:
+                hf_txt = _flatten_block_text(ftr_blk, include_comments=options.include_comments)
+                if hf_txt and hf_txt not in footers_by_section[ftr_blk.prov.section_idx]:
+                    footers_by_section[ftr_blk.prov.section_idx].append(hf_txt)
 
         parsed_pages: list[ParsedPage] = []
         all_tables: list[ExtractedTable] = []
@@ -947,6 +1064,22 @@ class RhwpDocumentAdapter:
                 page_num, (_A4_WIDTH_PT, _A4_HEIGHT_PT)
             )
             page_col_cnt = container_meta.page_columns.get(page_num, 1)
+            render_page_num = (
+                page_num
+                if ((layout_pages_aligned or page_num == 1) and 1 <= page_num <= layout_page_count)
+                else None
+            )
+            page_render_cache = _PageRenderCache(
+                doc=doc,
+                source_path=source_path,
+                page_num=page_num,
+                render_page_num=render_page_num,
+                dpi=options.render_dpi,
+                page_renderer=page_renderer,
+                total_logical_pages=total_pages,
+                layout_page_count=layout_page_count,
+                warnings=warnings,
+            )
 
             raw_blocks = blocks_by_page.get(page_num, [])
             page_doc_blocks: list[DocumentBlock] = []
@@ -1266,14 +1399,7 @@ class RhwpDocumentAdapter:
                     det_w = pw or 0
                     det_h = ph or 0
                 else:
-                    render_img = _render_page_or_region(
-                        doc,
-                        source_path,
-                        page_num,
-                        None,
-                        dpi=options.render_dpi,
-                        page_renderer=page_renderer,
-                    )
+                    render_img = page_render_cache.get_full_page()
                     if render_img is not None:
                         det_bytes = render_img.data
                         det_ext = render_img.extension
@@ -1420,16 +1546,9 @@ class RhwpDocumentAdapter:
                 is_real_bbox = vis.region_id in real_page_bbox_ids
                 render_bbox = vis.bbox if is_real_bbox else None
 
-                # 임베디드 벡터(.svg/.emf/.wmf)는 PNG로 래스터화해 VLM에 전달
+                # 임베디드 벡터(.svg/.emf/.wmf)는 PNG로 래스터화해 VLM에 전달 (페이지당 1회 캐시)
                 if img_bytes is not None and img_ext.lower() not in _RASTER_IMAGE_EXTS:
-                    rendered = _render_page_or_region(
-                        doc,
-                        source_path,
-                        page_num,
-                        render_bbox,
-                        dpi=options.render_dpi,
-                        page_renderer=page_renderer,
-                    )
+                    rendered = page_render_cache.get_region(render_bbox)
                     if rendered is not None:
                         img_bytes = rendered.data
                         img_ext = rendered.extension
@@ -1448,14 +1567,7 @@ class RhwpDocumentAdapter:
                         is_real_bbox or active_vision is not None or options.extract_crops
                     )
                     if should_render:
-                        rendered = _render_page_or_region(
-                            doc,
-                            source_path,
-                            page_num,
-                            render_bbox,
-                            dpi=options.render_dpi,
-                            page_renderer=page_renderer,
-                        )
+                        rendered = page_render_cache.get_region(render_bbox)
                         if rendered is not None:
                             img_bytes = rendered.data
                             img_ext = rendered.extension
@@ -1637,6 +1749,11 @@ class RhwpDocumentAdapter:
                 dict.fromkeys(r.strategy for r in page_region_routes if r.strategy != primary_strat)
             )
 
+            sec_idx = container_meta.page_to_section.get(page_num, 0)
+            page_hf_texts = [
+                *_resolve_section_furniture(headers_by_section, sec_idx),
+                *_resolve_section_furniture(footers_by_section, sec_idx),
+            ]
             hf_bbox = make_bbox(
                 0.08 * page_w_pt,
                 0.02 * page_h_pt,
@@ -1655,7 +1772,7 @@ class RhwpDocumentAdapter:
                     bbox=hf_bbox,
                     text=hf_txt,
                 )
-                for hf_idx, hf_txt in enumerate(hf_template_texts, start=1)
+                for hf_idx, hf_txt in enumerate(page_hf_texts, start=1)
             ]
 
             metrics = PageMetrics(

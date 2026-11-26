@@ -1283,3 +1283,144 @@ def test_hwpx_review_regression_guards(
     doc_no_comments = parse_document(hwpx_path, options=ParseOptions(include_comments=False))
     t1_no_cmt = doc_no_comments.pages[0].tables[1]
     assert "셀 내부 주석" not in (t1_no_cmt.headers[0] if t1_no_cmt.headers else "")
+
+
+def test_hwpx_render_cache_section_headers_and_page_mismatch_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """페이지당 전체 렌더 1회 캐시·섹션별 머리글 분리·조판 페이지 불일치 경고를 검증한다."""
+    import rhwp
+
+    from autoetl.parser import parse_document
+
+    svg_bytes = (
+        b'<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40">'
+        b'<rect width="80" height="40"/></svg>'
+    )
+    container_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<ocf:container xmlns:ocf="urn:oasis:names:tc:opendocument:xmlns:container">
+  <ocf:rootfiles>
+    <ocf:rootfile full-path="Contents/content.hpf" media-type="application/hwpml-package+xml"/>
+  </ocf:rootfiles>
+</ocf:container>"""
+    content_hpf = """<?xml version="1.0" encoding="UTF-8"?>
+<opf:package xmlns:opf="http://www.idpf.org/2007/opf/" version="1.0">
+  <opf:metadata><opf:title>캐시 및 섹션 머리글 검증</opf:title></opf:metadata>
+  <opf:manifest>
+    <opf:item id="header" href="Contents/header.xml" media-type="application/xml"/>
+    <opf:item id="section0" href="Contents/section0.xml" media-type="application/xml"/>
+    <opf:item id="section1" href="Contents/section1.xml" media-type="application/xml"/>
+    <opf:item id="vec1" href="BinData/vec1.svg" media-type="image/svg+xml"/>
+    <opf:item id="vec2" href="BinData/vec2.svg" media-type="image/svg+xml"/>
+  </opf:manifest>
+  <opf:spine>
+    <opf:itemref idref="header"/>
+    <opf:itemref idref="section0"/>
+    <opf:itemref idref="section1"/>
+  </opf:spine>
+</opf:package>"""
+    header_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:refList>
+    <hh:charProperties><hh:charPr id="0" height="1000"/></hh:charProperties>
+    <hh:paraProperties><hh:paraPr id="0"/></hh:paraProperties>
+    <hh:styles>
+      <hh:style id="0" name="바탕글" engName="Normal" paraPrIDRef="0" charPrIDRef="0"/>
+    </hh:styles>
+  </hh:refList>
+</hh:head>"""
+    section0_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section"
+        xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run>
+      <hp:secPr><hp:pagePr landscape="WIDELY" width="59528" height="84188"/></hp:secPr>
+      <hp:ctrl>
+        <hp:header>
+          <hp:subList><hp:p><hp:run><hp:t>섹션0 머리글</hp:t></hp:run></hp:p></hp:subList>
+        </hp:header>
+      </hp:ctrl>
+      <hp:pic id="svg_a">
+        <hp:curSz width="12000" height="8000"/><hc:img binaryItemIDRef="vec1"/>
+      </hp:pic>
+      <hp:pic id="svg_b">
+        <hp:curSz width="12000" height="8000"/><hc:img binaryItemIDRef="vec2"/>
+      </hp:pic>
+    </hp:run>
+  </hp:p>
+</hs:sec>"""
+    section1_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section"
+        xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run>
+      <hp:secPr><hp:pagePr landscape="WIDELY" width="59528" height="84188"/></hp:secPr>
+      <hp:ctrl>
+        <hp:header>
+          <hp:subList><hp:p><hp:run><hp:t>섹션1 머리글</hp:t></hp:run></hp:p></hp:subList>
+        </hp:header>
+      </hp:ctrl>
+      <hp:pic id="svg_c">
+        <hp:curSz width="12000" height="8000"/><hc:img binaryItemIDRef="vec1"/>
+      </hp:pic>
+    </hp:run>
+  </hp:p>
+</hs:sec>"""
+
+    hwpx_path = tmp_path / "cache_hdr.hwpx"
+    with zipfile.ZipFile(hwpx_path, "w") as zf:
+        zf.writestr("mimetype", "application/hwp+zip")
+        zf.writestr("META-INF/container.xml", container_xml)
+        zf.writestr("Contents/content.hpf", content_hpf)
+        zf.writestr("Contents/header.xml", header_xml)
+        zf.writestr("Contents/section0.xml", section0_xml)
+        zf.writestr("Contents/section1.xml", section1_xml)
+        zf.writestr("BinData/vec1.svg", svg_bytes)
+        zf.writestr("BinData/vec2.svg", svg_bytes)
+
+    render_calls_by_page: dict[int, int] = {}
+    orig_render_region = RhwpPageRenderer.render_document_region
+
+    def counting_render_region(
+        doc_obj: object,
+        page_number: int,
+        bbox: object,
+        *,
+        dpi: int = 150,
+    ) -> object:
+        render_calls_by_page[page_number] = render_calls_by_page.get(page_number, 0) + 1
+        return orig_render_region(doc_obj, page_number, bbox, dpi=dpi)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(RhwpPageRenderer, "render_document_region", counting_render_region)
+
+    doc_cached = parse_document(hwpx_path, options=ParseOptions(extract_crops=True))
+    # Page 1에 SVG가 2개 있어도 전체 페이지 렌더는 1회만 호출
+    assert render_calls_by_page.get(1) == 1
+    assert render_calls_by_page.get(2) == 1
+    # 섹션별 머리글 분리
+    p1_hf = [b.text for b in doc_cached.pages[0].header_footer_blocks]
+    p2_hf = [b.text for b in doc_cached.pages[1].header_footer_blocks]
+    assert p1_hf == ["섹션0 머리글"]
+    assert p2_hf == ["섹션1 머리글"]
+
+    # 논리 페이지 수(2) != 조판 페이지 수(1) 불일치 시 Page 2 렌더링 건너뛰고 경고 기록
+    orig_parse = rhwp.parse
+
+    class _MismatchDocProxy:
+        def __init__(self, inner: object) -> None:
+            self._inner = inner
+
+        @property
+        def page_count(self) -> int:
+            return 1
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(rhwp, "parse", lambda path: _MismatchDocProxy(orig_parse(path)))
+    doc_mismatch = parse_document(hwpx_path, options=ParseOptions(extract_crops=True))
+    assert doc_mismatch.pages[1].visual_regions[0].crop_status == CropStatus.RENDERER_UNAVAILABLE
+    assert any("조판 페이지 수(1)" in w for w in doc_mismatch.warnings)
