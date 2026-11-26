@@ -13,14 +13,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from string import ascii_lowercase, ascii_uppercase
 from typing import Any
 
 import duckdb
@@ -53,6 +56,13 @@ from autoetl.parser.pipeline import parse_document, supported_extensions
 
 _INT_RE = re.compile(r"^[+-]?\d{1,3}(?:,\d{3})*$|^[+-]?\d+$")
 _FLOAT_RE = re.compile(r"^[+-]?(?:\d{1,3}(?:,\d{3})*|\d+)\.\d+$")
+_BIGINT_MIN = -(2**63)
+_BIGINT_MAX = 2**63 - 1
+_BIGINT_MAX_DIGITS = len(str(_BIGINT_MAX))
+# DuckDB folds ASCII letters in identifiers, including quoted identifiers.
+_DUCKDB_IDENTIFIER_FOLD = str.maketrans(ascii_uppercase, ascii_lowercase)
+# FTS5 replaces nonpositive IDF with 1e-6. Even 32 floor-only terms score below 1e-4.
+_FTS5_BM25_FLOOR_THRESHOLD = 1e-4
 _FORBIDDEN_SQL_FUNCS = frozenset(
     {
         "read_csv",
@@ -80,6 +90,15 @@ CREATE TABLE IF NOT EXISTS documents (
     page_count INTEGER NOT NULL,
     metadata_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS document_source_paths (
+    doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    canonical_path TEXT NOT NULL,
+    PRIMARY KEY (doc_id, canonical_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_source_paths_canonical
+    ON document_source_paths(canonical_path);
 
 CREATE TABLE IF NOT EXISTS sections (
     section_id TEXT PRIMARY KEY,
@@ -143,18 +162,31 @@ class _DraftSection:
     table_ids: list[str] = field(default_factory=list)
 
 
-def _normalize_source_path(source_path: str) -> str:
-    """`--replace` 경로 매칭을 위한 결정론적 경로 정규화."""
+def _source_path_keys(source_path: str) -> tuple[str, ...]:
+    """디렉터리 정보가 있는 경로의 기준·해석 절대 경로 키 목록을 반환한다.
+
+    상대 경로는 색인 프로세스의 현재 작업 디렉터리에 실제로 존재하는 경우에만
+    절대 경로로 확장해, 외부에서 생성된 파싱 번들의 미존재 상대 경로를
+    현재 디렉터리 파일과 혼동하지 않도록 한다.
+    `os.path.abspath`처럼 심볼릭 링크 해석 전에 `..`를 어휘적으로 접지 않도록
+    기준 경로와 부모 디렉터리 해석 경로(`parent.resolve() / name`)를 함께 기록한다.
+    """
     raw = source_path.strip()
-    if not raw:
-        return raw
-    try:
-        p = Path(raw)
-        if p.exists():
-            return str(p.resolve())
-    except OSError:
-        pass
-    return raw.replace("\\", "/")
+    path = Path(raw)
+    if not raw or path.name == raw:
+        return ()
+    if not path.is_absolute() and not os.path.lexists(raw):
+        return ()
+
+    keys: list[str] = []
+    with contextlib.suppress(OSError, RuntimeError):
+        anchored = path if path.is_absolute() else (Path.cwd() / path)
+        keys.append(str(anchored))
+        if anchored.name not in {"", ".", ".."}:
+            keys.append(str(anchored.parent.resolve() / anchored.name))
+    with contextlib.suppress(OSError, RuntimeError):
+        keys.append(str(path.resolve()))
+    return tuple(dict.fromkeys(keys))
 
 
 def _expand_query_terms(
@@ -313,10 +345,12 @@ def _validate_readonly_sql(sql: str) -> str:
         raise ParserInputError(f"SQL 구문을 해석할 수 없다: {exc}") from exc
     if len(stmts) != 1:
         raise ParserInputError("표 조회에는 단일 SELECT 문만 허용된다.")
-    root = stmts[0]
-    if not isinstance(root, (exp.Select, exp.Union)):
+    inner_root: exp.Expr | None = stmts[0]
+    while isinstance(inner_root, exp.Subquery):
+        inner_root = inner_root.this
+    if not isinstance(inner_root, (exp.Select, exp.SetOperation)):
         raise ParserInputError("보안상 표 조회에는 읽기 전용 SELECT/WITH 질의만 허용된다.")
-    for node in root.walk():
+    for node in stmts[0].walk():
         if isinstance(
             node, (exp.Command, exp.Insert, exp.Update, exp.Delete, exp.Drop, exp.Create)
         ):
@@ -341,29 +375,47 @@ def _strip_currency_prefix(raw: str) -> str:
 
 def _infer_duckdb_col_type(values: Sequence[str]) -> tuple[str, list[Any]]:
     """정수·실수(천단위 쉼표·통화기호 포함) 표 칼럼을 수치형으로 변환해 집계 SQL을 지원한다."""
-    non_empty = [_strip_currency_prefix(v) for v in values if v.strip() != ""]
-    if not non_empty:
-        return "VARCHAR", [None if v.strip() == "" else v for v in values]
-
-    if all(_INT_RE.fullmatch(v) is not None for v in non_empty):
-        return (
-            "BIGINT",
-            [
-                None if v.strip() == "" else int(_strip_currency_prefix(v).replace(",", ""))
-                for v in values
-            ],
-        )
-    if all(
-        (_INT_RE.fullmatch(v) is not None or _FLOAT_RE.fullmatch(v) is not None) for v in non_empty
-    ):
-        return (
-            "DOUBLE",
-            [
-                None if v.strip() == "" else float(_strip_currency_prefix(v).replace(",", ""))
-                for v in values
-            ],
-        )
-    return "VARCHAR", [None if v.strip() == "" else v.strip() for v in values]
+    col_type = "VARCHAR"
+    numbers: list[str | None] = []
+    for value in values:
+        text = value.strip()
+        if not text:
+            numbers.append(None)
+            continue
+        numeric = _strip_currency_prefix(text)
+        ungrouped = numeric.replace(",", "")
+        if _INT_RE.fullmatch(numeric):
+            digits = ungrouped.lstrip("+-")
+            if len(digits) > 1 and int(digits[0]) == 0:
+                if text == ungrouped:
+                    break
+                sign = ungrouped[: len(ungrouped) - len(digits)]
+                first_significant_digit = next(
+                    (i for i, digit in enumerate(digits) if int(digit)), len(digits) - 1
+                )
+                digits = digits[first_significant_digit:]
+                ungrouped = sign + digits
+            if len(digits) > _BIGINT_MAX_DIGITS:
+                break
+            if len(digits) == _BIGINT_MAX_DIGITS and not (
+                _BIGINT_MIN <= int(ungrouped) <= _BIGINT_MAX
+            ):
+                break
+            if col_type == "VARCHAR":
+                col_type = "BIGINT"
+        elif _FLOAT_RE.fullmatch(numeric):
+            int_part = ungrouped.lstrip("+-").partition(".")[0]
+            if len(int_part) > 1 and int(int_part[0]) == 0 and text == ungrouped:
+                break
+            col_type = "DOUBLE"
+        else:
+            break
+        numbers.append(ungrouped)
+    else:
+        if col_type != "VARCHAR":
+            cast = int if col_type == "BIGINT" else float
+            return col_type, [None if number is None else cast(number) for number in numbers]
+    return "VARCHAR", [value.strip() or None for value in values]
 
 
 class DocumentIndex:
@@ -409,30 +461,47 @@ class DocumentIndex:
         """
         sha = doc.document.sha256
         raw_source_path = doc.document.source_path
-        norm_source_path = _normalize_source_path(raw_source_path)
+        if not replace:
+            existing_sha = self._conn.execute(
+                "SELECT doc_id FROM documents WHERE sha256 = ?", (sha,)
+            ).fetchone()
+            if existing_sha is not None:
+                return (str(existing_sha["doc_id"]), False, 0, 0)
 
-        existing_sha = self._conn.execute(
-            "SELECT doc_id FROM documents WHERE sha256 = ?", (sha,)
-        ).fetchone()
-        if existing_sha is not None and not replace:
-            return (str(existing_sha["doc_id"]), False, 0, 0)
-
-        ids_to_replace: list[str] = []
-        if replace:
-            matched_rows = self._conn.execute(
-                "SELECT doc_id FROM documents "
-                "WHERE sha256 = ? OR source_path = ? OR source_path = ?",
-                (sha, raw_source_path, norm_source_path),
-            ).fetchall()
-            ids_to_replace = [str(r["doc_id"]) for r in matched_rows]
-
+        path_keys = _source_path_keys(raw_source_path)
         doc_id = _make_doc_id(sha, raw_source_path)
         doc_title = (doc.document.title or Path(raw_source_path).stem or doc_id).strip()
         sections = _extract_sections_from_parsed(doc, doc_id)
 
         with self._conn:
-            for old_id in ids_to_replace:
-                self._delete_document_in_tx(old_id)
+            if replace:
+                absolute_source_path = (
+                    raw_source_path if Path(raw_source_path.strip()).is_absolute() else None
+                )
+                # 기존 상대 경로(path_keys 부재)는 원래 키 또는 레거시 행과 비교한다.
+                self._conn.execute("BEGIN IMMEDIATE")
+                raw_and_key_targets = tuple(dict.fromkeys([raw_source_path, *path_keys]))
+                target_ph = ", ".join("?" for _ in raw_and_key_targets)
+                union_parts = ["SELECT doc_id FROM documents WHERE sha256 = ?"]
+                params: list[Any] = [sha]
+                if path_keys:
+                    key_ph = ", ".join("?" for _ in path_keys)
+                    union_parts.append(
+                        f"SELECT doc_id FROM document_source_paths "
+                        f"WHERE canonical_path IN ({key_ph})"
+                    )
+                    params.extend(path_keys)
+                union_parts.append(
+                    "SELECT d.doc_id FROM documents d "
+                    "LEFT JOIN document_source_paths p ON p.doc_id = d.doc_id "
+                    "WHERE d.source_path = ? "
+                    f"OR (p.doc_id IS NULL AND d.source_path IN ({target_ph}))"
+                )
+                params.append(absolute_source_path)
+                params.extend(raw_and_key_targets)
+                existing_rows = self._conn.execute(" UNION ".join(union_parts), params).fetchall()
+                for row in existing_rows:
+                    self._delete_document_in_tx(str(row["doc_id"]))
 
             self._conn.execute(
                 "INSERT INTO documents "
@@ -448,6 +517,12 @@ class DocumentIndex:
                     doc.document.model_dump_json(),
                 ),
             )
+            for key in path_keys:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO document_source_paths "
+                    "(doc_id, canonical_path) VALUES (?, ?)",
+                    (doc_id, key),
+                )
 
             for sec in sections:
                 full_text = "\n\n".join(sec.parts).strip()
@@ -696,12 +771,20 @@ class DocumentIndex:
 
         # 중복/빈 헤더를 안전하게 유일화
         unique_headers: list[str] = []
-        seen_h: dict[str, int] = {}
+        used_headers: set[str] = set()
+        next_suffix: dict[str, int] = {}
         for i in range(n_cols):
-            base = (headers[i].strip() if i < len(headers) else "") or f"col_{i + 1}"
-            cnt = seen_h.get(base, 0)
-            seen_h[base] = cnt + 1
-            unique_headers.append(base if cnt == 0 else f"{base}_{cnt + 1}")
+            name = (headers[i].strip() if i < len(headers) else "") or f"col_{i + 1}"
+            folded = name.translate(_DUCKDB_IDENTIFIER_FOLD)
+            if folded in used_headers:
+                suffix = next_suffix.get(folded, 2)
+                while f"{folded}_{suffix}" in used_headers:
+                    suffix += 1
+                next_suffix[folded] = suffix + 1
+                name = f"{name}_{suffix}"
+                folded = f"{folded}_{suffix}"
+            used_headers.add(folded)
+            unique_headers.append(name)
 
         # 열별 수치 자동 판정으로 SUM/AVG/비교 SQL 바로 동작 지원
         col_types: list[str] = []
@@ -843,31 +926,39 @@ class DocumentIndex:
                 ).fetchall()
 
         # FTS5 결과가 비어 있으면 짧은 문자열/기호 질의를 위한 부분 일치 폴백
-        if not rows and query.strip():
-            like_pat = f"%{query.strip()}%"
+        stripped_query = query.strip()
+        if not rows and stripped_query:
+            escaped_query = (
+                stripped_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            like_pat = f"%{escaped_query}%"
             if doc_id is not None:
                 rows = self._conn.execute(
-                    """
+                    r"""
                     SELECT s.*, d.source_path, -0.5 AS rank_score
                     FROM sections s
                     JOIN documents d ON d.doc_id = s.doc_id
-                    WHERE s.doc_id = ? AND (s.title LIKE ? OR s.full_text LIKE ?)
+                    WHERE s.doc_id = ?
+                      AND (s.title LIKE ? ESCAPE '\' OR s.full_text LIKE ? ESCAPE '\')
                     LIMIT ?
                     """,
                     (doc_id, like_pat, like_pat, fetch_k),
                 ).fetchall()
             else:
                 rows = self._conn.execute(
-                    """
+                    r"""
                     SELECT s.*, d.source_path, -0.5 AS rank_score
                     FROM sections s
                     JOIN documents d ON d.doc_id = s.doc_id
-                    WHERE s.title LIKE ? OR s.full_text LIKE ?
+                    WHERE s.title LIKE ? ESCAPE '\' OR s.full_text LIKE ? ESCAPE '\'
                     LIMIT ?
                     """,
                     (like_pat, like_pat, fetch_k),
                 ).fetchall()
 
+        use_floor_calibration = bool(rows) and all(
+            round(max(0.0, -float(r["rank_score"])), 6) < _FTS5_BM25_FLOOR_THRESHOLD for r in rows
+        )
         candidates: list[EvidenceHit] = []
         for r in rows:
             title = str(r["title"])
@@ -875,17 +966,17 @@ class DocumentIndex:
             full_text = str(r["full_text"])
             table_ids: list[str] = json.loads(str(r["table_ids_json"]))
             raw_bm25 = max(0.0, -float(r["rank_score"]))
+            bm25_score = round(raw_bm25, 6)
 
             haystack_raw = f"{title} {' '.join(sec_path)} {full_text}"
             haystack = haystack_raw.lower()
             matched = [t for t in query_terms if t in haystack][:12]
             outline_boost = compute_outline_overlap(query_terms, title, sec_path)
 
-            if raw_bm25 > 0.0:
+            if not use_floor_calibration or bm25_score >= _FTS5_BM25_FLOOR_THRESHOLD:
                 bm25_norm = raw_bm25 / (1.0 + raw_bm25)
             else:
-                # 소규모 코퍼스(문서 1~2건)에서는 SQLite FTS5 IDF가 음수가 되어 bm25가 0으로
-                # 잘릴 수 있으므로, 실제 어휘 커버리지 기반의 양수 정규화 보정을 적용한다.
+                # 후보 전체가 FTS5 IDF 하한일 때만 어휘 커버리지 보정을 적용해 척도 역전을 방지한다.
                 haystack_tokens = set(extract_index_tokens(haystack_raw))
                 overlap = (
                     sum(1 for t in query_terms if t in haystack_tokens) / max(len(query_terms), 1)
@@ -906,7 +997,7 @@ class DocumentIndex:
                     page_start=int(r["page_start"]),
                     page_end=int(r["page_end"]),
                     full_text=full_text,
-                    bm25_score=round(raw_bm25, 6),
+                    bm25_score=bm25_score,
                     outline_boost=round(outline_boost, 6),
                     rerank_score=None,
                     final_score=stage1_score,
@@ -946,6 +1037,7 @@ class DocumentIndex:
             query=query,
             mode=mode,
             reranker_model=reranker_name,
+            floor_calibrated=use_floor_calibration and reranker is None,
             elapsed_ms=elapsed_ms,
             total_candidates=len(candidates),
             hits=candidates[:top_k],
@@ -1103,7 +1195,11 @@ def render_evidence_pack_markdown(pack: EvidencePack) -> str:
             else f"p.{hit.page_start}-{hit.page_end}"
         )
         score_detail = f"final={hit.final_score:.3f}, bm25={hit.bm25_score:.4f}"
-        if hit.bm25_score == 0.0 and hit.final_score > 0.0:
+        if (
+            pack.floor_calibrated
+            and hit.bm25_score < _FTS5_BM25_FLOOR_THRESHOLD
+            and hit.final_score > 0.0
+        ):
             score_detail += " (소규모 코퍼스 어휘 보정)"
         if hit.rerank_score is not None:
             score_detail += f", rerank={hit.rerank_score:.3f}"
