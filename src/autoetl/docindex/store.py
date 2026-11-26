@@ -13,8 +13,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import time
@@ -90,8 +92,9 @@ CREATE TABLE IF NOT EXISTS documents (
 );
 
 CREATE TABLE IF NOT EXISTS document_source_paths (
-    doc_id TEXT PRIMARY KEY REFERENCES documents(doc_id) ON DELETE CASCADE,
-    canonical_path TEXT NOT NULL
+    doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    canonical_path TEXT NOT NULL,
+    PRIMARY KEY (doc_id, canonical_path)
 );
 
 CREATE INDEX IF NOT EXISTS idx_document_source_paths_canonical
@@ -159,17 +162,29 @@ class _DraftSection:
     table_ids: list[str] = field(default_factory=list)
 
 
-def _canonical_source_path(source_path: str) -> str | None:
-    """색인 시점의 디렉터리 정보가 있는 경로를 절대 경로로 기록한다."""
+def _source_path_keys(source_path: str) -> tuple[str, ...]:
+    """디렉터리 정보가 있는 경로의 어휘적·해석 절대 경로 키 목록을 반환한다.
+
+    상대 경로는 색인 프로세스의 현재 작업 디렉터리에 실제로 존재하는 경우에만
+    절대 경로로 확장해, 외부에서 생성된 파싱 번들의 미존재 상대 경로를
+    현재 디렉터리 파일과 혼동하지 않도록 한다.
+    """
     raw = source_path.strip()
     path = Path(raw)
-    # 파서가 기록한 파일명만으로는 원본 디렉터리를 알 수 없다.
-    if path.name == raw:
-        return None
-    try:
-        return str(path.resolve())
-    except (OSError, RuntimeError):
-        return None
+    if not raw or path.name == raw:
+        return ()
+    if not path.is_absolute() and not os.path.lexists(raw):
+        return ()
+
+    keys: list[str] = []
+    with contextlib.suppress(OSError):
+        lexical = os.path.abspath(raw)
+        keys.append(lexical)
+        lexical_path = Path(lexical)
+        keys.append(str(lexical_path.parent.resolve() / lexical_path.name))
+    with contextlib.suppress(OSError, RuntimeError):
+        keys.append(str(path.resolve()))
+    return tuple(dict.fromkeys(keys))
 
 
 def _expand_query_terms(
@@ -448,7 +463,7 @@ class DocumentIndex:
             if existing_sha is not None:
                 return (str(existing_sha["doc_id"]), False, 0, 0)
 
-        canonical_path = _canonical_source_path(raw_source_path)
+        path_keys = _source_path_keys(raw_source_path)
         doc_id = _make_doc_id(sha, raw_source_path)
         doc_title = (doc.document.title or Path(raw_source_path).stem or doc_id).strip()
         sections = _extract_sections_from_parsed(doc, doc_id)
@@ -458,22 +473,28 @@ class DocumentIndex:
                 absolute_source_path = (
                     raw_source_path if Path(raw_source_path.strip()).is_absolute() else None
                 )
-                # 기존 상대 경로는 색인 당시 디렉터리를 알 수 없어 원래 키로만 비교한다.
+                # 기존 상대 경로(path_keys 부재)는 원래 키 또는 레거시 행과 비교한다.
                 self._conn.execute("BEGIN IMMEDIATE")
-                existing_rows = self._conn.execute(
-                    """
-                    SELECT doc_id FROM documents WHERE sha256 = ?
-                    UNION
-                    SELECT doc_id FROM document_source_paths WHERE canonical_path = ?
-                    UNION
-                    SELECT d.doc_id
-                    FROM documents d
-                    LEFT JOIN document_source_paths p ON p.doc_id = d.doc_id
-                    WHERE d.source_path = ?
-                       OR (p.doc_id IS NULL AND d.source_path IN (?, ?))
-                    """,
-                    (sha, canonical_path, absolute_source_path, raw_source_path, canonical_path),
-                ).fetchall()
+                raw_and_key_targets = tuple(dict.fromkeys([raw_source_path, *path_keys]))
+                target_ph = ", ".join("?" for _ in raw_and_key_targets)
+                union_parts = ["SELECT doc_id FROM documents WHERE sha256 = ?"]
+                params: list[Any] = [sha]
+                if path_keys:
+                    key_ph = ", ".join("?" for _ in path_keys)
+                    union_parts.append(
+                        f"SELECT doc_id FROM document_source_paths "
+                        f"WHERE canonical_path IN ({key_ph})"
+                    )
+                    params.extend(path_keys)
+                union_parts.append(
+                    "SELECT d.doc_id FROM documents d "
+                    "LEFT JOIN document_source_paths p ON p.doc_id = d.doc_id "
+                    "WHERE d.source_path = ? "
+                    f"OR (p.doc_id IS NULL AND d.source_path IN ({target_ph}))"
+                )
+                params.append(absolute_source_path)
+                params.extend(raw_and_key_targets)
+                existing_rows = self._conn.execute(" UNION ".join(union_parts), params).fetchall()
                 for row in existing_rows:
                     self._delete_document_in_tx(str(row["doc_id"]))
 
@@ -491,10 +512,11 @@ class DocumentIndex:
                     doc.document.model_dump_json(),
                 ),
             )
-            if canonical_path is not None:
+            for key in path_keys:
                 self._conn.execute(
-                    "INSERT INTO document_source_paths (doc_id, canonical_path) VALUES (?, ?)",
-                    (doc_id, canonical_path),
+                    "INSERT OR IGNORE INTO document_source_paths "
+                    "(doc_id, canonical_path) VALUES (?, ?)",
+                    (doc_id, key),
                 )
 
             for sec in sections:
@@ -929,6 +951,9 @@ class DocumentIndex:
                     (like_pat, like_pat, fetch_k),
                 ).fetchall()
 
+        use_floor_calibration = bool(rows) and all(
+            round(max(0.0, -float(r["rank_score"])), 6) < _FTS5_BM25_FLOOR_THRESHOLD for r in rows
+        )
         candidates: list[EvidenceHit] = []
         for r in rows:
             title = str(r["title"])
@@ -943,10 +968,10 @@ class DocumentIndex:
             matched = [t for t in query_terms if t in haystack][:12]
             outline_boost = compute_outline_overlap(query_terms, title, sec_path)
 
-            if bm25_score >= _FTS5_BM25_FLOOR_THRESHOLD:
+            if not use_floor_calibration or bm25_score >= _FTS5_BM25_FLOOR_THRESHOLD:
                 bm25_norm = raw_bm25 / (1.0 + raw_bm25)
             else:
-                # FTS5가 IDF 하한만 반환하면 실제 어휘 커버리지로 점수를 보정한다.
+                # 후보 전체가 FTS5 IDF 하한일 때만 어휘 커버리지 보정을 적용해 척도 역전을 방지한다.
                 haystack_tokens = set(extract_index_tokens(haystack_raw))
                 overlap = (
                     sum(1 for t in query_terms if t in haystack_tokens) / max(len(query_terms), 1)
@@ -1156,6 +1181,7 @@ def render_evidence_pack_markdown(pack: EvidencePack) -> str:
         )
         return "\n".join(lines) + "\n"
 
+    all_bm25_floored = all(h.bm25_score < _FTS5_BM25_FLOOR_THRESHOLD for h in pack.hits)
     for rank, hit in enumerate(pack.hits, start=1):
         path_str = " > ".join(hit.section_path) if hit.section_path else hit.title
         page_lbl = (
@@ -1164,7 +1190,11 @@ def render_evidence_pack_markdown(pack: EvidencePack) -> str:
             else f"p.{hit.page_start}-{hit.page_end}"
         )
         score_detail = f"final={hit.final_score:.3f}, bm25={hit.bm25_score:.4f}"
-        if hit.bm25_score < _FTS5_BM25_FLOOR_THRESHOLD and hit.final_score > 0.0:
+        if (
+            all_bm25_floored
+            and hit.bm25_score < _FTS5_BM25_FLOOR_THRESHOLD
+            and hit.final_score > 0.0
+        ):
             score_detail += " (소규모 코퍼스 어휘 보정)"
         if hit.rerank_score is not None:
             score_detail += f", rerank={hit.rerank_score:.3f}"

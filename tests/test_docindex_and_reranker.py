@@ -624,6 +624,90 @@ def test_docindex_replace_does_not_guess_directory_for_stored_basename(
         }
 
 
+def test_docindex_replace_preserves_repointed_symlink_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docs").mkdir()
+    v1 = tmp_path / "v1.docx"
+    v2 = tmp_path / "v2.docx"
+    _write_custom_docx(v1, "entry", "obsolete symlink target")
+    _write_custom_docx(v2, "entry", "updated symlink target")
+
+    link = Path("docs/current.docx")
+    try:
+        link.symlink_to(v1)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+    db_path = tmp_path / "index.sqlite"
+    parsed_json = tmp_path / "parsed.json"
+    _write_index_bundle(link, parsed_json)
+    assert build_document_index(parsed_json, db_path).documents_indexed == 1
+
+    link.unlink()
+    link.symlink_to(v2)
+    _write_index_bundle(link, parsed_json)
+    assert build_document_index(parsed_json, db_path, replace=True).documents_indexed == 1
+
+    with DocumentIndex(db_path) as idx:
+        assert [doc.source_path for doc in idx.list_documents()] == [str(link)]
+        assert not idx.search("obsolete").hits
+        assert len(idx.search("updated").hits) == 1
+
+
+def test_docindex_replace_does_not_bind_missing_relative_bundle_path_to_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    src_file = tmp_path / "sample.docx"
+    _write_custom_docx(src_file, "entry", "external bundle content")
+    doc_a = autoetl.parse(src_file)
+    doc_a.document.source_path = "docs/external.docx"
+    bundle_a = tmp_path / "a.json"
+    bundle_a.write_text(doc_a.model_dump_json(), encoding="utf-8")
+
+    db_path = tmp_path / "index.sqlite"
+    monkeypatch.chdir(dir_a)
+    assert build_document_index(bundle_a, db_path).documents_indexed == 1
+
+    (dir_a / "docs").mkdir()
+    local_doc = (dir_a / "docs" / "external.docx").resolve()
+    _write_custom_docx(local_doc, "local", "different file at dir a")
+    bundle_local = tmp_path / "local.json"
+    _write_index_bundle(local_doc, bundle_local)
+    assert build_document_index(bundle_local, db_path, replace=True).documents_indexed == 1
+
+    with DocumentIndex(db_path) as idx:
+        assert len(idx.list_documents()) == 2
+        assert len(idx.search("external").hits) == 1
+
+
+def test_docindex_mixed_bm25_corpus_does_not_outrank_with_floor_calibration(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "mixed.sqlite"
+    paths: list[Path] = []
+    for i in range(3):
+        p = tmp_path / f"rare_{i}.docx"
+        _write_custom_docx(p, "entry", f"common rare x{i}")
+        paths.append(p)
+    for i in range(4):
+        p = tmp_path / f"common_{i}.docx"
+        _write_custom_docx(p, "entry", f"common pass y{i}")
+        paths.append(p)
+
+    assert build_document_index(paths, db_path).documents_indexed == 7
+
+    with DocumentIndex(db_path) as idx:
+        pack = idx.search("common rare", top_k=3)
+
+    assert len(pack.hits) == 3
+    assert all("rare" in hit.full_text for hit in pack.hits)
+    assert "소규모 코퍼스 어휘 보정" not in render_evidence_pack_markdown(pack)
+
+
 def test_docindex_fts5_idf_floor_uses_vocabulary_coverage(tmp_path: Path) -> None:
     src = tmp_path / "sales.docx"
     _write_custom_docx(src, "매출", "매출 보고")
