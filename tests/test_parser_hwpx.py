@@ -14,6 +14,7 @@ from autoetl.parser import (
     HeuristicRasterLayoutDetector,
     HwpxDocumentAdapter,
     OpenAICompatibleVlmAdapter,
+    PageCategory,
     ParseOptions,
     ParserInputError,
     ParseStrategy,
@@ -447,6 +448,11 @@ def _build_rich_sample_hwpx(target_path: Path) -> Path:
   <!-- ================= PAGE 3: 2-COLUMN + PICTURE + VECTOR CONTAINER ================= -->
   <hp:p paraPrIDRef="1" styleIDRef="1">
     <hp:run charPrIDRef="1">
+      <hp:secPr>
+        <hp:pagePr landscape="WIDELY" width="59528" height="84188">
+          <hp:margin left="8504" right="8504" top="5668" bottom="4252"/>
+        </hp:pagePr>
+      </hp:secPr>
       <hp:ctrl>
         <hp:colPr type="NEWSPAPER" colCount="2" sameGap="1134"/>
       </hp:ctrl>
@@ -571,13 +577,25 @@ def test_hwpx_rich_document_inspection_and_parsing(tmp_path: Path) -> None:
     assert plan.document.format == SourceFormat.HWPX
     assert plan.document.title == "2026년도 차세대 공공데이터 표준화 사업 계획서"
     assert plan.document.author == "AutoETL HWPX 검증팀"
-    assert plan.summary.total_pages >= 2
-    assert plan.summary.analyzed_pages == plan.summary.total_pages
+    assert plan.summary.total_pages == 4
+    assert plan.summary.analyzed_pages == 4
+    assert 3 in plan.summary.multi_column_pages
+    assert plan.pages[1].category == PageCategory.TABLE_HEAVY
+    assert plan.pages[2].metrics.column_count == 2
+    assert plan.pages[3].category == PageCategory.SCANNED_IMAGE
 
     outline_titles = [(o.level, o.title, o.page) for o in plan.outline]
     assert (1, "1. 사업 개요 및 추진 배경", 1) in outline_titles
-    assert (1, "2. 연차별 소요 예산 및 통계", 1) in outline_titles
-    assert (1, "3. 시스템 구성도 및 다단 레이아웃", 2) in outline_titles
+    assert (1, "2. 연차별 소요 예산 및 통계", 2) in outline_titles
+    assert (1, "3. 시스템 구성도 및 다단 레이아웃", 3) in outline_titles
+
+    # `--pages 1` 선택 시 마지막 페이지(4p) 전용 미주는 1페이지에 섞이지 않아야 한다
+    p1_only = inspect_document(hwpx_path, options=ParseOptions(pages=(1,)))
+    assert len(p1_only.pages) == 1
+    from autoetl.parser import parse_document
+
+    p1_doc = parse_document(hwpx_path, options=ParseOptions(pages=(1,)))
+    assert not any("[미주 1]" in b.text for b in p1_doc.pages[0].blocks)
 
     doc, manifest = parse_and_export(
         hwpx_path,
@@ -589,7 +607,7 @@ def test_hwpx_rich_document_inspection_and_parsing(tmp_path: Path) -> None:
     assert manifest.document_markdown.is_file()
     md = manifest.document_markdown.read_text(encoding="utf-8")
 
-    # --- Section 1: 변경추적·스위치·목록·수식·코드·각주·미주·머리글/바닥글 ---
+    # --- Page 1 (Section 0, Part 1): 변경추적·스위치·목록·수식·코드·각주·머리글/바닥글 ---
     p1 = doc.pages[0]
 
     heading_blk = next(b for b in p1.blocks if b.kind == ElementKind.HEADING)
@@ -611,15 +629,16 @@ def test_hwpx_rich_document_inspection_and_parsing(tmp_path: Path) -> None:
     assert any("mc^2" in b.text for b in formula_blocks)
     assert any("uv run autoetl parse proposal.hwpx" in b.text for b in p1.blocks)
 
-    # 각주·미주 및 머리글·바닥글 분리 (미주는 문서 마지막 페이지에 배치)
+    # 각주·미주(4p) 및 머리글·바닥글 분리
     assert any("[각주 1]" in b.text and "KS X 6101 OWPML" in b.text for b in p1.blocks)
-    assert any("[미주 1]" in b.text and "별첨 1" in b.text for b in doc.pages[-1].blocks)
+    assert any("[미주 1]" in b.text and "별첨 1" in b.text for b in doc.pages[3].blocks)
     assert any("2026년도 공공데이터 표준화 사업 계획서" in b.text for b in p1.header_footer_blocks)
     assert any("행정안전부" in b.text for b in p1.header_footer_blocks)
 
-    # 병합 표 + 상하선 표
-    assert len(p1.tables) >= 2
-    merged_tbl = p1.tables[0]
+    # Page 2: 병합 표 + 상하선 표
+    p2 = doc.pages[1]
+    assert len(p2.tables) >= 2
+    merged_tbl = p2.tables[0]
     assert merged_tbl.caption == "표 1. 연차별 소요 예산 총괄표"
     assert merged_tbl.strategy == ParseStrategy.RULED_TABLE
     assert merged_tbl.col_count == 3
@@ -633,14 +652,14 @@ def test_hwpx_rich_document_inspection_and_parsing(tmp_path: Path) -> None:
     assert r0c0.row_span == 2
     assert r0c1.col_span == 2
 
-    horiz_tbl = p1.tables[1]
+    horiz_tbl = p2.tables[1]
     assert horiz_tbl.headers == ["평가 지표", "목표치"]
     assert horiz_tbl.rows == [["표준 준수율", "99.8%"]]
     assert "소요 예산(백만원)" in md
 
-    # --- Section 2: 그림 + 캡션 + 크롭 추출 ---
-    p2 = doc.pages[1]
-    fig_vis = next(v for v in p2.visual_regions if v.element_kind == ElementKind.FIGURE_IMAGE)
+    # Page 3: 그림 + 캡션 + 크롭 추출
+    p3 = doc.pages[2]
+    fig_vis = next(v for v in p3.visual_regions if v.element_kind == ElementKind.FIGURE_IMAGE)
     assert fig_vis.caption == "<그림 1> 플랫폼 목표 아키텍처"
     assert fig_vis.crop_status in (CropStatus.EMBEDDED_EXTRACTED, CropStatus.SAVED)
 
@@ -662,13 +681,14 @@ def test_hwpx_scanned_page_layout_detector_and_vlm_pipeline(
 
     plan = inspect_document(
         hwpx_path,
-        options=ParseOptions(pages=(2,)),
+        options=ParseOptions(pages=(4,)),
         layout_detector=detector,
     )
     assert len(plan.pages) == 1
-    p2_route = plan.pages[0]
-    assert any(f"레이아웃 탐지({detector.name})" in r for r in p2_route.reasons)
-    assert len(p2_route.regions) >= 2
+    p4_route = plan.pages[0]
+    assert p4_route.category == PageCategory.SCANNED_IMAGE
+    assert any(f"레이아웃 탐지({detector.name})" in r for r in p4_route.reasons)
+    assert len(p4_route.regions) >= 2
 
     captured_prompts: list[str] = []
 
@@ -699,20 +719,21 @@ def test_hwpx_scanned_page_layout_detector_and_vlm_pipeline(
     doc, manifest = parse_and_export(
         hwpx_path,
         out_dir,
-        options=ParseOptions(pages=(2,)),
+        options=ParseOptions(pages=(4,)),
         layout_detector=detector,
         page_renderer=renderer,
         vision_adapter=vlm,
     )
     assert len(doc.pages) == 1
-    p2 = doc.pages[0]
-    assert len(p2.visual_regions) >= 2
+    p4 = doc.pages[0]
+    assert p4.header_footer_blocks  # --pages (4,)에서도 머리글/바닥글 보존
+    assert len(p4.visual_regions) >= 2
     assert all(
         v.crop_status in (CropStatus.EMBEDDED_EXTRACTED, CropStatus.SAVED)
-        for v in p2.visual_regions
+        for v in p4.visual_regions
     )
-    assert all(v.vision_status == VisionStatus.COMPLETED for v in p2.visual_regions)
-    assert len(manifest.crop_paths) == len(p2.visual_regions)
+    assert all(v.vision_status == VisionStatus.COMPLETED for v in p4.visual_regions)
+    assert len(manifest.crop_paths) == len(p4.visual_regions)
     assert captured_prompts
 
 
@@ -735,7 +756,7 @@ def test_cli_parse_hwpx_plan_and_export(
             "parse",
             str(hwpx_path),
             "--pages",
-            "1",
+            "1,2",
             "--include-comments",
             "--out",
             str(bundle_dir),
@@ -1025,6 +1046,9 @@ def test_hwpx_real_world_owpml_edge_cases(tmp_path: Path) -> None:
     assert doc.document.author == "MOLIT"
     assert doc.document.creator is not None and doc.document.creator.startswith("rhwp/")
     assert len(plan.pages) == 2
+    assert plan.pages[1].metrics.width_pt == pytest.approx(1031.8, abs=1.0)
+    assert plan.pages[1].metrics.height_pt == pytest.approx(728.52, abs=1.0)
+    assert plan.pages[1].metrics.width_pt > plan.pages[1].metrics.height_pt
 
     # 2. 본문 개요 및 텍스트 추출 확인
     p1_joined = "\n".join(b.text for b in doc.pages[0].blocks)
@@ -1048,3 +1072,214 @@ def test_hwpx_real_world_owpml_edge_cases(tmp_path: Path) -> None:
     rendered = RhwpPageRenderer().render_region(target_path, 1, None, dpi=96)
     assert rendered is not None
     assert rendered.data.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_hwpx_review_regression_guards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """병합 1x3 표 보존, 셀 중첩 그림·주석, SVG 래스터화, 소형 이미지 비전, ID 무충돌 검증."""
+    import rhwp
+
+    small_png = _make_solid_png(120, 80, (30, 120, 200))
+    scan_png = _make_synthetic_scanned_page_png(360, 480)
+    svg_bytes = (
+        b'<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40">'
+        b'<rect width="80" height="40"/></svg>'
+    )
+
+    container_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<ocf:container xmlns:ocf="urn:oasis:names:tc:opendocument:xmlns:container">
+  <ocf:rootfiles>
+    <ocf:rootfile full-path="Contents/content.hpf" media-type="application/hwpml-package+xml"/>
+  </ocf:rootfiles>
+</ocf:container>"""
+
+    content_hpf = """<?xml version="1.0" encoding="UTF-8"?>
+<opf:package xmlns:opf="http://www.idpf.org/2007/opf/" version="1.0">
+  <opf:metadata><opf:title>리뷰 회귀 검증</opf:title></opf:metadata>
+  <opf:manifest>
+    <opf:item id="header" href="Contents/header.xml" media-type="application/xml"/>
+    <opf:item id="section0" href="Contents/section0.xml" media-type="application/xml"/>
+    <opf:item id="section1" href="Contents/section1.xml" media-type="application/xml"/>
+    <opf:item id="img1" href="BinData/image1.png" media-type="image/png"/>
+    <opf:item id="scan2" href="BinData/scan2.png" media-type="image/png"/>
+    <opf:item id="vec3" href="BinData/vec3.svg" media-type="image/svg+xml"/>
+  </opf:manifest>
+  <opf:spine>
+    <opf:itemref idref="header"/>
+    <opf:itemref idref="section0"/>
+    <opf:itemref idref="section1"/>
+  </opf:spine>
+</opf:package>"""
+
+    header_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:refList>
+    <hh:charProperties><hh:charPr id="0" height="1000"/></hh:charProperties>
+    <hh:borderFills>
+      <hh:borderFill id="1">
+        <hh:leftBorder type="SOLID"/><hh:rightBorder type="SOLID"/>
+        <hh:topBorder type="SOLID"/><hh:bottomBorder type="SOLID"/>
+      </hh:borderFill>
+    </hh:borderFills>
+    <hh:paraProperties><hh:paraPr id="0"/></hh:paraProperties>
+    <hh:styles>
+      <hh:style id="0" name="바탕글" engName="Normal" paraPrIDRef="0" charPrIDRef="0"/>
+    </hh:styles>
+  </hh:refList>
+</hh:head>"""
+
+    # Page 1: col_span=3 1행 병합표 + 표 셀 안 그림/숨은주석 + Page 2 대형 이미지 뒤 소형 그림
+    section0_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section"
+        xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run>
+      <hp:secPr><hp:pagePr landscape="WIDELY" width="59528" height="84188"/></hp:secPr>
+      <hp:tbl rowCnt="1" colCnt="3" borderFillIDRef="1">
+        <hp:tr>
+          <hp:tc borderFillIDRef="1">
+            <hp:cellAddr colAddr="0" rowAddr="0"/><hp:cellSpan colSpan="3" rowSpan="1"/>
+            <hp:subList><hp:p><hp:run><hp:t>전체 제목</hp:t></hp:run></hp:p></hp:subList>
+          </hp:tc>
+        </hp:tr>
+      </hp:tbl>
+    </hp:run>
+  </hp:p>
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run>
+      <hp:tbl rowCnt="1" colCnt="1" borderFillIDRef="1">
+        <hp:tr>
+          <hp:tc borderFillIDRef="1">
+            <hp:cellAddr colAddr="0" rowAddr="0"/><hp:cellSpan colSpan="1" rowSpan="1"/>
+            <hp:subList>
+              <hp:p>
+                <hp:run>
+                  <hp:pic id="cell_pic"><hc:img binaryItemIDRef="img1"/></hp:pic>
+                  <hp:ctrl>
+                    <hp:hiddenComment>
+                      <hp:subList>
+                        <hp:p><hp:run><hp:t>셀 내부 주석</hp:t></hp:run></hp:p>
+                      </hp:subList>
+                    </hp:hiddenComment>
+                  </hp:ctrl>
+                </hp:run>
+              </hp:p>
+            </hp:subList>
+          </hp:tc>
+        </hp:tr>
+      </hp:tbl>
+    </hp:run>
+  </hp:p>
+  <hp:p paraPrIDRef="0" styleIDRef="0" pageBreak="1">
+    <hp:run>
+      <hp:pic id="big_scan">
+        <hp:curSz width="44000" height="62000"/><hc:img binaryItemIDRef="scan2"/>
+      </hp:pic>
+      <hp:pic id="small_tail">
+        <hp:curSz width="8000" height="5000"/><hc:img binaryItemIDRef="img1"/>
+      </hp:pic>
+    </hp:run>
+  </hp:p>
+</hs:sec>"""
+
+    # Page 3: 텍스트 없이 소형 그림 1개 + SVG 1개
+    section1_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section"
+        xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run>
+      <hp:secPr><hp:pagePr landscape="WIDELY" width="59528" height="84188"/></hp:secPr>
+      <hp:pic id="only_small">
+        <hp:curSz width="8000" height="5000"/><hc:img binaryItemIDRef="img1"/>
+      </hp:pic>
+      <hp:pic id="vec_svg">
+        <hp:curSz width="12000" height="8000"/><hc:img binaryItemIDRef="vec3"/>
+      </hp:pic>
+    </hp:run>
+  </hp:p>
+</hs:sec>"""
+
+    hwpx_path = tmp_path / "regression.hwpx"
+    with zipfile.ZipFile(hwpx_path, "w") as zf:
+        zf.writestr("mimetype", "application/hwp+zip")
+        zf.writestr("META-INF/container.xml", container_xml)
+        zf.writestr("Contents/content.hpf", content_hpf)
+        zf.writestr("Contents/header.xml", header_xml)
+        zf.writestr("Contents/section0.xml", section0_xml)
+        zf.writestr("Contents/section1.xml", section1_xml)
+        zf.writestr("BinData/image1.png", small_png)
+        zf.writestr("BinData/scan2.png", scan_png)
+        zf.writestr("BinData/vec3.svg", svg_bytes)
+
+    parse_calls = 0
+    orig_parse = rhwp.parse
+
+    def counted_parse(path: str) -> rhwp.Document:
+        nonlocal parse_calls
+        parse_calls += 1
+        return orig_parse(path)
+
+    monkeypatch.setattr(rhwp, "parse", counted_parse)
+
+    captured_mimes: list[str] = []
+
+    def fake_open_json(
+        url: str,
+        *,
+        zone: object,
+        payload: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout_sec: float = 90.0,
+    ) -> dict[str, object]:
+        assert payload is not None
+        msgs = payload["messages"]
+        assert isinstance(msgs, list)
+        user_content = msgs[-1]["content"]
+        assert isinstance(user_content, list)
+        for part in user_content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                img_url = part.get("image_url")
+                if isinstance(img_url, dict):
+                    captured_mimes.append(str(img_url.get("url", ""))[:22])
+        return {"choices": [{"message": {"content": "VLM ok"}}]}
+
+    monkeypatch.setattr("autoetl.parser.vision._open_json_request", fake_open_json)
+
+    vlm = OpenAICompatibleVlmAdapter(model="TestVLM", base_url="http://127.0.0.1:8080/v1")
+    doc, _ = parse_and_export(
+        hwpx_path,
+        tmp_path / "reg_out",
+        options=ParseOptions(extract_crops=True),
+        layout_detector=HeuristicRasterLayoutDetector(),
+        page_renderer=RhwpPageRenderer(),
+        vision_adapter=vlm,
+    )
+
+    assert parse_calls == 1  # RhwpPageRenderer 사용 시 문서 전체 재파싱 0회
+
+    # 1x3 병합 표 열 보존 + 표 셀 중첩 PictureBlock 추출
+    t0 = doc.pages[0].tables[0]
+    assert t0.col_count == 3
+    assert t0.cells[0].col_span == 3
+    assert len(doc.pages[0].visual_regions) >= 1
+
+    # Page 2: 대형 이미지 분할 후 소형 그림 ID와 중복되지 않아야 함
+    p2_ids = [v.region_id for v in doc.pages[1].visual_regions]
+    assert len(p2_ids) == len(set(p2_ids)) and len(p2_ids) >= 3
+
+    # Page 3: 텍스트 없는 이미지 전용 페이지도 vision_required_pages 포함 + SVG는 PNG 래스터화
+    assert 3 in doc.routing_plan.summary.vision_required_pages
+    assert doc.pages[2].route.requires_vision is True
+    assert all(m.startswith("data:image/png;base64") for m in captured_mimes)
+
+    # PageCategory enum & include_comments=False 시 셀 중첩 주석 필터 확인
+    assert PageCategory.SCANNED_IMAGE.value == "scanned_image"
+    from autoetl.parser import parse_document
+
+    doc_no_comments = parse_document(hwpx_path, options=ParseOptions(include_comments=False))
+    t1_no_cmt = doc_no_comments.pages[0].tables[1]
+    assert "셀 내부 주석" not in (t1_no_cmt.headers[0] if t1_no_cmt.headers else "")

@@ -899,8 +899,10 @@ def test_hwp_native_rich_document_end_to_end(tmp_path: Path) -> None:
     assert plan.document.title == "HWP 5.0 통합 테스트 문서"
     assert plan.document.author == "홍길동"
     assert plan.document.creator is not None and plan.document.creator.startswith("rhwp/")
+    assert plan.summary.total_pages == 2
     assert any(o.title == "1. 구형 바이너리 호환성 개요" for o in plan.outline)
-    assert any(f"레이아웃 탐지({detector.name})" in r for r in plan.pages[0].reasons)
+    assert plan.pages[1].category.value == "scanned_image"
+    assert any(f"레이아웃 탐지({detector.name})" in r for r in plan.pages[1].reasons)
 
     out_dir = tmp_path / "out_hwp"
     doc, manifest = parse_and_export(
@@ -918,9 +920,10 @@ def test_hwp_native_rich_document_end_to_end(tmp_path: Path) -> None:
     assert "첫 번째 번호 항목" in joined_p1
     assert "두 번째 번호 항목" in joined_p1
     assert "공식 문서를 참고한다" in joined_p1
-    # 각주·미주
+    # 각주(1p) · 미주(마지막 2p)
     assert "[각주 1]" in joined_p1 and "HWP 5.0 바이너리 공개 명세" in joined_p1
-    assert "[미주 1]" in joined_p1 and "CFB 섹터 배치" in joined_p1
+    joined_p2 = "\n".join(b.text for b in doc.pages[1].blocks)
+    assert "[미주 1]" in joined_p2 and "CFB 섹터 배치" in joined_p2
     # 수식 & 코드 블록
     assert any("a + b" in b.text for b in p1.blocks)
     assert any("uv run autoetl parse notice.hwp" in b.text for b in p1.blocks)
@@ -935,11 +938,11 @@ def test_hwp_native_rich_document_end_to_end(tmp_path: Path) -> None:
     assert tbl.has_merged_cells is True
     assert tbl.headers == ["형식", "지원 전략", ""]
     assert tbl.rows == [["HWP 5.0", "네이티브", "무의존성"]]
-    # 그림 + 레이아웃 탐지 분할 + RhwpPageRenderer 네이티브 PNG 렌더링
-    assert len(p1.visual_regions) >= 2
+    # Page 2 스캔 그림 + 레이아웃 탐지 분할 + RhwpPageRenderer 네이티브 PNG 렌더링
+    assert len(doc.pages[1].visual_regions) >= 2
     assert all(
         v.crop_status in (CropStatus.EMBEDDED_EXTRACTED, CropStatus.SAVED)
-        for v in p1.visual_regions
+        for v in doc.pages[1].visual_regions
     )
     rendered = RhwpPageRenderer().render_region(hwp_path, 1, None, dpi=96)
     assert rendered is not None
@@ -947,7 +950,7 @@ def test_hwp_native_rich_document_end_to_end(tmp_path: Path) -> None:
 
 
 def test_hwp_security_guards(tmp_path: Path) -> None:
-    """암호화·DRM·배포용(ViewText)·손상된 FileHeader HWP 문서를 안전하게 차단한다."""
+    """암호화·DRM·배포용(ViewText)·손상된 FileHeader 및 위장 HWPX 문서를 안전하게 차단한다."""
     for name, flags, extra_streams, match_pat in (
         ("enc.hwp", 0x02, {"BodyText/Section0": b""}, "암호화"),
         ("drm.hwp", 0x10, {"BodyText/Section0": b""}, "DRM"),
@@ -970,6 +973,23 @@ def test_hwp_security_guards(tmp_path: Path) -> None:
     bad_fh = _write_cfb_v3(tmp_path / "bad_fh.hwp", {"FileHeader": b"WRONG HEADER" * 10})
     with pytest.raises(ParserInputError, match="FileHeader"):
         parse_document(bad_fh)
+
+    # .hwp 확장자를 쓴 암호화 HWPX(ZIP)도 HWPX 가드를 거쳐 차단되어야 함
+    disguised_enc = tmp_path / "disguised.hwp"
+    with zipfile.ZipFile(disguised_enc, "w") as zf:
+        zf.writestr(
+            "META-INF/manifest.xml",
+            "<manifest><file-entry><encryption-data/></file-entry></manifest>",
+        )
+        zf.writestr("Contents/section0.xml", "<hs:sec/>")
+    with pytest.raises(ParserInputError, match="암호화"):
+        parse_document(disguised_enc)
+
+    # OLE2도 ZIP도 아닌 위조 바이트 차단
+    garbage = tmp_path / "garbage.hwp"
+    garbage.write_bytes(b"NOT-AN-HWP-OR-ZIP-FILE")
+    with pytest.raises(ParserInputError, match="OLE2"):
+        parse_document(garbage)
 
 
 def test_doc_native_tier2_rich_document_and_security_guard(tmp_path: Path) -> None:

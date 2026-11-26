@@ -53,6 +53,33 @@ def test_doctor_report_and_cli(capsys: pytest.CaptureFixture[str]) -> None:
     assert len(data["checks"]) >= 5
 
 
+def test_doctor_distinguishes_rhwp_load_vs_version_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`doctor`가 `rhwp` 로드 실패와 버전 조회 실패의 가용성 상태를 구분한다."""
+    import types
+
+    def fail_load() -> object:
+        raise ImportError("undefined symbol: FT_Palette_Data_Get")
+
+    monkeypatch.setattr("autoetl.doctor.load_rhwp", fail_load)
+    rep_fail = collect_doctor_report()
+    chk_fail = next(c for c in rep_fail.checks if "rhwp" in c.name)
+    assert chk_fail.available is False
+    assert "로드 실패" in chk_fail.detail
+    assert "libfreetype6" in chk_fail.install_hint
+
+    broken_ver_mod = types.SimpleNamespace(
+        version=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        rhwp_core_version=lambda: "0.7.17",
+    )
+    monkeypatch.setattr("autoetl.doctor.load_rhwp", lambda: broken_ver_mod)
+    rep_ok = collect_doctor_report()
+    chk_ok = next(c for c in rep_ok.checks if "rhwp" in c.name)
+    assert chk_ok.available is True
+    assert "버전 조회 실패" in chk_ok.detail
+
+
 def test_ui_server_loopback_guard_and_safe_close() -> None:
     """로컬 웹 UI는 비루프백 바인딩을 차단하고, 미기동 서버 close()도 안전하게 종료한다."""
     with pytest.raises(ParserInputError, match="루프백"):
