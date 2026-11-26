@@ -53,7 +53,7 @@ if TYPE_CHECKING:
         parse_document,
         supported_extensions,
     )
-    from autoetl.parser.ui import LocalParserUiServer, create_ui_server, serve_ui
+    from autoetl.ui import LocalParserUiServer, create_ui_server, serve_ui
 
     parse = parse_document
     inspect = inspect_document
@@ -73,7 +73,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "DocumentToolkit": ("autoetl.docindex", "DocumentToolkit"),
     "EvidencePack": ("autoetl.docindex", "EvidencePack"),
     "ExportManifest": ("autoetl.parser", "ExportManifest"),
-    "LocalParserUiServer": ("autoetl.parser.ui", "LocalParserUiServer"),
+    "LocalParserUiServer": ("autoetl.ui", "LocalParserUiServer"),
     "MaskingPolicy": ("autoetl.contracts", "MaskingPolicy"),
     "MultiTableAnalysisBundle": ("autoetl.contracts", "MultiTableAnalysisBundle"),
     "MultiTableContext": ("autoetl.core.multi_context", "MultiTableContext"),
@@ -90,7 +90,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "build_document_index": ("autoetl.docindex", "build_document_index"),
     "chunk_document": ("autoetl.parser", "chunk_document"),
     "collect_doctor_report": ("autoetl.doctor", "collect_doctor_report"),
-    "create_ui_server": ("autoetl.parser.ui", "create_ui_server"),
+    "create_ui_server": ("autoetl.ui", "create_ui_server"),
     "export_bundle": ("autoetl.parser", "export_parse_bundle"),
     "export_multi_table_bundle": ("autoetl.core.load_planner", "export_multi_table_bundle"),
     "export_parse_bundle": ("autoetl.parser", "export_parse_bundle"),
@@ -106,7 +106,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "render_evidence_pack_markdown": ("autoetl.docindex", "render_evidence_pack_markdown"),
     "render_management_tables_ddl": ("autoetl.core.db_loader", "render_management_tables_ddl"),
     "rollback_batch": ("autoetl.core.db_loader", "rollback_batch"),
-    "serve_ui": ("autoetl.parser.ui", "serve_ui"),
+    "serve_ui": ("autoetl.ui", "serve_ui"),
     "supported_extensions": ("autoetl.parser", "supported_extensions"),
 }
 

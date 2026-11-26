@@ -510,7 +510,7 @@ def _run_doctor(args: argparse.Namespace) -> int:
 
 def _run_ui(args: argparse.Namespace) -> int:
     from autoetl.parser.adapters import ParserInputError
-    from autoetl.parser.ui import serve_ui
+    from autoetl.ui import serve_ui
 
     if not (0 <= args.port <= 65535):
         print("--port는 0~65535 범위여야 한다.", file=sys.stderr)

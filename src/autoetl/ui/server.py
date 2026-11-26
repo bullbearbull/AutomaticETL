@@ -136,9 +136,7 @@ _MIME_BY_EXT: dict[str, str] = {
 
 
 def _load_ui_html() -> bytes:
-    html_text = (
-        resources.files("autoetl.parser.ui").joinpath("app.html").read_text(encoding="utf-8")
-    )
+    html_text = resources.files("autoetl.ui").joinpath("app.html").read_text(encoding="utf-8")
     return html_text.encode("utf-8")
 
 

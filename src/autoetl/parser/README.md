@@ -19,7 +19,7 @@
 - `batch.py` — 폴더 일괄 파싱 파이프라인(`discover_batch_files`, `parse_batch`, `BatchManifest`, `render_batch_summary_markdown`):
   - Office 임시 파일(`~$*`, `.~lock.*`) 자동 제외, 파일 단위 오류 격리(본문·스택 비노출), 충돌 없는 출력 경로(`stem__ext`)
   - SHA-256 기반 증분 재개(`--resume`), 병렬 워커(`--workers`), 통합 `batch_summary.md`·`batch_manifest.json`·`all_chunks.jsonl` 생성
-- `ui/` — 무의존성 표준 라이브러리(`ThreadingHTTPServer`) 기반 로컬 웹 UI(`autoetl ui`):
+- `../ui/`(`autoetl.ui`) — 무의존성 표준 라이브러리(`ThreadingHTTPServer`) 기반 로컬 웹 UI(`autoetl ui`). 기존 import 경로 `autoetl.parser.ui`는 호환용으로 남아 있다:
   - 루프백(`127.0.0.1`) 전용 바인딩 기본 강제, 오프라인 단일 페이지 앱(`app.html`), 5개 결과 탭(개요·Markdown·추출 표·RAG 청크·시각 영역), ZIP 번들 다운로드
 - `image_io.py` — 외부 Pillow 없이 동작하는 순수 Python PNG 인코더·디코더·부분 크롭기 및 PDF 내장 이미지 추출기.
 - `layout_detector.py` — 스캔 페이지 레이아웃 객체 탐지기 구현체(추가 핵심 의존성 0개):
