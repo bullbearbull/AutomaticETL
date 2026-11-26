@@ -1,0 +1,88 @@
+.figure {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+  margin: 0;
+}
+
+.header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.name {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+}
+
+.copy {
+  font-size: var(--font-size-small);
+}
+
+.message {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+}
+
+.message:empty {
+  display: none;
+}
+
+.ok {
+  color: var(--color-status-done);
+}
+
+.warn {
+  color: var(--color-status-warning);
+}
+
+.empty {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+}
+
+.scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  border: var(--border-width) solid var(--color-divider);
+  border-radius: var(--radius-control);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+}
+
+.table th,
+.table td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: var(--border-width) solid var(--color-divider);
+  text-align: left;
+  vertical-align: top;
+  word-break: keep-all;
+  overflow-wrap: normal;
+  min-width: 4em;
+}
+
+.table th {
+  background: var(--color-bg-subtle);
+  font-weight: var(--font-weight-strong);
+}
+
+.table tr:last-child td {
+  border-bottom: 0;
+}
+
+.table th + th,
+.table td + td {
+  border-left: var(--border-width) solid var(--color-divider);
+}

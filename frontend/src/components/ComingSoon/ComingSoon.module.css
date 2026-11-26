@@ -1,0 +1,40 @@
+.root {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: 100%;
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: var(--space-12) var(--space-4);
+}
+
+.title {
+  font-size: var(--font-size-display);
+  line-height: var(--line-height-display);
+  font-weight: var(--font-weight-strong);
+}
+
+.body {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  color: var(--color-text-secondary);
+}
+
+.body > svg {
+  margin-top: 0.3em;
+}
+
+.link {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--control-height);
+  padding: var(--space-1) var(--space-4);
+  border: var(--border-width) solid var(--color-border-input);
+  border-radius: var(--radius-control);
+  text-decoration: none;
+}
+
+.link:hover {
+  background: var(--color-bg-subtle);
+}

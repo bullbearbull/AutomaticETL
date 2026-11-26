@@ -1,0 +1,46 @@
+.details {
+  min-width: 0;
+}
+
+.trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--target-min);
+  padding: 0 var(--space-1);
+  margin-left: calc(var(--space-1) * -1);
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--color-text);
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+  text-align: left;
+  cursor: pointer;
+}
+
+.trigger[data-hovered] {
+  background: var(--color-bg-subtle);
+}
+
+/* A small triangle that turns when open (decorative). */
+.chevron {
+  width: 0;
+  height: 0;
+  border-top: 0.3em solid transparent;
+  border-bottom: 0.3em solid transparent;
+  border-left: 0.45em solid currentColor;
+  transition: transform var(--duration-fast);
+}
+
+.details[data-expanded] .chevron {
+  transform: rotate(90deg);
+}
+
+.panel {
+  min-width: 0;
+}
+
+.details[data-expanded] .panel {
+  padding: var(--space-2) 0 0;
+}

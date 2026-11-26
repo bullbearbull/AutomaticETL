@@ -1,0 +1,54 @@
+.list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: var(--border-width) solid var(--color-divider);
+  list-style: none;
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+}
+
+.step {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-text-secondary);
+}
+
+/* A short line between steps, drawn with a pseudo-element (decorative). */
+.step + .step::before {
+  content: '';
+  width: var(--space-4);
+  border-top: var(--border-width) solid var(--color-border-input);
+}
+
+.marker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border: var(--border-width) solid var(--color-border-input);
+  border-radius: 50%;
+  font-size: var(--font-size-tiny);
+}
+
+.current {
+  color: var(--color-text);
+  font-weight: var(--font-weight-strong);
+}
+
+.current .marker {
+  border: var(--border-width-strong) solid var(--color-text);
+}
+
+.done {
+  color: var(--color-text);
+}
+
+.done .marker {
+  border-color: var(--color-status-done);
+  color: var(--color-status-done);
+}
