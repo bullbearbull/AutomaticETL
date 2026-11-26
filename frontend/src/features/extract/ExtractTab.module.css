@@ -1,0 +1,8 @@
+/* The tab's root. Keeping a CSS file here from the start means later style
+   changes in this tab only touch this tab's own output files. */
+.root {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
