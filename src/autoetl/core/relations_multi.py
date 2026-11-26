@@ -33,7 +33,7 @@ from autoetl.contracts import (
 )
 from autoetl.core.context import quote_identifier
 from autoetl.core.multi_context import MultiTableContext, TableSlotContext
-from autoetl.core.pk_selector import _singularize, select_primary_key
+from autoetl.core.pk_selector import select_primary_key, singularize
 from autoetl.core.stages import s05_relations
 
 MIN_INCLUSION_RATE = 0.95
@@ -86,9 +86,13 @@ _DISALLOWED_FK_CATEGORIES = frozenset(
 )
 
 
-def _name_tokens(name: str) -> set[str]:
+def _name_token_list(name: str) -> list[str]:
     parts = [p for p in _TOKEN_SPLIT_RE.split(name.lower()) if p]
-    return {_singularize(p) for p in parts}
+    return [singularize(p) for p in parts]
+
+
+def _name_tokens(name: str) -> set[str]:
+    return set(_name_token_list(name))
 
 
 def _semantic_name_similarity(
@@ -124,11 +128,12 @@ def _semantic_name_similarity(
                     return 0.75
 
     # 일반 토큰뿐이어도 키 접미사를 뺀 전체 이름이 부모 테이블이면 근거로 인정한다.
-    child_parts = [p for p in _TOKEN_SPLIT_RE.split(child_col.lower()) if p]
+    child_tokens = _name_token_list(child_col)
+    parent_table_tokens = _name_token_list(parent_table)
     if (
-        len(child_parts) > 1
-        and _singularize(child_parts[-1]) in _GENERIC_KEY_TOKENS
-        and {_singularize(p) for p in child_parts[:-1]} == p_table_toks
+        len(child_tokens) > 1
+        and child_tokens[-1] in _GENERIC_KEY_TOKENS
+        and child_tokens[:-1] == parent_table_tokens
     ):
         return 0.85
     return 0.0
@@ -276,6 +281,7 @@ class _ChildCandidate:
     category: ColumnRoleCategory
     unique_count: int
     is_unique: bool
+    likely_surrogate_index: bool = False
     slot_name: str | None = None
     slot_extract_hint: str | None = None
 
@@ -345,6 +351,9 @@ def _collect_child_candidates(
                         category=cls.category,
                         unique_count=cls.unique_count,
                         is_unique=(cls.missing_count == 0 and cls.cardinality_ratio >= 0.999),
+                        likely_surrogate_index=bool(
+                            cls.index_meta is not None and cls.index_meta.likely_surrogate_index
+                        ),
                     )
                 )
 
@@ -430,11 +439,12 @@ def _discover_cross_table_fks(
             ):
                 continue
 
-            # 서로 다른 테이블의 범용 행번호(`row_idx`, `id`)끼리 이름 근거 없이 1:1 오탐 차단
+            # 서로 다른 테이블의 범용 행번호(`row_idx`, `id`)·단조증가 정수 ID끼리
+            # 이름 근거 없이 1:1 오탐 차단
             if (
                 child.is_unique
                 and child.slot_name is None
-                and child.category is ColumnRoleCategory.INDEX
+                and (child.category is ColumnRoleCategory.INDEX or child.likely_surrogate_index)
                 and parent.likely_surrogate_index
                 and name_sim == 0.0
             ):
