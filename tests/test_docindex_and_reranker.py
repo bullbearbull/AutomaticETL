@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import zipfile
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,7 @@ from autoetl.docindex import (
     OnnxCrossEncoderReranker,
     build_document_index,
     create_reranker,
+    render_evidence_pack_markdown,
 )
 from autoetl.parser.adapters import ParserInputError
 
@@ -426,6 +429,236 @@ def _write_custom_docx(path: Path, heading: str, body: str) -> None:
         zf.writestr("word/styles.xml", styles_xml)
 
 
+def _index_test_table(
+    idx: DocumentIndex, tmp_path: Path, headers: list[str], rows: list[list[str]]
+) -> str:
+    src = tmp_path / "table.docx"
+    _write_rich_korean_docx(src)
+    doc = autoetl.parse(src)
+    table = doc.tables[0].model_copy(
+        update={"headers": headers, "rows": rows, "row_count": len(rows), "col_count": len(headers)}
+    )
+    doc.tables = [table]
+    doc.pages[table.page - 1].tables = [table]
+    idx.index_parsed_document(doc)
+    return idx.list_tables()[0].table_uid
+
+
+@pytest.mark.parametrize(
+    ("values", "expected_type"),
+    [
+        (["00123", "04567", ""], "VARCHAR"),
+        (["00123", "4.5"], "VARCHAR"),
+        (["9223372036854775808", "42"], "VARCHAR"),
+        (["-9223372036854775809", "42"], "VARCHAR"),
+        (["9" * 4301, "42"], "VARCHAR"),
+        (["9223372036854775808", "4.5"], "VARCHAR"),
+        (["-9223372036854775808", "9223372036854775807", "0"], "BIGINT"),
+    ],
+)
+def test_docindex_sql_preserves_codes_and_out_of_range_integers(
+    tmp_path: Path, values: list[str], expected_type: str
+) -> None:
+    with DocumentIndex(":memory:") as idx:
+        table_uid = _index_test_table(idx, tmp_path, ["value"], [[v] for v in values])
+
+        result = idx.query_table(table_uid, "SELECT value, typeof(value) FROM tbl")
+
+    assert result.rows == [[v, expected_type] for v in values]
+
+
+@pytest.mark.parametrize(
+    ("values", "expected_sum"),
+    [(["$001", "$2.75"], "3.75"), (["001,002", "2"], "1004")],
+)
+def test_docindex_sql_aggregates_formatted_numbers_with_leading_zeros(
+    tmp_path: Path, values: list[str], expected_sum: str
+) -> None:
+    with DocumentIndex(":memory:") as idx:
+        table_uid = _index_test_table(idx, tmp_path, ["value"], [[v] for v in values])
+
+        result = idx.query_table(table_uid, "SELECT SUM(value) FROM tbl")
+
+    assert result.rows == [[expected_sum]]
+
+
+def test_docindex_sql_header_deduplication_uses_duckdb_identifier_rules(tmp_path: Path) -> None:
+    headers = ["a", "a", "a_2", "Name", "name", "", "COL_6", "É", "é"]
+    values = [str(i) for i in range(len(headers))]
+    with DocumentIndex(":memory:") as idx:
+        table_uid = _index_test_table(idx, tmp_path, headers, [values])
+
+        result = idx.read_table(table_uid)
+
+    assert result.columns == ["a", "a_2", "a_2_2", "Name", "name_2", "col_6", "COL_6_2", "É", "é"]
+    assert result.rows == [values]
+
+
+@pytest.mark.parametrize(
+    ("set_operator", "expected_rows"), [("EXCEPT", [["1"]]), ("INTERSECT", [["2"], ["3"]])]
+)
+def test_docindex_sql_allows_readonly_set_operations(
+    tmp_path: Path, set_operator: str, expected_rows: list[list[str]]
+) -> None:
+    with DocumentIndex(":memory:") as idx:
+        table_uid = _index_test_table(idx, tmp_path, ["value"], [["1"], ["2"], ["3"]])
+        result = idx.query_table(
+            table_uid,
+            f"WITH filtered AS (SELECT value FROM tbl WHERE value > 1) "
+            f"SELECT value FROM tbl {set_operator} SELECT value FROM filtered ORDER BY value",
+        )
+
+        with pytest.raises(ParserInputError, match="허용되지 않는 SQL 함수"):
+            idx.query_table(
+                table_uid,
+                f"SELECT value FROM tbl {set_operator} SELECT * FROM read_csv('unused.csv')",
+            )
+
+    assert result.rows == expected_rows
+
+
+def test_docindex_sql_allows_parenthesized_readonly_subquery(tmp_path: Path) -> None:
+    with DocumentIndex(":memory:") as idx:
+        table_uid = _index_test_table(idx, tmp_path, ["value"], [["1"], ["2"], ["3"]])
+        result = idx.query_table(table_uid, "(SELECT value FROM tbl ORDER BY value)")
+        with pytest.raises(ParserInputError, match="허용되지 않는 SQL 함수"):
+            idx.query_table(table_uid, "(SELECT * FROM read_csv('unused.csv'))")
+
+    assert result.rows == [["1"], ["2"], ["3"]]
+
+
+def _write_index_bundle(source: Path, bundle: Path) -> None:
+    doc = autoetl.parse(source)
+    doc.document.source_path = str(source)
+    bundle.write_text(doc.model_dump_json(), encoding="utf-8")
+
+
+def test_docindex_replace_matches_stored_relative_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    db_path = tmp_path / "index.sqlite"
+    relative_src = Path("docs/record.docx")
+    relative_src.parent.mkdir()
+    _write_custom_docx(relative_src, "old", "obsolete version")
+    parsed_json = tmp_path / "parsed.json"
+    _write_index_bundle(relative_src, parsed_json)
+    assert build_document_index(parsed_json, db_path).documents_indexed == 1
+    with DocumentIndex(db_path) as idx:
+        assert idx.list_documents()[0].source_path == str(relative_src)
+
+    absolute_src = relative_src.resolve()
+    monkeypatch.chdir(absolute_src.parent)
+    _write_custom_docx(absolute_src, "new", "current version")
+    _write_index_bundle(absolute_src, parsed_json)
+    assert build_document_index(parsed_json, db_path, replace=True).documents_indexed == 1
+
+    with DocumentIndex(db_path) as idx:
+        assert [doc.source_path for doc in idx.list_documents()] == [str(absolute_src)]
+        assert not idx.search("obsolete").hits
+        assert len(idx.search("current").hits) == 1
+
+
+@pytest.mark.parametrize(
+    ("legacy", "incoming_relative", "keep_old"),
+    [(False, False, True), (False, True, True), (True, False, True), (True, True, False)],
+)
+def test_docindex_replace_uses_index_time_path_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy: bool,
+    incoming_relative: bool,
+    keep_old: bool,
+) -> None:
+    relative_src = Path("docs/record.docx")
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    for directory in (first, second):
+        (directory / relative_src).parent.mkdir(parents=True)
+    db_path = tmp_path / "index.sqlite"
+    parsed_json = tmp_path / "parsed.json"
+
+    monkeypatch.chdir(first)
+    _write_custom_docx(relative_src, "old record", "archived report")
+    _write_index_bundle(relative_src, parsed_json)
+    assert build_document_index(parsed_json, db_path).documents_indexed == 1
+
+    if legacy:
+        # Reproduce an index from before canonical source paths were recorded.
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("DROP TABLE IF EXISTS document_source_paths")
+
+    monkeypatch.chdir(second)
+    source = relative_src if incoming_relative else relative_src.resolve()
+    _write_custom_docx(source, "new record", "current report")
+    _write_index_bundle(source, parsed_json)
+    assert build_document_index(parsed_json, db_path, replace=True).documents_indexed == 1
+
+    with DocumentIndex(db_path) as idx:
+        # An exact legacy key remains usable when the index lacks the original directory.
+        assert bool(idx.search("archived").hits) == keep_old
+        assert len(idx.list_documents()) == (2 if keep_old else 1)
+        assert [hit.source_path for hit in idx.search("current").hits] == [str(source)]
+
+
+def test_docindex_replace_does_not_guess_directory_for_stored_basename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    db_path = tmp_path / "index.sqlite"
+    older_src = tmp_path / "other" / "record.docx"
+    older_src.parent.mkdir()
+    _write_custom_docx(older_src, "other record", "previous document from another folder")
+    assert build_document_index(older_src, db_path).documents_indexed == 1
+
+    incoming_src = tmp_path.resolve() / "record.docx"
+    _write_custom_docx(incoming_src, "new record", "new document from this folder")
+    parsed_json = tmp_path / "parsed.json"
+    _write_index_bundle(incoming_src, parsed_json)
+    assert build_document_index(parsed_json, db_path, replace=True).documents_indexed == 1
+
+    with DocumentIndex(db_path) as idx:
+        assert {doc.source_path for doc in idx.list_documents()} == {
+            older_src.name,
+            str(incoming_src),
+        }
+
+
+def test_docindex_fts5_idf_floor_uses_vocabulary_coverage(tmp_path: Path) -> None:
+    src = tmp_path / "sales.docx"
+    _write_custom_docx(src, "매출", "매출 보고")
+    db_path = tmp_path / "index.sqlite"
+    assert build_document_index(src, db_path).documents_indexed == 1
+
+    with DocumentIndex(db_path) as idx:
+        result = idx.search("매출")
+
+    assert len(result.hits) == 1
+    assert result.hits[0].final_score == pytest.approx(0.625)
+    assert 0.0 < result.hits[0].bm25_score < 1e-4
+    assert "소규모 코퍼스 어휘 보정" in render_evidence_pack_markdown(result)
+
+
+@pytest.mark.parametrize("restrict_doc", [False, True])
+@pytest.mark.parametrize("query", ["%", "_", "50%", r"\_%"])
+def test_docindex_like_fallback_matches_punctuation_literally(
+    tmp_path: Path, query: str, restrict_doc: bool
+) -> None:
+    src = tmp_path / "rate.docx"
+    _write_custom_docx(src, "실적", r"연간 목표 150%과 첨부 기록 \_%")
+    other = tmp_path / "other.docx"
+    _write_custom_docx(other, "전년도", r"연간 목표 500과 첨부 기록 \X500")
+    db_path = tmp_path / "index.sqlite"
+    assert build_document_index([src, other], db_path).documents_indexed == 2
+
+    with DocumentIndex(db_path) as idx:
+        # Limit to the nonmatching document when checking the scoped fallback.
+        doc_id = next(d.doc_id for d in idx.list_documents() if d.source_path == other.name)
+        result = idx.search(query, doc_id=doc_id if restrict_doc else None)
+
+    assert [hit.title for hit in result.hits] == ([] if restrict_doc else ["실적"])
+
+
 def test_docindex_replace_replaces_same_source_path_atomically_and_preserves_on_parse_error(
     tmp_path: Path,
 ) -> None:
@@ -473,8 +706,6 @@ def test_docindex_synonyms_tiny_corpus_score_and_zero_candidate_transparency(
     tmp_path: Path,
 ) -> None:
     """리뷰2 P-08 + 리뷰3 #7: 소규모 코퍼스 점수 보정·BM25 4자리·동의어 확장·후보 0건 투명성."""
-    from autoetl.docindex import render_evidence_pack_markdown
-
     doc1 = tmp_path / "hr_leave.docx"
     doc2 = tmp_path / "hr_expense.docx"
     _write_custom_docx(
