@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from autoetl.contracts import RelationshipCardinality
+import pytest
+
+from autoetl.contracts import ColumnRoleCategory, RelationshipCardinality
 from autoetl.core.multi_context import MultiTableContext, NamedTableInput, profile_all_tables
+from autoetl.core.pk_selector import singularize
 from autoetl.core.relations_multi import analyze_multi_table_relations
 
 
@@ -194,6 +197,152 @@ def test_one_to_one_cycle_deduplication_and_orphan_rows() -> None:
     assert abs(log_fks[0].inclusion_rate - 0.95) < 1e-6
 
 
+def test_foreign_keys_on_different_columns_survive_opposite_directions() -> None:
+    departments = NamedTableInput(
+        name="departments",
+        headers=("dept_id", "manager_id"),
+        rows=(("DEP101", "EMP001"), ("DEP102", "EMP003"), ("DEP103", "EMP005")),
+    )
+    employees = NamedTableInput(
+        name="employees",
+        headers=("emp_id", "dept_id"),
+        rows=tuple((f"EMP{i:03d}", f"DEP{101 + (i - 1) // 2}") for i in range(1, 7)),
+    )
+
+    with MultiTableContext(extra_tables=[departments, employees]) as mctx:
+        analysis = analyze_multi_table_relations(mctx, profile_all_tables(mctx))
+
+    fks = {
+        (
+            fk.child_table,
+            tuple(fk.child_columns),
+            fk.parent_table,
+            tuple(fk.parent_columns),
+        ): fk.cardinality
+        for fk in analysis.foreign_keys
+    }
+    assert fks[("employees", ("dept_id",), "departments", ("dept_id",))] is (
+        RelationshipCardinality.MANY_TO_ONE
+    )
+    assert fks[("departments", ("manager_id",), "employees", ("emp_id",))] is (
+        RelationshipCardinality.ONE_TO_ONE
+    )
+
+
+@pytest.mark.parametrize(
+    ("child_column", "parent_name", "parent_column", "expected_orphans"),
+    [
+        ("region_code", "product_codes", "product_code", []),
+        ("store_no", "item_no", "item_no", []),
+        ("code_id", "codes", "id", [1]),
+        ("code", "customers", "code", []),
+        ("code_id", "codes", "code_id", [1]),
+        ("code_code_id", "codes", "id", []),
+        ("num_code_id", "code_nums", "id", []),
+        ("code_num_id", "code_nums", "id", [1]),
+        ("branch_id", "branches", "id", [1]),
+        ("address_id", "addresses", "id", [1]),
+        ("status_id", "statuses", "id", [1]),
+        ("alias_id", "aliases", "id", [1]),
+        ("quiz_id", "quizzes", "id", [1]),
+    ],
+)
+def test_partial_fk_requires_domain_or_explicit_table_match(
+    child_column: str, parent_name: str, parent_column: str, expected_orphans: list[int]
+) -> None:
+    parent = NamedTableInput(
+        name=parent_name,
+        headers=(parent_column,),
+        rows=tuple((str(i),) for i in range(100, 120)),
+    )
+    child = NamedTableInput(
+        name="locations",
+        headers=(child_column,),
+        rows=tuple((str(i),) for i in [*range(100, 119), 999]),
+    )
+
+    with MultiTableContext(extra_tables=[parent, child]) as mctx:
+        analysis = analyze_multi_table_relations(mctx, profile_all_tables(mctx))
+
+    assert [
+        fk.orphan_rows
+        for fk in analysis.foreign_keys
+        if fk.child_table == "locations" and fk.parent_table == parent_name
+    ] == expected_orphans
+
+
+def test_composite_key_dependency_uses_equivalence_class_representatives() -> None:
+    table = NamedTableInput(
+        name="states",
+        headers=("m", "r", "a", "x"),
+        rows=(
+            ("red", "10", "north", "open"),
+            ("blue", "20", "north", "closed"),
+            ("red", "10", "east", "closed"),
+            ("blue", "20", "east", "open"),
+            ("red", "10", "west", "open"),
+            ("blue", "20", "west", "open"),
+        ),
+    )
+
+    with MultiTableContext(extra_tables=[table]) as mctx:
+        analysis = analyze_multi_table_relations(mctx, profile_all_tables(mctx))
+
+    relations = analysis.table_relations["states"]
+    assert {tuple(key.columns) for key in relations.candidate_keys} == {("a", "m"), ("a", "r")}
+    assert any(fd.lhs == ["a", "r"] and fd.rhs == "x" for fd in relations.functional_dependencies)
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("addresses", "address_id"),
+        ("boxes", "box_id"),
+        ("branches", "branch_id"),
+        ("movies", "movie_id"),
+        ("countries", "country_id"),
+        ("release_movies", "release_movie_id"),
+        ("statuses", "status_id"),
+        ("order_statuses", "order_status_id"),
+        ("order_status", "order_status_id"),
+        ("aliases", "alias_id"),
+        ("email_aliases", "email_alias_id"),
+        ("email_alias", "email_alias_id"),
+        ("result_caches", "result_cache_id"),
+        ("loan_tranches", "loan_tranche_id"),
+        ("cases", "case_id"),
+        ("headaches", "headache_id"),
+        ("backaches", "backache_id"),
+        ("avalanches", "avalanche_id"),
+        ("quizzes", "quiz_id"),
+        ("user_quizzes", "user_quiz_id"),
+        ("beaches", "beach_id"),
+        ("coaches", "coach_id"),
+        ("buzzes", "buzz_id"),
+    ],
+)
+def test_surrogate_key_name_uses_singular_table_name(name: str, expected: str) -> None:
+    table = NamedTableInput(name=name, headers=("color",), rows=(("red",), ("red",)))
+    with MultiTableContext(extra_tables=[table]) as mctx:
+        analysis = analyze_multi_table_relations(mctx, profile_all_tables(mctx))
+
+    recommendation = analysis.primary_keys[name]
+    assert recommendation.recommend_surrogate
+    assert recommendation.surrogate_column_name == expected
+
+
+def test_singular_table_name_breaks_tie_between_natural_keys() -> None:
+    table = NamedTableInput(
+        name="addresses",
+        headers=("legacy_id", "address_id"),
+        rows=tuple((str(1000 + i), str(2000 + i)) for i in range(1, 8)),
+    )
+    with MultiTableContext(extra_tables=[table]) as mctx:
+        analysis = analyze_multi_table_relations(mctx, profile_all_tables(mctx))
+
+    assert analysis.primary_keys["addresses"].columns == ["address_id"]
+
+
 def test_camelcase_associative_composite_pk_selection() -> None:
     """camelCase 연관 테이블 복합 PK(orderID, productID)와 다수 반복 문자열 FK를 검증한다."""
     customers = NamedTableInput(
@@ -246,3 +395,47 @@ def test_camelcase_associative_composite_pk_selection() -> None:
         and fk.inclusion_rate == 1.0
         for fk in analysis.foreign_keys
     )
+
+
+def test_year_prefixed_sequential_ids_across_unrelated_tables_do_not_form_fk() -> None:
+    orders = NamedTableInput(
+        name="orders",
+        headers=("order_id", "amount"),
+        rows=tuple((f"2026{i:06d}", str(i * 100)) for i in range(1, 20)),
+    )
+    invoices = NamedTableInput(
+        name="invoices",
+        headers=("invoice_id", "tax"),
+        rows=tuple((f"2026{i:06d}", str(i * 10)) for i in range(1, 20)),
+    )
+
+    with MultiTableContext(extra_tables=[orders, invoices]) as mctx:
+        bundles = profile_all_tables(mctx)
+        analysis = analyze_multi_table_relations(mctx, bundles)
+
+    for bundle in bundles:
+        pk_cls = bundle.classifications[0]
+        assert pk_cls.category is ColumnRoleCategory.STRUCTURED_STRING
+        assert pk_cls.string_pattern is not None
+        assert pk_cls.string_pattern.template == "{year}{seq}"
+    assert analysis.foreign_keys == []
+
+
+@pytest.mark.parametrize(
+    ("raw_name", "expected_singular"),
+    [
+        ("branches", "branch"),
+        ("addresses", "address"),
+        ("statuses", "status"),
+        ("orderStatuses", "order_status"),
+        ("emailAliases", "email_alias"),
+        ("quizzes", "quiz"),
+        ("userQuizzes", "user_quiz"),
+        ("headaches", "headache"),
+        ("beaches", "beach"),
+    ],
+)
+def test_singularize_handles_irregular_suffix_and_camelcase_forms(
+    raw_name: str, expected_singular: str
+) -> None:
+    assert singularize(raw_name) == expected_singular

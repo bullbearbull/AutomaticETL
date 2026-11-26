@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 
+from autoetl.adapters.detectors import name_matches
 from autoetl.contracts import (
     ColumnClassification,
     ColumnProfile,
@@ -28,10 +29,16 @@ from autoetl.core.string_pattern import analyze_string_pattern
 
 _SAMPLE_LIMIT = 2000
 
+_CAMEL_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
 _INDEX_NAME_RE = re.compile(
     r"(^|_)(id|idx|index|seq|no|num|pk|rownum|row_num|순번|번호|연번)$",
     re.IGNORECASE,
 )
+
+
+def _normalize_column_name(name: str) -> str:
+    return _CAMEL_BOUNDARY_RE.sub(r"\1_\2", name)
+
 
 # 알려진 서열 범주 사전(낮음 → 높음 순서)
 _ORDINAL_DICTS: tuple[tuple[str, ...], ...] = (
@@ -226,10 +233,18 @@ def classify_table_columns(
             if prof.length.minimum == prof.length.maximum and prof.length.minimum >= 10:
                 sample_strs = _fetch_non_missing_strings(ctx, col_id)
                 cand_pat = analyze_string_pattern(sample_strs)
-                if cand_pat is not None and any(
-                    seg.slot_category is ColumnRoleCategory.TEMPORAL for seg in cand_pat.segments
-                ):
-                    str_pattern = cand_pat
+                if cand_pat is not None:
+                    has_date_prefix = (
+                        bool(cand_pat.segments)
+                        and cand_pat.segments[0].slot_category is ColumnRoleCategory.TEMPORAL
+                    )
+                    normalized_name = _normalize_column_name(col.name)
+                    is_year_code = cand_pat.template == "{year}{seq}" and (
+                        _INDEX_NAME_RE.search(normalized_name) is not None
+                        or name_matches(normalized_name, ("code", "코드"))
+                    )
+                    if has_date_prefix or is_year_code:
+                        str_pattern = cand_pat
 
             if str_pattern is not None:
                 category = ColumnRoleCategory.STRUCTURED_STRING
@@ -240,7 +255,7 @@ def classify_table_columns(
             elif is_unique and (
                 (index_meta is not None and index_meta.likely_surrogate_index)
                 or sem is SemanticType.IDENTIFIER
-                or _INDEX_NAME_RE.search(col.name) is not None
+                or _INDEX_NAME_RE.search(_normalize_column_name(col.name)) is not None
             ):
                 category = ColumnRoleCategory.INDEX
                 if index_meta is not None and index_meta.likely_surrogate_index:
@@ -363,10 +378,7 @@ def classify_table_columns(
                                     for v in sample_strs
                                 )
                             )
-                            or _INDEX_NAME_RE.search(
-                                re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", col.name)
-                            )
-                            is not None
+                            or _INDEX_NAME_RE.search(_normalize_column_name(col.name)) is not None
                         )
                     ):
                         category = ColumnRoleCategory.CODE_IDENTIFIER

@@ -30,16 +30,53 @@ _SEQ_DISCRIMINATOR_RE = re.compile(
 )
 
 _MIN_ACCEPTABLE_PK_SCORE = 40.0
+_SINGULAR_FORMS = {
+    "aches": "ache",
+    "alias": "alias",
+    "aliases": "alias",
+    "apaches": "apache",
+    "avalanches": "avalanche",
+    "axes": "axe",
+    "backaches": "backache",
+    "caches": "cache",
+    "cliches": "cliche",
+    "cookies": "cookie",
+    "dies": "die",
+    "earaches": "earache",
+    "headaches": "headache",
+    "heartaches": "heartache",
+    "lies": "lie",
+    "moustaches": "moustache",
+    "movies": "movie",
+    "mustaches": "mustache",
+    "niches": "niche",
+    "panaches": "panache",
+    "pies": "pie",
+    "quiches": "quiche",
+    "quizzes": "quiz",
+    "status": "status",
+    "statuses": "status",
+    "stomachaches": "stomachache",
+    "ties": "tie",
+    "toothaches": "toothache",
+    "tranches": "tranche",
+    "zombies": "zombie",
+}
 
 
 def _to_snake(name: str) -> str:
     return _CAMEL_RE.sub(r"\1_\2", name.strip()).lower()
 
 
-def _singularize(word: str) -> str:
-    w = word.lower().strip()
+def singularize(word: str) -> str:
+    w = _to_snake(word)
+    prefix, separator, last_word = w.rpartition("_")
+    if last_word in _SINGULAR_FORMS:
+        return prefix + separator + _SINGULAR_FORMS[last_word]
     if w.endswith("ies") and len(w) > 4:
         return w[:-3] + "y"
+    if w.endswith(("sses", "xes", "ches", "shes", "zzes")):
+        return w[:-2]
     if w.endswith("s") and not w.endswith("ss") and len(w) > 3:
         return w[:-1]
     return w
@@ -132,7 +169,7 @@ def _score_candidate_key(
         reasons.append("연속 수치·장문 텍스트 포함으로 감점")
 
     # 4. 이름 신호 및 선두 컬럼 보너스(camelCase 포함 동률 판결)
-    table_singular = _singularize(table_name)
+    table_singular = singularize(table_name)
     name_hits = 0
     for col in candidate.columns:
         snake = _to_snake(col)
@@ -186,7 +223,7 @@ def select_primary_key(
             columns=[],
             is_composite=False,
             recommend_surrogate=True,
-            surrogate_column_name=f"{_singularize(table_name)}_id",
+            surrogate_column_name=f"{singularize(table_name)}_id",
             score=0.0,
             referenced_by_count=0,
             alternative_keys=[],
@@ -222,7 +259,7 @@ def select_primary_key(
             columns=[],
             is_composite=False,
             recommend_surrogate=True,
-            surrogate_column_name=f"{_singularize(table_name)}_id",
+            surrogate_column_name=f"{singularize(table_name)}_id",
             score=best_score,
             referenced_by_count=best_ref,
             alternative_keys=[item[2].columns for item in scored[:3]],
@@ -245,4 +282,4 @@ def select_primary_key(
     )
 
 
-__all__ = ["select_primary_key"]
+__all__ = ["select_primary_key", "singularize"]
