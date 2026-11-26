@@ -137,13 +137,14 @@ def _normalize_expression(
             "ELSE NULL END"
         )
     elif rule is NormalizationRule.DATE:
+        trimmed = f"trim({quoted})"
         parsed = ", ".join(
-            f"CAST(TRY_STRPTIME({quoted}, '{fmt}') AS DATE)"
+            f"CAST(TRY_STRPTIME({trimmed}, '{fmt}') AS DATE)"
             for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d")
         )
         dense = (
-            f"CASE WHEN regexp_full_match(trim({quoted}), '[0-9]{{8}}') "
-            f"THEN CAST(TRY_STRPTIME(trim({quoted}), '%Y%m%d') AS DATE) END"
+            f"CASE WHEN regexp_full_match({trimmed}, '[0-9]{{8}}') "
+            f"THEN CAST(TRY_STRPTIME({trimmed}, '%Y%m%d') AS DATE) END"
         )
         # 시리얼 분기도 정수 형태일 때만 — TRY_CAST INTEGER는 소수를 반올림한다.
         serial = (

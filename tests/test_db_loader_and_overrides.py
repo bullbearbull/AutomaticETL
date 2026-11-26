@@ -111,7 +111,7 @@ def test_keep_last_valid_primary_key_row_and_release_only_its_old_unique_values(
         )
         with MultiTableContext(extra_tables=[source]) as ctx:
             bundle = profile_all_tables(ctx)[0]
-            read, loaded, quarantined, *_, error = _load_single_table(
+            read, loaded, quarantined, _, _, _, table_warnings, error = _load_single_table(
                 adapter,
                 mctx=ctx,
                 bundle=bundle,
@@ -126,6 +126,7 @@ def test_keep_last_valid_primary_key_row_and_release_only_its_old_unique_values(
             )
         assert error is None
         assert (read, loaded) == (7, 3)
+        assert any("PK 중복 2건" in w for w in table_warnings)
         assert [(entry[3], entry[4]) for entry in quarantined] == [
             (6, "unique_violation"),
             (7, "unique_violation"),
@@ -272,6 +273,40 @@ def test_duckdb_numeric_overflow_quarantines_rows_with_an_existing_target_type(
         assert conn.execute(
             "SELECT DISTINCT error_category, error_column FROM _etl_quarantine_rows"
         ).fetchall() == [("cast_error", "amount")]
+
+
+def test_duckdb_existing_numeric_and_int4_constraints_apply_across_inferred_types(
+    tmp_path: Path,
+) -> None:
+    """기존 DB 컬럼이 DECIMAL(5,2)/INTEGER이면 추론 물리 타입이 달라도 범위 초과 행을 격리한다."""
+    source = NamedTableInput(
+        name="cross_typed",
+        headers=("id", "existing_num", "existing_int"),
+        rows=(
+            ("1", "100", "100.0"),
+            ("2", "1000", "200.0"),
+            ("3", "200", "3000000000.0"),
+        ),
+    )
+    db_path = tmp_path / "cross_typed.duckdb"
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute(
+            "CREATE TABLE cross_typed (id INTEGER PRIMARY KEY, "
+            "existing_num DECIMAL(5,2), existing_int INTEGER)"
+        )
+    _, result = load_tables(extra_tables=[source], db_path=db_path, engine="duckdb")
+    assert (result.total_rows_loaded, result.total_rows_quarantined) == (1, 2)
+    with duckdb.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT id, existing_num, existing_int FROM cross_typed"
+        ).fetchall() == [(1, Decimal("100.00"), 100)]
+        assert conn.execute(
+            "SELECT source_row_number, error_category, error_column "
+            "FROM _etl_quarantine_rows ORDER BY source_row_number"
+        ).fetchall() == [
+            (2, "cast_error", "existing_num"),
+            (3, "cast_error", "existing_int"),
+        ]
 
 
 def _write_korean_finance_fixture(

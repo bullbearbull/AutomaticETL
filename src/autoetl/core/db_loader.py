@@ -890,23 +890,7 @@ def _transform_cell(
                 return False, None, "정수 변환 불가(소수 존재)"
             val = int(dec)
         else:
-            numeric_type = db_type_cast or (
-                _dialect_col_type(col, mapping, engine) if engine == "duckdb" else type_cast
-            )
-            m_num = _DECIMAL_PS_RE.fullmatch(numeric_type)
-            if m_num is not None:
-                precision, scale = int(m_num.group(1)), int(m_num.group(2))
-                # SQL NUMERIC은 소수부 자릿수를 반올림한 뒤 정수부 범위를 검사한다.
-                overflow_at = Decimal((0, (9,) * precision + (5,), -scale - 1))
-                if dec.copy_abs() >= overflow_at:
-                    return False, None, f"NUMERIC({precision}, {scale}) 허용 범위 초과"
-                if engine != "sqlite":
-                    quantum = Decimal((0, (1,), -scale))
-                    context = Context(prec=precision, rounding=ROUND_HALF_UP)
-                    dec = dec.quantize(quantum, context=context)
-            val = float(dec) if engine == "sqlite" else dec
-            if isinstance(val, float) and not math.isfinite(val):
-                return False, None, "유한하지 않은 수치 값"
+            val = dec
     elif mapping.transform == "normalize_boolean" or col.physical_type is PhysicalType.BOOLEAN:
         low = s.strip().lower()
         if low in _TRUE_TOKENS:
@@ -960,12 +944,36 @@ def _transform_cell(
         if m_vc is not None and len(val) > int(m_vc.group(1)):
             return False, None, f"VARCHAR({m_vc.group(1)}) 최대 길이 초과"
 
-    if (
-        col.physical_type is PhysicalType.INTEGER
-        and (db_type_cast == "integer" or type_cast in {"int", "integer"})
-        and not (INT4_MIN <= val <= INT4_MAX)
-    ):
-        return False, None, "INT4 허용 범위 초과"
+    if not isinstance(val, bool) and isinstance(val, (int, float, Decimal)):
+        numeric_type = db_type_cast or (
+            _dialect_col_type(col, mapping, engine)
+            if engine == "duckdb" and col.physical_type is PhysicalType.DECIMAL
+            else type_cast
+        )
+        m_num = _DECIMAL_PS_RE.fullmatch(numeric_type)
+        if m_num is not None:
+            precision, scale = int(m_num.group(1)), int(m_num.group(2))
+            dec_val = val if isinstance(val, Decimal) else Decimal(str(val))
+            # SQL NUMERIC은 소수부 자릿수를 반올림한 뒤 정수부 범위를 검사한다.
+            overflow_at = Decimal((0, (9,) * precision + (5,), -scale - 1))
+            if dec_val.copy_abs() >= overflow_at:
+                return False, None, f"NUMERIC({precision}, {scale}) 허용 범위 초과"
+            if engine != "sqlite" and isinstance(val, Decimal):
+                quantum = Decimal((0, (1,), -scale))
+                context = Context(prec=precision, rounding=ROUND_HALF_UP)
+                val = val.quantize(quantum, context=context)
+        if db_type_cast == "integer" or (
+            col.physical_type is PhysicalType.INTEGER and type_cast in {"int", "integer"}
+        ):
+            dec_val = val if isinstance(val, Decimal) else Decimal(str(val))
+            rounded_int = int(dec_val.to_integral_value(rounding=ROUND_HALF_UP))
+            if not (INT4_MIN <= rounded_int <= INT4_MAX):
+                return False, None, "INT4 허용 범위 초과"
+        if engine == "sqlite" and isinstance(val, Decimal):
+            fv_dec = float(val)
+            if not math.isfinite(fv_dec):
+                return False, None, "유한하지 않은 수치 값"
+            val = fv_dec
     if mask_policy is not MaskingPolicy.NONE and isinstance(val, str):
         val = mask_value(val, sensitive_type, mask_policy)
     return True, val, ""
@@ -1598,6 +1606,7 @@ def _load_single_table(
         else (set(), {})
     )
     valid_rows: list[list[Any]] = []
+    dedup_replaced = 0
     quarantine_entries: list[tuple[Any, ...]] = []
 
     for row_idx, raw_row in enumerate(raw_rows, start=1):
@@ -1747,12 +1756,18 @@ def _load_single_table(
             valid_rows.append(row_values)
         else:
             valid_rows[previous_position] = row_values
+            dedup_replaced += 1
 
     pre_update_snapshots: list[dict[str, Any]] | None = []
     predecessor_batch_ids: list[str] | None = []
     snap_omit_reason: str | None = None
     actual_updated = 0
     table_warnings: list[str] = []
+    if dedup_replaced > 0:
+        table_warnings.append(
+            f"`{target_table.name}` 동일 파일 내 PK 중복 {dedup_replaced:,}건을 "
+            "마지막 유효 행으로 대체했습니다."
+        )
     if valid_rows:
         cols_sql = ", ".join(_qi(c) for c in insert_col_names)
         placeholders = ", ".join([adapter.placeholder] * len(insert_col_names))

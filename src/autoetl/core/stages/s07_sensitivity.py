@@ -39,7 +39,9 @@ _PHONE_INTL_RE = re.compile(r"^(?:\+\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]\d{3,4}[-
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _IPV4_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$")
 _BANK_ACCT_VALUE_RE = re.compile(r"^\d{2,4}-\d{2,6}-\d{2,7}(?:-\d{1,3})?$")
-_CAMEL_WORD_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+_CAMEL_WORD_BOUNDARY_RE = re.compile(
+    r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=(?!Pv[46](?:[^a-z]|$))[A-Z][a-z])"
+)
 
 _ENTITY_NAME_EXCLUSIONS = (
     "branch",
@@ -423,6 +425,7 @@ def _classify_column(
     if (
         _contains_hint(col_name, _ADDRESS_HINTS)
         and not email_hint
+        and not name_matches(col_name, _NETWORK_ADDRESS_HINTS)
         and not name_matches(tokenized_name, _NETWORK_ADDRESS_HINTS)
     ):
         _add(SensitiveType.ADDRESS, "name_hint", 0.85, max(best_rate, 0.80))
