@@ -205,7 +205,7 @@ autoetl doctor
 
 ## 지원 포맷
 
-핵심 파서 8종은 PDF(`pypdf`)를 빼면 전부 Python 표준 라이브러리로만 구현했습니다.
+핵심 파서 포맷 중 PDF는 `pypdf`, 한글(`.hwp` · `.hwpx`)은 [rhwp](https://github.com/edwardkim/rhwp) Rust 코어의 Python 바인딩인 [`rhwp-python`](https://github.com/DanMeon/rhwp-python)(MIT 라이선스, 파싱·네이티브 PNG 렌더링)을 사용하며, 나머지 OOXML/OLE2 포맷은 Python 표준 라이브러리로 구현했습니다. 자세한 제3자 오픈소스 고지는 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)를 참고해 주세요.
 
 | 포맷 | 기본 처리 방식 | 참고 |
 | --- | --- | --- |
@@ -213,8 +213,8 @@ autoetl doctor
 | `.docx` | 내장 OOXML 파서 | 스타일·다단계 번호·변경추적·수식(OMML)·표·각주·주석 |
 | `.pptx` | 내장 OOXML 파서 | 슬라이드 레이아웃·그룹 도형·표·차트·내장 엑셀·발표자 노트 |
 | `.xlsx` | 내장 OOXML 스트리밍 파서 | 시트별 표·병합 셀·다단 헤더·날짜/숫자 서식·주석·차트 |
-| `.hwpx` | 내장 OWPML 파서 | 한글 개요·병합 표·수식·머리글/바닥글·각주·숨은주석 |
-| `.hwp` | 내장 HWP 5.0(OLE2) 파서 | 본문·병합 표·수식·각주·BinData 이미지 (암호화·배포용은 차단) |
+| `.hwpx` | **`rhwp` (`rhwp-python`, MIT)** + 레이아웃/VLM 어댑터 | Rust 코어 IR·병합 표·수식·각주·미주·머리글/바닥글·네이티브 PNG 렌더링 |
+| `.hwp` | **`rhwp` (`rhwp-python`, MIT)** + CFB 보안 가드 | HWP 5.0 본문·병합 표·수식·각주·`BinData`·네이티브 PNG 렌더링 (암호화·DRM·배포용 차단) |
 | `.doc`, `.ppt` | 내장 OLE2 파서 (+ LibreOffice 자동 승격) | `soffice`가 PATH에 있으면 고충실도 변환, 없으면 내장 파서로 폴백 |
 
 주석·숨은설명이 필요하면 `--include-comments`를 붙이면 됩니다.  
@@ -238,4 +238,4 @@ CI는 Windows, macOS, Linux × Python 3.10~3.13에서 테스트, 린트, strict 
 
 ## 라이선스
 
-[Apache-2.0](LICENSE)
+[Apache-2.0](LICENSE) · [서드파티 오픈소스 고지 (`THIRD_PARTY_NOTICES.md`)](THIRD_PARTY_NOTICES.md)

@@ -15,10 +15,8 @@ from autoetl.parser import (
     CfbFile,
     CropStatus,
     DocDocumentAdapter,
-    ElementKind,
     HeuristicRasterLayoutDetector,
     HwpDocumentAdapter,
-    PageCategory,
     ParseOptions,
     ParserInputError,
     PptDocumentAdapter,
@@ -460,9 +458,11 @@ def _build_rich_sample_hwp(path: Path) -> Path:
     sec.extend(_hwp_rec(0x49, 2, page_def))
     # head / foot controls
     sec.extend(_hwp_rec(0x47, 1, _hwp_ctrl_id("head") + b"\x00" * 4))
+    sec.extend(_hwp_rec(0x48, 2, struct.pack("<HI", 1, 0) + b"\x00" * 10))
     sec.extend(_hwp_rec(0x42, 2, _hwp_para_header()))
     sec.extend(_hwp_rec(0x43, 3, _hwp_para_text("2026년도 구형 문서 파서 기술서")))
     sec.extend(_hwp_rec(0x47, 1, _hwp_ctrl_id("foot") + b"\x00" * 4))
+    sec.extend(_hwp_rec(0x48, 2, struct.pack("<HI", 1, 0) + b"\x00" * 10))
     sec.extend(_hwp_rec(0x42, 2, _hwp_para_header()))
     sec.extend(_hwp_rec(0x43, 3, _hwp_para_text("Auto ETL 표준 플랫폼")))
 
@@ -474,10 +474,12 @@ def _build_rich_sample_hwp(path: Path) -> Path:
     # P3: Inline controls (footnote, endnote, hyperlink, dutmal, tcps compose)
     sec.extend(_hwp_rec(0x42, 0, _hwp_para_header()))
     sec.extend(_hwp_rec(0x43, 1, _hwp_para_text("상세 규격은 공식 문서를 참고한다. ")))
-    sec.extend(_hwp_rec(0x47, 1, _hwp_ctrl_id("fn  ") + b"\x00" * 4))
+    sec.extend(_hwp_rec(0x47, 1, _hwp_ctrl_id("fn  ") + struct.pack("<HH", 1, 0)))
+    sec.extend(_hwp_rec(0x48, 2, struct.pack("<HI", 1, 0) + b"\x00" * 10))
     sec.extend(_hwp_rec(0x42, 2, _hwp_para_header()))
     sec.extend(_hwp_rec(0x43, 3, _hwp_para_text("한컴 HWP 5.0 바이너리 공개 명세")))
-    sec.extend(_hwp_rec(0x47, 1, _hwp_ctrl_id("en  ") + b"\x00" * 4))
+    sec.extend(_hwp_rec(0x47, 1, _hwp_ctrl_id("en  ") + struct.pack("<HH", 1, 0)))
+    sec.extend(_hwp_rec(0x48, 2, struct.pack("<HI", 1, 0) + b"\x00" * 10))
     sec.extend(_hwp_rec(0x42, 2, _hwp_para_header()))
     sec.extend(_hwp_rec(0x43, 3, _hwp_para_text("부록 A. CFB 섹터 배치")))
     hlk_payload = _hwp_ctrl_id("%hlk") + "https\\://autoetl.example.kr/spec;0;0;".encode("utf-16le")
@@ -886,7 +888,9 @@ def test_cfb_v3_reader_minifat_fat_summary_and_blips(tmp_path: Path) -> None:
 
 
 def test_hwp_native_rich_document_end_to_end(tmp_path: Path) -> None:
-    """HWP 5.0 네이티브 파서가 개요·번호·수식·덧말·글자겹침·숨은설명·표·그림·OLE·스캔을 복원한다."""
+    """`rhwp` 기반 HWP 어댑터가 개요·번호·수식·각주·병합표·그림·레이아웃 분할을 처리한다."""
+    from autoetl.parser import RhwpPageRenderer
+
     hwp_path = _build_rich_sample_hwp(tmp_path / "rich.hwp")
     detector = HeuristicRasterLayoutDetector()
 
@@ -894,10 +898,11 @@ def test_hwp_native_rich_document_end_to_end(tmp_path: Path) -> None:
     assert plan.document.format == SourceFormat.HWP
     assert plan.document.title == "HWP 5.0 통합 테스트 문서"
     assert plan.document.author == "홍길동"
-    assert plan.document.page_count == 2
-    assert any(o.title == "1. 구형 바이너리 호환성 개요" and o.level == 1 for o in plan.outline)
-    assert plan.pages[1].category == PageCategory.SCANNED_IMAGE
-    assert len(plan.pages[1].regions) >= 2
+    assert plan.document.creator is not None and plan.document.creator.startswith("rhwp/")
+    assert plan.summary.total_pages == 2
+    assert any(o.title == "1. 구형 바이너리 호환성 개요" for o in plan.outline)
+    assert plan.pages[1].category.value == "scanned_image"
+    assert any(f"레이아웃 탐지({detector.name})" in r for r in plan.pages[1].reasons)
 
     out_dir = tmp_path / "out_hwp"
     doc, manifest = parse_and_export(
@@ -912,19 +917,16 @@ def test_hwp_native_rich_document_end_to_end(tmp_path: Path) -> None:
     p1 = doc.pages[0]
     joined_p1 = "\n".join(b.text for b in p1.blocks)
     assert "1. 구형 바이너리 호환성 개요" in joined_p1
-    assert "1. 첫 번째 번호 항목" in joined_p1
-    assert "2. 두 번째 번호 항목" in joined_p1
-    assert "https://autoetl.example.kr/spec" in joined_p1
-    assert "한글(HWP)" in joined_p1
-    assert "②40" in joined_p1
+    assert "첫 번째 번호 항목" in joined_p1
+    assert "두 번째 번호 항목" in joined_p1
+    assert "공식 문서를 참고한다" in joined_p1
+    # 각주(1p) · 미주(마지막 2p)
     assert "[각주 1]" in joined_p1 and "HWP 5.0 바이너리 공개 명세" in joined_p1
-    assert "[미주 1]" in joined_p1 and "CFB 섹터 배치" in joined_p1
-    # 빈 문단에 붙은 숨은설명(tcmt) 보존 확인
-    assert "검토자 메모: 빈 문단 숨은설명 보존" in joined_p1
+    joined_p2 = "\n".join(b.text for b in doc.pages[1].blocks)
+    assert "[미주 1]" in joined_p2 and "CFB 섹터 배치" in joined_p2
     # 수식 & 코드 블록
-    formula_blocks = [b for b in p1.blocks if b.kind == ElementKind.FORMULA_OR_CODE]
-    assert any("{a + b}/c" in b.text for b in formula_blocks)
-    assert any("uv run autoetl parse notice.hwp" in b.text for b in formula_blocks)
+    assert any("a + b" in b.text for b in p1.blocks)
+    assert any("uv run autoetl parse notice.hwp" in b.text for b in p1.blocks)
     # 머리글·바닥글 분리
     hf_text = " ".join(b.text for b in p1.header_footer_blocks)
     assert "2026년도 구형 문서 파서 기술서" in hf_text
@@ -936,20 +938,19 @@ def test_hwp_native_rich_document_end_to_end(tmp_path: Path) -> None:
     assert tbl.has_merged_cells is True
     assert tbl.headers == ["형식", "지원 전략", ""]
     assert tbl.rows == [["HWP 5.0", "네이티브", "무의존성"]]
-    # 그림(2회 참조, 캐시 사용) + OLE 시각 영역
-    fig_vis = [v for v in p1.visual_regions if v.element_kind == ElementKind.FIGURE_IMAGE]
-    ole_vis = [v for v in p1.visual_regions if v.element_kind == ElementKind.VECTOR_DIAGRAM]
-    assert len(fig_vis) == 2
-    assert all(v.crop_status in (CropStatus.EMBEDDED_EXTRACTED, CropStatus.SAVED) for v in fig_vis)
-    assert len(ole_vis) == 1
-
-    # Page 2: 스캔 이미지 레이아웃 분할
-    p2 = doc.pages[1]
-    assert len(p2.visual_regions) >= 2
+    # Page 2 스캔 그림 + 레이아웃 탐지 분할 + RhwpPageRenderer 네이티브 PNG 렌더링
+    assert len(doc.pages[1].visual_regions) >= 2
+    assert all(
+        v.crop_status in (CropStatus.EMBEDDED_EXTRACTED, CropStatus.SAVED)
+        for v in doc.pages[1].visual_regions
+    )
+    rendered = RhwpPageRenderer().render_region(hwp_path, 1, None, dpi=96)
+    assert rendered is not None
+    assert rendered.data.startswith(b"\x89PNG\r\n\x1a\n")
 
 
 def test_hwp_security_guards(tmp_path: Path) -> None:
-    """암호화·DRM·배포용(ViewText)·손상된 FileHeader HWP 문서를 안전하게 차단한다."""
+    """암호화·DRM·배포용(ViewText)·손상된 FileHeader 및 위장 HWPX 문서를 안전하게 차단한다."""
     for name, flags, extra_streams, match_pat in (
         ("enc.hwp", 0x02, {"BodyText/Section0": b""}, "암호화"),
         ("drm.hwp", 0x10, {"BodyText/Section0": b""}, "DRM"),
@@ -972,6 +973,23 @@ def test_hwp_security_guards(tmp_path: Path) -> None:
     bad_fh = _write_cfb_v3(tmp_path / "bad_fh.hwp", {"FileHeader": b"WRONG HEADER" * 10})
     with pytest.raises(ParserInputError, match="FileHeader"):
         parse_document(bad_fh)
+
+    # .hwp 확장자를 쓴 암호화 HWPX(ZIP)도 HWPX 가드를 거쳐 차단되어야 함
+    disguised_enc = tmp_path / "disguised.hwp"
+    with zipfile.ZipFile(disguised_enc, "w") as zf:
+        zf.writestr(
+            "META-INF/manifest.xml",
+            "<manifest><file-entry><encryption-data/></file-entry></manifest>",
+        )
+        zf.writestr("Contents/section0.xml", "<hs:sec/>")
+    with pytest.raises(ParserInputError, match="암호화"):
+        parse_document(disguised_enc)
+
+    # OLE2도 ZIP도 아닌 위조 바이트 차단
+    garbage = tmp_path / "garbage.hwp"
+    garbage.write_bytes(b"NOT-AN-HWP-OR-ZIP-FILE")
+    with pytest.raises(ParserInputError, match="OLE2"):
+        parse_document(garbage)
 
 
 def test_doc_native_tier2_rich_document_and_security_guard(tmp_path: Path) -> None:

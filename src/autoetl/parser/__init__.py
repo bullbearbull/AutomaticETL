@@ -61,7 +61,12 @@ from autoetl.parser.exporters import (
     render_document_markdown,
     render_routing_report_markdown,
 )
-from autoetl.parser.hwpx import HwpxDocumentAdapter
+from autoetl.parser.hwp import (
+    HwpDocumentAdapter,
+    HwpxDocumentAdapter,
+    RhwpDocumentAdapter,
+    RhwpPageRenderer,
+)
 from autoetl.parser.layout_detector import (
     DOCLAYNET_LABELS,
     LAYOUT_LABEL_PRESETS,
@@ -80,7 +85,6 @@ from autoetl.parser.layout_detector import (
 from autoetl.parser.legacy import (
     CfbFile,
     DocDocumentAdapter,
-    HwpDocumentAdapter,
     PptDocumentAdapter,
     convert_legacy_office_document,
 )
@@ -161,6 +165,8 @@ __all__ = [
     "PptDocumentAdapter",
     "PptxDocumentAdapter",
     "RegionRoute",
+    "RhwpDocumentAdapter",
+    "RhwpPageRenderer",
     "RoutedVisionAdapter",
     "RoutingPlan",
     "RoutingSummary",

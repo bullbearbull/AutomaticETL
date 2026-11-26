@@ -47,21 +47,18 @@
   - 병합 셀(`gridSpan`·`hMerge`·`vMerge` restart/continue)·중첩 표·테두리 유형(`RULED_TABLE`/`HORIZONTAL_RULED_TABLE`/`BORDERLESS_TABLE`)·희소 패딩 열 압축
   - Office Math(`m:oMath`/`m:oMathPara` 분수·위첨자·아래첨자·근호·적분/합·행렬) 선형 수식 변환, 각주(`word/footnotes.xml`)·미주(`word/endnotes.xml`)·검토 주석(`word/comments.xml`, `--include-comments`)·머리글/바닥글 분리
   - 내장 이미지·네이티브 차트(`c:chart`·`cx:chart`)·SmartArt·내장 Excel(`.xlsx`) OLE 추출, 페이지 나누기/섹션/가상 높이 페이지 분할 및 전체 스캔 페이지 `PageLayoutDetector` 연동
-- `hwpx/` — HWPX(KS X 6101 OWPML 한글 개방형 문서) 무의존성 심층 구현(`owpml.py`, `elements.py`, `router.py`, `adapter.py`):
-  - `META-INF/container.xml`·`Contents/content.hpf` 매니페스트/스파인/메타데이터, `Contents/header.xml` 글꼴·글자모양(`charPr`)·문단모양(`paraPr` 개요/번호/글머리표)·스타일(`style`)·테두리(`borderFill`) 카탈로그
-  - `<hp:switch>`(`<hp:case>` vs `<hp:default>`) 중복 제거, `<hp:ctrl>` 내 머리글(`header`)·바닥글(`footer`)·각주(`footNote`)·미주(`endNote`)·숨은주석(`hiddenComment`) 본문 혼입 방지 및 분리 추출
-  - `<hp:tbl>` 명시적 격자 좌표(`cellAddr`)·가로세로 병합(`cellSpan`)·테두리 전략(`RULED_TABLE`/`HORIZONTAL_RULED_TABLE`/`BORDERLESS_TABLE`)·내장 캡션(`caption`)·중첩 표 추출
-  - 한컴 수식 스크립트(`<hp:equation><hp:script>`) 선형 수식 정규화, `BinData/*` 내장 이미지·OOXML 차트(`Chart/*.xml`)·도형 컨테이너(`container`/`drawText`)·다단(`colPr`)·페이지 나누기(`pageBreak`/`linesegarray`) 및 전체 스캔 페이지 `PageLayoutDetector` 연동
+- `hwp/` — [`rhwp`](https://github.com/edwardkim/rhwp) Rust 코어의 Python 바인딩 [`rhwp-python`](https://github.com/DanMeon/rhwp-python)(MIT)을 사용한 `.hwp`(HWP 5.0)·`.hwpx`(KS X 6101 OWPML) 통합 파서 및 네이티브 PNG 페이지 렌더러(`adapter.py`: `RhwpDocumentAdapter`, `HwpDocumentAdapter`, `HwpxDocumentAdapter`, `RhwpPageRenderer`):
+  - 컨테이너 선행 보안 검증(암호화·DRM·배포용 `ViewText`·암호화 HWPX 차단), `rhwp.parse()` → Document IR(`HwpDocument`) 매핑(문단·목록·병합 표·캡션·한컴 수식·각주/미주·머리글/바닥글·`BinData` 이미지 추출)
+  - `doc.render_png()` 기반 네이티브 페이지 래스터 렌더링 및 스캔 페이지 `PageLayoutDetector` / OCR·VLM 연동
 - `xlsx/` — XLSX(SpreadsheetML OOXML) 무의존성 심층 구현(`ooxml.py`, `elements.py`, `adapter.py`):
   - `ET.iterparse` 스트리밍 시트 파싱, `sharedStrings.xml` 음성 힌트(`<rPh>`) 제거, `styles.xml` 날짜(1900/1904)·백분율·천단위 서식 복원
   - 병합 셀(`mergeCells`) 확장 및 다단 헤더 평탄화, 빈 행·빈 열 기준 다중 데이터 영역 분할, 시트별 메모/주석(`--include-comments`)
   - DrawingML 차트(`c:chart`·`cx:chart`) 표 변환 및 내장 이미지 크롭 추출, OLE2 암호화 `.xlsx` 안전 차단
-- `legacy/` — 구형 바이너리 OLE2 문서(`.hwp`, `.doc`, `.ppt`) 무의존성 네이티브 + 하이브리드 구현(`cfb.py`, `converter.py`, `hwp.py`, `doc.py`, `ppt.py`):
+- `legacy/` — 구형 바이너리 OLE2 MS Office 문서(`.doc`, `.ppt`) 네이티브 + 하이브리드 구현(`cfb.py`, `converter.py`, `doc.py`, `ppt.py`) 및 `HwpDocumentAdapter` 호환 re-export:
   - `cfb.py` — 순수 Python MS-CFB(OLE2) v3/v4 리더(`CfbFile`, FAT·DIFAT·MiniFAT·디렉터리 트리), `\x05SummaryInformation`/`\x05HwpSummaryInformation` 속성셋 파서, OfficeArt BLIP(PNG/JPEG/BMP/EMF/WMF) 스캐너
   - `converter.py` — 시스템에 LibreOffice(`soffice`/`libreoffice`)가 설치된 환경에서 `.doc`→`.docx`, `.ppt`→`.pptx` 고충실도 승격을 지원하는 선택 변환기(`convert_legacy_office_document`)
-  - `hwp.py` — 순수 Python HWP 5.0(`.hwp`) 네이티브 파서(`HwpDocumentAdapter`): `FileHeader` 암호화·DRM·배포용(`ViewText`) 차단, `DocInfo` 스타일·글꼴·글자/문단모양·번호·테두리·BinData 캐시, 섹션 스트리밍 레코드 트리(`BodyText/Section*`), 병합 표·캡션·수식(`eqed`)·덧말(`tdut`)·글자겹침(`tcps`)·하이퍼링크(`%hlk`)·각주/미주/숨은설명(`tcmt`)·머리글/바닥글·그림(`BinData/*`)·OLE(`$ole`/`0x54`) 및 스캔 페이지 `PageLayoutDetector` 연동
-  - `doc.py` — MS Word 97–2003(`.doc`) 하이브리드 어댑터(`DocDocumentAdapter`): Tier-1 LibreOffice `.docx` 승격(설치 시) + Tier-2 순수 Python MS-DOC 폴백(`WordDocument` FIB 암호화 차단, `0Table`/`1Table` `Clx`/`PlcPcd` 피스 테이블 UTF-16LE/CP1252 디코딩, `\x07` 표 복원, 필드/하이퍼링크 해석, 머리글/바닥글/각주/미주/주석 서브도큐먼트, `Data`/Escher BLIP 이미지 추출)
-  - `ppt.py` — MS PowerPoint 97–2003(`.ppt`) 하이브리드 어댑터(`PptDocumentAdapter`): Tier-1 LibreOffice `.pptx` 승격(설치 시) + Tier-2 순수 Python MS-PPT 폴백(`Current User` 암호화 차단, `UserEditAtom`/`PersistDirectoryAtom` 증분 저장 복원, `SlideListWithText`·`Slide`·`Notes`·`HeadersFootersContainer`(`0x0FD9`)·Escher 표(`fIsTable`)·`Pictures` BLIP 이미지 추출)
+  - `doc.py` — MS Word 97–2003(`.doc`) 하이브리드 어댑터(`DocDocumentAdapter`)
+  - `ppt.py` — MS PowerPoint 97–2003(`.ppt`) 하이브리드 어댑터(`PptDocumentAdapter`)
 
 ## 빠른 실행
 

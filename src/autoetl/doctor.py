@@ -10,6 +10,7 @@ from pydantic import Field
 
 from autoetl import __version__
 from autoetl.contracts.common import ContractModel
+from autoetl.parser.hwp._loader import load_rhwp
 from autoetl.parser.legacy.converter import find_libreoffice_binary
 from autoetl.parser.pipeline import supported_extensions
 
@@ -48,6 +49,28 @@ def collect_doctor_report() -> DoctorReport:
     has_pypdfium2 = _has_module("pypdfium2")
     has_onnx = _has_module("onnxruntime") and _has_module("numpy")
 
+    has_rhwp = False
+    rhwp_detail = "미설치"
+    rhwp_hint = "uv sync 또는 pip install rhwp-python"
+    try:
+        rhwp_mod = load_rhwp()
+    except (ImportError, OSError) as exc:
+        rhwp_detail = f"로드 실패 ({exc})"
+        rhwp_hint = (
+            "uv sync 또는 pip install rhwp-python "
+            "(Linux에서는 시스템 libfreetype6>=2.10 설치 필요: apt-get install libfreetype6)"
+        )
+    else:
+        has_rhwp = True
+        rhwp_hint = ""
+        try:
+            rhwp_detail = (
+                f"rhwp-python {rhwp_mod.version()} / rhwp-core {rhwp_mod.rhwp_core_version()} "
+                "(HWP 5.0·HWPX 파싱 및 네이티브 PNG 페이지 렌더링 활성)"
+            )
+        except Exception:
+            rhwp_detail = "설치됨 (버전 조회 실패, HWP·HWPX 파싱 및 렌더링 가능)"
+
     checks = [
         DoctorCheck(
             name="PDF 파서 (pypdf)",
@@ -57,13 +80,20 @@ def collect_doctor_report() -> DoctorReport:
             install_hint="" if has_pypdf else "uv sync 또는 pip install pypdf",
         ),
         DoctorCheck(
-            name="OOXML 네이티브 파서 (PPTX·DOCX·HWPX·XLSX)",
+            name="한글 파서·렌더러 (rhwp / rhwp-python)",
+            category="core_parser",
+            available=has_rhwp,
+            detail=rhwp_detail,
+            install_hint=rhwp_hint,
+        ),
+        DoctorCheck(
+            name="OOXML 네이티브 파서 (PPTX·DOCX·XLSX)",
             category="core_parser",
             available=True,
             detail="내장 표준 라이브러리 전용 (외부 의존성 불필요)",
         ),
         DoctorCheck(
-            name="구형 OLE2 네이티브 파서 (HWP 5.0·DOC·PPT)",
+            name="구형 OLE2 네이티브 파서 (DOC·PPT)",
             category="core_parser",
             available=True,
             detail="내장 순수 Python MS-CFB 리더 활성 (외부 의존성 불필요)",
