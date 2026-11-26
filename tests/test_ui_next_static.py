@@ -322,6 +322,31 @@ def test_missing_static_folder_keeps_server_running(
         assert headers["content-type"] == "text/html; charset=utf-8"
 
 
+def test_unreadable_static_folder_keeps_server_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """정적 폴더를 읽다 OS 오류가 나면 경고하고 빈 번들로 기동하며, `/`는 그대로 응답한다."""
+    root = tmp_path / "static"
+    _write_files(root, _SERVED_FILES)
+    monkeypatch.setattr(static_files, "_static_root", lambda: root)
+
+    def _unreadable(_root: object) -> Iterator[tuple[str, object, str]]:
+        raise PermissionError("읽기 권한 없음")
+
+    monkeypatch.setattr(static_files, "_iter_static_files", _unreadable)
+    with pytest.warns(RuntimeWarning, match="새 화면 없이 기동한다"):
+        assert static_files.load_static_bundle() == {}
+
+    with (
+        pytest.warns(RuntimeWarning, match="새 화면 없이 기동한다"),
+        create_ui_server(host="127.0.0.1", port=0) as srv,
+    ):
+        _assert_not_found(*_get(srv.port, "/next/"))
+        status, headers, _ = _get(srv.port, "/")
+        assert status == 200
+        assert headers["content-type"] == "text/html; charset=utf-8"
+
+
 def test_load_static_bundle_caps_total_size(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

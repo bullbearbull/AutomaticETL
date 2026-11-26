@@ -76,22 +76,31 @@ def load_static_bundle() -> StaticBundle:
     """정적 폴더의 허용 확장자 파일을 읽어 상대 POSIX 경로 → (본문, MIME 형식) 사전을 만든다.
 
     합계 크기가 상한(20MB)을 넘게 하는 파일은 읽지 않고 경고를 남긴다. 정적 폴더가 없으면
-    빈 사전을 반환하므로 서버는 그대로 기동한다.
+    빈 사전을 반환하므로 서버는 그대로 기동한다. 정적 폴더를 읽다 OS 오류가 나도 경고만 남기고
+    빈 사전을 반환하므로, 기존 화면(`/`)은 `/next/` 없이 그대로 쓸 수 있다.
     """
     root = _static_root()
     bundle: StaticBundle = {}
-    if not root.is_dir():
-        return bundle
     budget = _MAX_STATIC_BUNDLE_BYTES
     skipped: list[str] = []
-    for rel_path, entry, content_type in _iter_static_files(root):
-        with entry.open("rb") as fh:
-            body = fh.read(budget + 1)
-        if len(body) > budget:
-            skipped.append(rel_path)
-            continue
-        budget -= len(body)
-        bundle[rel_path] = (body, content_type)
+    try:
+        if not root.is_dir():
+            return bundle
+        for rel_path, entry, content_type in _iter_static_files(root):
+            with entry.open("rb") as fh:
+                body = fh.read(budget + 1)
+            if len(body) > budget:
+                skipped.append(rel_path)
+                continue
+            budget -= len(body)
+            bundle[rel_path] = (body, content_type)
+    except OSError as exc:
+        warnings.warn(
+            f"`/next/` 정적 폴더를 읽지 못해 새 화면 없이 기동한다: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return {}
     if skipped:
         max_mb = _MAX_STATIC_BUNDLE_BYTES // (1024 * 1024)
         warnings.warn(
