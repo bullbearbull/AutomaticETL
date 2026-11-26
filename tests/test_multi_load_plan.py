@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 from sqlglot import parse as sqlglot_parse
 
 from autoetl.contracts import IncrementMode, Purpose
+from autoetl.core.db_loader import load_tables
 from autoetl.core.load_planner import export_multi_table_bundle, render_analysis_report
 from autoetl.core.multi_analyze import analyze_tables
 from autoetl.core.multi_context import NamedTableInput
@@ -76,6 +78,43 @@ def _ecommerce_inputs() -> list[NamedTableInput]:
             ),
         ),
     ]
+
+
+def test_partial_string_pattern_loads_unmatched_rows_with_null_slots(tmp_path: Path) -> None:
+    tables = _ecommerce_inputs()
+    original_orders = next(table for table in tables if table.name == "orders")
+    rows = tuple(
+        (
+            str(order_id),
+            f"ORD-2026-{('KR', 'US', 'JP')[order_id % 3]}-{order_id:05d}"
+            if order_id <= 1090
+            else f"unstructured {order_id}",
+            "101",
+            "2026-01-01",
+        )
+        for order_id in range(1001, 1101)
+    )
+    tables = [
+        NamedTableInput(name=table.name, headers=table.headers, rows=rows)
+        if table is original_orders
+        else table
+        for table in tables
+    ]
+    db_path = tmp_path / "partial.sqlite"
+    analysis, batch = load_tables(extra_tables=tables, db_path=db_path)
+    candidate = next(
+        sc for sc in analysis.load_plan.scorecards if sc.candidate_id == "C2_NORMALIZED"
+    )
+    assert candidate.validation.trial_load_ok is True
+    assert analysis.load_plan.selected_candidate_id == "C2_NORMALIZED"
+    assert batch.total_rows_quarantined == 0
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM orders WHERE branch_code IS NULL").fetchone() == (
+            10,
+        )
+        assert conn.execute(
+            "SELECT order_code, branch_code FROM orders WHERE order_id = 1001"
+        ).fetchone() == ("ORD-2026-JP-01001", "JP")
 
 
 def test_oltp_load_plan_topological_order_slot_fk_and_ddl(tmp_path: Path) -> None:
@@ -172,6 +211,10 @@ def test_purpose_changes_selected_candidate() -> None:
 
     archive_bundle = analyze_tables(extra_tables=tables, purpose=Purpose.ARCHIVE)
     assert archive_bundle.load_plan.selected_candidate_id == "C2_COMPACT_RAW"
+    compact = next(
+        sc for sc in archive_bundle.load_plan.scorecards if sc.candidate_id == "C2_COMPACT_RAW"
+    )
+    assert compact.redundancy.score == 80.0
 
 
 def test_korean_table_and_column_names_produce_valid_ddl_and_report(tmp_path: Path) -> None:
@@ -440,3 +483,52 @@ def test_review3_analytics_declarative_partition_matches_ddl_and_pk() -> None:
     pk = orders_create.find(exp.PrimaryKey)
     assert pk is not None
     assert [c.name for c in pk.expressions] == ["order_id", "order_date"]
+
+
+def test_decimal_precision_scale_preserves_full_scale_and_int_digits() -> None:
+    """M2: 폴백 경로에서 소수 12자리 보존 및 p<=38 초과 시 정수부 자릿수를 우선 보존한다."""
+    from autoetl.contracts import (
+        ColumnStats,
+        NumericStats,
+        OutlierMethod,
+        OutlierSummary,
+        StatsKind,
+    )
+    from autoetl.core.load_planner import _decimal_precision_scale
+
+    outliers = OutlierSummary(method=OutlierMethod.IQR, count=0, rate=0.0, bounds="[]")
+    high_scale_stat = ColumnStats(
+        column="rate",
+        kind=StatsKind.NUMERIC,
+        numeric=NumericStats(
+            mean=0.1,
+            std=0.05,
+            minimum=0.0,
+            maximum=0.123456789012,
+            p25=0.0,
+            p50=0.1,
+            p75=0.12,
+            skew=0.0,
+            max_decimal_digits=12,
+            outliers=outliers,
+        ),
+    )
+    assert _decimal_precision_scale(high_scale_stat) == (13, 12)
+
+    overflow_stat = ColumnStats(
+        column="big_val",
+        kind=StatsKind.NUMERIC,
+        numeric=NumericStats(
+            mean=1.0,
+            std=0.0,
+            minimum=0.0,
+            maximum=10**19,
+            p25=0.0,
+            p50=1.0,
+            p75=1.0,
+            skew=0.0,
+            max_decimal_digits=20,
+            outliers=outliers,
+        ),
+    )
+    assert _decimal_precision_scale(overflow_stat) == (38, 18)

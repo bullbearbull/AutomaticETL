@@ -28,13 +28,13 @@ import uuid
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dt_time
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Context, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 import duckdb
 
-from autoetl.adapters.detectors.builtin import EXCEL_SERIAL_MAX, EXCEL_SERIAL_MIN
+from autoetl.adapters.detectors.builtin import EXCEL_SERIAL_MAX, EXCEL_SERIAL_MIN, parse_date_text
 from autoetl.contracts import (
     ColumnClassification,
     ColumnMapping,
@@ -90,10 +90,12 @@ _CURRENCY_SHAPE_RE = re.compile(CURRENCY_DECIMAL_SHAPE)
 _CURRENCY_STRIP_RE = re.compile(r"[₩$원,\s]")
 _INT_RE = re.compile(r"^[+-]?\d+$")
 _VARCHAR_LEN_RE = re.compile(r"^varchar\((\d+)\)$", re.IGNORECASE)
-_DECIMAL_PS_RE = re.compile(r"^(?:numeric|decimal)\((\d+),\s*(\d+)\)$", re.IGNORECASE)
+_DECIMAL_PS_RE = re.compile(r"^(?:numeric|decimal)\((\d+),\s*(-?\d+)\)$", re.IGNORECASE)
 _KOREAN_DATE_RE = re.compile(r"^(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일$")
 _YEAR_RE = re.compile(r"(19\d{2}|20\d{2})")
-_PHONE_PARTS_RE = re.compile(r"^(\+?\d{2,4})([-.\s]?)(\d{3,4})([-.\s]?)(\d{4})$")
+_PHONE_PARTS_RE = re.compile(
+    r"^(\+?\d{2,4}(?=[-.\s])|02|050\d|0(?!2|50)\d{2})([-.\s]?)(\d{3,4})([-.\s]?)(\d{4})$"
+)
 _RRN_SPLIT_RE = re.compile(r"^(\d{6})(-?)([1-8])(\d{6})$")
 _BRN_SPLIT_RE = re.compile(r"^(\d{3})-(\d{2})-(\d{5})$")
 
@@ -156,7 +158,7 @@ def mask_value(
             return f"{m.group(1)}{sep1}{'*' * len(m.group(3))}{sep2}{m.group(5)}"
         digits = "".join(ch for ch in s if ch.isdigit())
         if len(digits) >= 7:
-            return f"{digits[:3]}-****-{digits[-4:]}"
+            return f"****-{digits[-4:]}"
 
     if stype is SensitiveType.EMAIL and "@" in s:
         local, domain = s.split("@", 1)
@@ -566,23 +568,33 @@ class _DbAdapter:
             return [str(r[0]) for r in rows]
         return self.existing_columns(table_name)
 
-    def existing_not_null_columns(self, table_name: str) -> set[str]:
-        """기존 DB 테이블에 물리 NOT NULL 또는 PK 제약이 걸린 컬럼 집합을 반환한다."""
+    def existing_column_constraints(self, table_name: str) -> tuple[set[str], dict[str, str]]:
+        """기존 테이블의 물리 NOT NULL과 범위가 정해진 수치 타입을 반환한다."""
         if not self.table_exists(table_name):
-            return set()
+            return set(), {}
         if self.engine == "sqlite":
             rows = self.fetchall(f"PRAGMA table_info({_qi(table_name)})")
-            return {str(r[1]) for r in rows if int(r[3]) != 0 or int(r[5]) > 0}
+            return {str(r[1]) for r in rows if int(r[3]) != 0 or int(r[5]) > 0}, {}
         p = self.placeholder
         schema_clause = (
             "table_schema='main'" if self.engine == "duckdb" else "table_schema=current_schema()"
         )
         rows = self.fetchall(
-            f"SELECT column_name FROM information_schema.columns "
-            f"WHERE {schema_clause} AND table_name={p} AND is_nullable='NO'",
+            f"SELECT column_name, is_nullable, data_type, "
+            f"numeric_precision, numeric_precision_radix, numeric_scale "
+            f"FROM information_schema.columns WHERE {schema_clause} AND table_name={p}",
             (table_name,),
         )
-        return {str(r[0]) for r in rows}
+        not_null: set[str] = set()
+        numeric_types: dict[str, str] = {}
+        for name, nullable, dtype, precision, radix, scale in rows:
+            if nullable == "NO":
+                not_null.add(str(name))
+            if str(dtype).lower() == "integer":
+                numeric_types[str(name)] = "integer"
+            elif radix == 10 and precision is not None and scale is not None:
+                numeric_types[str(name)] = f"numeric({precision}, {scale})"
+        return not_null, numeric_types
 
     def column_data_types(self, table_name: str) -> dict[str, str]:
         """테이블 각 컬럼의 소문자 DB 타입명(PostgreSQL 배열 원소 타입 포함)을 반환한다."""
@@ -773,11 +785,9 @@ def _parse_temporal_date(raw: str, *, korean: bool) -> date | None:
                 return date(int(m_ko.group(1)), int(m_ko.group(2)), int(m_ko.group(3)))
             except ValueError:
                 return None
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            continue
+    parsed = parse_date_text(s)
+    if parsed is not None:
+        return parsed
     if not korean and s.isascii() and s.isdigit():
         num = int(s)
         if EXCEL_SERIAL_MIN <= num <= EXCEL_SERIAL_MAX:
@@ -832,6 +842,7 @@ def _transform_cell(
     mask_policy: MaskingPolicy,
     sensitive_type: SensitiveType | None,
     engine: str,
+    db_type_cast: str | None = None,
 ) -> tuple[bool, Any, str]:
     """단일 원본 셀을 결정론적으로 변환·마스킹한다. 반환: `(ok, value, error_detail)`."""
     if _is_missing_raw(raw):
@@ -844,9 +855,13 @@ def _transform_cell(
         rx, cap_group = slot_rx
         m = rx.search(s)
         if m is None:
+            if col.nullable:
+                return True, None, ""
             return False, None, "문자열 패턴 슬롯 추출 불일치"
         extracted = m.group(cap_group)
         if extracted is None or extracted == "":
+            if col.nullable:
+                return True, None, ""
             return False, None, "추출된 슬롯 값이 비어 있음"
         s = extracted
 
@@ -858,6 +873,7 @@ def _transform_cell(
         return True, masked, ""
 
     # 3. 변환식·물리 타입별 파싱
+    type_cast = mapping.type_cast.strip().lower()
     val: Any
     if mapping.transform == "strip_currency_and_comma" or col.physical_type is PhysicalType.DECIMAL:
         if not _CURRENCY_SHAPE_RE.search(s):
@@ -874,7 +890,7 @@ def _transform_cell(
                 return False, None, "정수 변환 불가(소수 존재)"
             val = int(dec)
         else:
-            val = float(dec) if engine == "sqlite" else dec
+            val = dec
     elif mapping.transform == "normalize_boolean" or col.physical_type is PhysicalType.BOOLEAN:
         low = s.strip().lower()
         if low in _TRUE_TOKENS:
@@ -913,10 +929,7 @@ def _transform_cell(
         st = s.strip()
         if not _INT_RE.fullmatch(st):
             return False, None, "정수(INTEGER) 형식 불일치"
-        iv = int(st)
-        if mapping.type_cast.lower() in {"int", "integer"} and not (INT4_MIN <= iv <= INT4_MAX):
-            return False, None, "INT4 허용 범위 초과"
-        val = iv
+        val = int(st)
     elif col.physical_type is PhysicalType.FLOAT:
         try:
             fv = float(s.strip())
@@ -927,10 +940,42 @@ def _transform_cell(
         val = fv
     else:
         val = s
-        m_vc = _VARCHAR_LEN_RE.fullmatch(mapping.type_cast.strip())
+        m_vc = _VARCHAR_LEN_RE.fullmatch(type_cast)
         if m_vc is not None and len(val) > int(m_vc.group(1)):
             return False, None, f"VARCHAR({m_vc.group(1)}) 최대 길이 초과"
 
+    if not isinstance(val, bool) and isinstance(val, (int, float, Decimal)):
+        numeric_type = db_type_cast or (
+            _dialect_col_type(col, mapping, engine)
+            if engine == "duckdb" and col.physical_type is PhysicalType.DECIMAL
+            else type_cast
+        )
+        m_num = _DECIMAL_PS_RE.fullmatch(numeric_type)
+        if m_num is not None:
+            precision, scale = int(m_num.group(1)), int(m_num.group(2))
+            dec_val = val if isinstance(val, Decimal) else Decimal(str(val))
+            # SQL NUMERIC은 소수부 자릿수를 반올림한 뒤 정수부 범위를 검사한다.
+            overflow_at = Decimal((0, (9,) * precision + (5,), -scale - 1))
+            if dec_val.copy_abs() >= overflow_at:
+                return False, None, f"NUMERIC({precision}, {scale}) 허용 범위 초과"
+            if engine != "sqlite" and isinstance(val, Decimal):
+                quantum = Decimal((0, (1,), -scale))
+                context = Context(prec=precision, rounding=ROUND_HALF_UP)
+                val = val.quantize(quantum, context=context)
+        if isinstance(val, Decimal) and val.is_zero():
+            val = val.copy_abs()
+        if db_type_cast == "integer" or (
+            col.physical_type is PhysicalType.INTEGER and type_cast in {"int", "integer"}
+        ):
+            dec_val = val if isinstance(val, Decimal) else Decimal(str(val))
+            rounded_int = int(dec_val.to_integral_value(rounding=ROUND_HALF_UP))
+            if not (INT4_MIN <= rounded_int <= INT4_MAX):
+                return False, None, "INT4 허용 범위 초과"
+        if engine == "sqlite" and isinstance(val, Decimal):
+            fv_dec = float(val)
+            if not math.isfinite(fv_dec):
+                return False, None, "유한하지 않은 수치 값"
+            val = fv_dec
     if mask_policy is not MaskingPolicy.NONE and isinstance(val, str):
         val = mask_value(val, sensitive_type, mask_policy)
     return True, val, ""
@@ -1458,8 +1503,8 @@ def _load_single_table(
     slot: TableSlotContext = mctx.get_by_name(table_plan.source_table)
     src_rel = f"{slot.table_info.table_id}.{RAW_TABLE}"
     raw_col_ids = [c.column_id for c in slot.columns]
-    raw_headers = [c.original_name for c in slot.columns]
-    header_pos = {name: idx for idx, name in enumerate(raw_headers)}
+    header_pos = {c.name: c.index for c in bundle.ingest.columns}
+    raw_headers = sorted(header_pos, key=header_pos.__getitem__)
 
     assert mctx.connection is not None
     sel_sql = ", ".join(quote_identifier(cid) for cid in raw_col_ids)
@@ -1494,6 +1539,14 @@ def _load_single_table(
     all_pk_cols = [c.name for c in target_table.columns if c.is_primary_key]
     has_identity_pk = any(c.is_primary_key and c.is_identity for c in target_table.columns)
     pk_cols = [] if has_identity_pk else all_pk_cols
+    use_upsert = bool(pk_cols) and table_plan.increment_mode in {
+        IncrementMode.UPSERT,
+        IncrementMode.WATERMARK,
+    }
+    dedup = table_plan.deduplication
+    keep_last_pk = (
+        use_upsert and dedup.enabled and dedup.keep == "last" and set(dedup.keys) == set(pk_cols)
+    )
     confirmed_uq_cols = [uq for uq in table_plan.confirmed_unique_columns if all_pk_cols != [uq]]
 
     # 기존 DB에 저장된 UNIQUE 컬럼 값(다른 PK와 충돌 검사)
@@ -1546,12 +1599,16 @@ def _load_single_table(
         )
         next_surr_id = int(max_row[0]) + 1 if max_row is not None else 1
 
-    seen_pks: set[tuple[Any, ...]] = set()
+    seen_pk_positions: dict[tuple[Any, ...], int] = {}
     seen_uqs: dict[str, set[Any]] = {uq: set() for uq in confirmed_uq_cols}
-    db_not_null_cols: set[str] = (
-        adapter.existing_not_null_columns(target_table.name) if table_existed_before else set()
+    uq_positions = {uq: insert_col_names.index(uq) for uq in confirmed_uq_cols}
+    db_not_null_cols, db_numeric_types = (
+        adapter.existing_column_constraints(target_table.name)
+        if table_existed_before
+        else (set(), {})
     )
     valid_rows: list[list[Any]] = []
+    dedup_replaced = 0
     quarantine_entries: list[tuple[Any, ...]] = []
 
     for row_idx, raw_row in enumerate(raw_rows, start=1):
@@ -1578,6 +1635,7 @@ def _load_single_table(
                 mask_policy=policy,
                 sensitive_type=stype,
                 engine=adapter.engine,
+                db_type_cast=db_numeric_types.get(col.name),
             )
             if not ok:
                 err_cat = "cast_error"
@@ -1593,12 +1651,18 @@ def _load_single_table(
 
         # PK 중복 검사 (단일 배치 내 중복)
         pk_tuple: tuple[Any, ...] = ()
+        previous_position = None
+        previous_row = None
         if err_cat is None and pk_cols:
             pk_tuple = tuple(_normalize_key_for_lookup(converted[c]) for c in pk_cols)
-            if pk_tuple in seen_pks:
-                err_cat = "pk_duplicate"
-                err_col = ",".join(pk_cols)
-                err_detail = "동일 파일 내 기본 키(PK) 중복"
+            previous_position = seen_pk_positions.get(pk_tuple)
+            if previous_position is not None:
+                if keep_last_pk:
+                    previous_row = valid_rows[previous_position]
+                else:
+                    err_cat = "pk_duplicate"
+                    err_col = ",".join(pk_cols)
+                    err_detail = "동일 파일 내 기본 키(PK) 중복"
 
         # 확정 UNIQUE 컬럼 중복 검사
         if err_cat is None and confirmed_uq_cols:
@@ -1607,7 +1671,10 @@ def _load_single_table(
                 if uq_val is None:
                     continue
                 norm_uq = _normalize_key_for_lookup(uq_val)
-                if norm_uq in seen_uqs[uq_col]:
+                own_uq = previous_row is not None and norm_uq == _normalize_key_for_lookup(
+                    previous_row[uq_positions[uq_col]]
+                )
+                if norm_uq in seen_uqs[uq_col] and not own_uq:
                     err_cat = "unique_violation"
                     err_col = uq_col
                     err_detail = "동일 파일 내 확정 UNIQUE 컬럼 중복"
@@ -1667,9 +1734,11 @@ def _load_single_table(
             )
             continue
 
-        if pk_cols:
-            seen_pks.add(pk_tuple)
         for uq_col in confirmed_uq_cols:
+            if previous_row is not None:
+                old_uq = previous_row[uq_positions[uq_col]]
+                if old_uq is not None:
+                    seen_uqs[uq_col].remove(_normalize_key_for_lookup(old_uq))
             uq_val = converted.get(uq_col)
             if uq_val is not None:
                 seen_uqs[uq_col].add(_normalize_key_for_lookup(uq_val))
@@ -1683,22 +1752,30 @@ def _load_single_table(
                 row_values.append(converted[col.name])
         if include_audit_columns:
             row_values.extend([batch_id, dataset_id, loaded_at])
-        valid_rows.append(row_values)
+        if previous_position is None:
+            if pk_cols:
+                seen_pk_positions[pk_tuple] = len(valid_rows)
+            valid_rows.append(row_values)
+        else:
+            valid_rows[previous_position] = row_values
+            dedup_replaced += 1
 
     pre_update_snapshots: list[dict[str, Any]] | None = []
     predecessor_batch_ids: list[str] | None = []
     snap_omit_reason: str | None = None
     actual_updated = 0
     table_warnings: list[str] = []
+    if dedup_replaced > 0:
+        table_warnings.append(
+            f"`{target_table.name}` 동일 파일 내 PK 중복 {dedup_replaced:,}건을 "
+            "마지막 유효 행으로 대체했습니다."
+        )
     if valid_rows:
         cols_sql = ", ".join(_qi(c) for c in insert_col_names)
         placeholders = ", ".join([adapter.placeholder] * len(insert_col_names))
         insert_sql = f"INSERT INTO {_qi(target_table.name)} ({cols_sql}) VALUES ({placeholders})"
         do_upsert_update = False
-        if pk_cols and table_plan.increment_mode in {
-            IncrementMode.UPSERT,
-            IncrementMode.WATERMARK,
-        }:
+        if use_upsert:
             pk_set = set(pk_cols)
             non_pk_cols = [c for c in insert_col_names if c not in pk_set]
             pk_sql = ", ".join(_qi(c) for c in pk_cols)
@@ -2069,7 +2146,11 @@ def load_tables(
                 # 3c. 권고·확정 인덱스 생성
                 for idx_i, idx_rec in enumerate(tp.recommended_indexes):
                     prefix = "uq" if idx_rec.unique else "idx"
-                    idx_name = f"{prefix}_{t_name}_{'_'.join(idx_rec.columns)}_{idx_i}"[:60]
+                    idx_name = f"{prefix}_{t_name}_{'_'.join(idx_rec.columns)}_{idx_i}"
+                    if len(idx_name) > 60:
+                        identity = "\0".join((prefix, t_name, *idx_rec.columns))
+                        suffix = "_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+                        idx_name = idx_name[: 60 - len(suffix)] + suffix
                     uq_kw = "UNIQUE " if idx_rec.unique else ""
                     idx_cols_sql = ", ".join(_qi(c) for c in idx_rec.columns)
                     adapter.execute(
