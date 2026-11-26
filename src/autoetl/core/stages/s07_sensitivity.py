@@ -132,8 +132,6 @@ _NETWORK_ADDRESS_HINTS = (
     "ipv6",
     "mac",
     "url",
-    "web",
-    "wallet",
     "ipaddress",
     "ipaddr",
     "ipv4address",
@@ -144,8 +142,14 @@ _NETWORK_ADDRESS_HINTS = (
     "macaddr",
     "urladdress",
     "urladdr",
+    "web-address",
+    "web-addr",
+    "website-address",
+    "website-addr",
     "webaddress",
     "webaddr",
+    "wallet-address",
+    "wallet-addr",
     "walletaddress",
     "walletaddr",
     "웹주소",
@@ -165,7 +169,16 @@ _BANK_ACCOUNT_HINTS = (
 )
 
 _RRN_HINTS = ("주민등록번호", "주민번호")
-_RRN_TOKENS = ("rrn", "ssn", "resident-no", "residentno")
+_RRN_TOKENS = (
+    "rrn",
+    "ssn",
+    "resident-no",
+    "residentno",
+    "resident-num",
+    "residentnum",
+    "resident-number",
+    "residentnumber",
+)
 _CARD_HINTS = ("카드번호", "card_no", "card_number", "credit_card")
 
 _LEVEL_BY_TYPE: dict[SensitiveType, SensitivityLevel] = {

@@ -85,6 +85,8 @@ def test_rrn_name_hint_does_not_match_inside_words(column: str) -> None:
         "resident_no",
         "residentNo",
         "residentNo2",
+        "resident_number",
+        "residentNumber",
         "주민등록번호",
     ],
 )
@@ -109,9 +111,12 @@ def test_rrn_name_hint_recognizes_real_identifier_names(column: str) -> None:
         ("clientIPv6Address", [], []),
         ("URLAddress", [], []),
         ("web_address", [], []),
+        ("webAddress", [], []),
         ("wallet_address", [], []),
+        ("walletAddress", [], []),
         ("웹주소", [], []),
         ("지갑주소", [], []),
+        ("web_shipping_address", [], [SensitiveType.ADDRESS]),
         ("shipping_address", [], [SensitiveType.ADDRESS]),
     ],
 )
