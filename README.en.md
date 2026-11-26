@@ -203,7 +203,7 @@ Shows all 8 built-in formats and which optional backends (LibreOffice, PDF rende
 
 ## Supported Formats
 
-Aside from `pypdf` for PDFs, all parsers are pure Python using only the standard library.
+Aside from `pypdf` for PDFs and [`rhwp-python`](https://github.com/DanMeon/rhwp-python) (MIT, Rust [`rhwp`](https://github.com/edwardkim/rhwp) core) for Hangul (`.hwp` / `.hwpx`) parsing and native PNG page rendering, all other Office/OLE2 parsers use only the Python standard library. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for full attribution.
 
 | Format | Built-in engine | Notes |
 | --- | --- | --- |
@@ -211,8 +211,8 @@ Aside from `pypdf` for PDFs, all parsers are pure Python using only the standard
 | `.docx` | Pure-Python OOXML parser | Styles, multi-level lists, track changes, OMML math, tables, footnotes, comments |
 | `.pptx` | Pure-Python OOXML parser | Layouts, grouped shapes, tables, charts, embedded Excel, speaker notes |
 | `.xlsx` | Streaming OOXML parser | Sheets, merged cells, multi-row headers, date/number formats, comments, charts |
-| `.hwpx` | Pure-Python OWPML parser | Outlines, merged grid tables, Hancom equations, headers/footers, footnotes, comments |
-| `.hwp` | Pure-Python HWP 5.0 (OLE2) parser | Body text, merged tables, equations, footnotes, BinData images (rejects encrypted/DRM) |
+| `.hwpx` | **`rhwp` (`rhwp-python`, MIT)** + layout/VLM adapters | Rust IR, merged tables, Hancom equations, footnotes/endnotes, native PNG rendering |
+| `.hwp` | **`rhwp` (`rhwp-python`, MIT)** + CFB security guards | HWP 5.0 text, merged tables, equations, footnotes, `BinData`, native PNG rendering (blocks encrypted/DRM) |
 | `.doc`, `.ppt` | Pure-Python OLE2 parser (+ LibreOffice upgrade) | Uses `soffice` automatically when installed; falls back to built-in parser otherwise |
 
 Pass `--include-comments` to include review comments / hidden notes. Encrypted or DRM-protected files are rejected with a clear error rather than bypassed, and logs/errors never include raw document text or cell values.
@@ -234,4 +234,4 @@ CI runs tests, linting, strict `mypy`, and runtime dependency license checks acr
 
 ## License
 
-[Apache-2.0](LICENSE)
+[Apache-2.0](LICENSE) · [Third-Party Notices (`THIRD_PARTY_NOTICES.md`)](THIRD_PARTY_NOTICES.md)

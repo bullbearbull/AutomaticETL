@@ -30,8 +30,8 @@ from autoetl.parser.contracts import (
 )
 from autoetl.parser.docx.adapter import DocxDocumentAdapter
 from autoetl.parser.exporters import ExportManifest, export_parse_bundle
-from autoetl.parser.hwpx.adapter import HwpxDocumentAdapter
-from autoetl.parser.legacy import DocDocumentAdapter, HwpDocumentAdapter, PptDocumentAdapter
+from autoetl.parser.hwp import HwpDocumentAdapter, HwpxDocumentAdapter
+from autoetl.parser.legacy import DocDocumentAdapter, PptDocumentAdapter
 from autoetl.parser.pdf.adapter import PdfDocumentAdapter
 from autoetl.parser.pptx.adapter import PptxDocumentAdapter
 from autoetl.parser.xlsx import XlsxDocumentAdapter

@@ -36,8 +36,12 @@ def test_doctor_report_and_cli(capsys: pytest.CaptureFixture[str]) -> None:
     assert len(report.supported_extensions) >= 8
     assert ".xlsx" in report.supported_extensions
     assert ".hwp" in report.supported_extensions
+    rhwp_chk = next(c for c in report.checks if "rhwp" in c.name)
+    assert rhwp_chk.available is True
+    assert "rhwp-python" in rhwp_chk.detail
     md = render_doctor_markdown(report)
     assert "Auto ETL / Auto Parser" in md
+    assert "rhwp" in md
 
     assert main(["doctor"]) == 0
     out_md = capsys.readouterr().out

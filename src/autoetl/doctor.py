@@ -46,7 +46,20 @@ def collect_doctor_report() -> DoctorReport:
     tesseract_bin = shutil.which("tesseract")
     has_pypdf = _has_module("pypdf")
     has_pypdfium2 = _has_module("pypdfium2")
+    has_rhwp = _has_module("rhwp")
     has_onnx = _has_module("onnxruntime") and _has_module("numpy")
+
+    rhwp_detail = "미설치"
+    if has_rhwp:
+        try:
+            import rhwp
+
+            rhwp_detail = (
+                f"rhwp-python {rhwp.version()} / rhwp-core {rhwp.rhwp_core_version()} "
+                "(HWP 5.0·HWPX 파싱 및 네이티브 PNG 페이지 렌더링 활성)"
+            )
+        except Exception:
+            rhwp_detail = "설치됨 (HWP·HWPX 파싱 및 렌더링 가능)"
 
     checks = [
         DoctorCheck(
@@ -57,13 +70,20 @@ def collect_doctor_report() -> DoctorReport:
             install_hint="" if has_pypdf else "uv sync 또는 pip install pypdf",
         ),
         DoctorCheck(
-            name="OOXML 네이티브 파서 (PPTX·DOCX·HWPX·XLSX)",
+            name="한글 파서·렌더러 (rhwp / rhwp-python)",
+            category="core_parser",
+            available=has_rhwp,
+            detail=rhwp_detail,
+            install_hint="" if has_rhwp else "uv sync 또는 pip install rhwp-python",
+        ),
+        DoctorCheck(
+            name="OOXML 네이티브 파서 (PPTX·DOCX·XLSX)",
             category="core_parser",
             available=True,
             detail="내장 표준 라이브러리 전용 (외부 의존성 불필요)",
         ),
         DoctorCheck(
-            name="구형 OLE2 네이티브 파서 (HWP 5.0·DOC·PPT)",
+            name="구형 OLE2 네이티브 파서 (DOC·PPT)",
             category="core_parser",
             available=True,
             detail="내장 순수 Python MS-CFB 리더 활성 (외부 의존성 불필요)",
