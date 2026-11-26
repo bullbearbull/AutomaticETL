@@ -107,12 +107,12 @@ def _semantic_name_similarity(
     if not c_toks:
         return 0.0
 
-    # 정확 이름 일치(단순 'id'/'row_idx' 제외)
-    if child_col.lower() == parent_col.lower() and child_col.lower() not in {
-        "id",
-        "idx",
-        "row_idx",
-    }:
+    # 정확 이름 일치(단순 'id'/'row_idx' 및 일반 키 토큰만으로 된 이름 제외)
+    if (
+        child_col.lower() == parent_col.lower()
+        and child_col.lower() not in {"id", "idx", "row_idx"}
+        and not c_toks <= _GENERIC_KEY_TOKENS
+    ):
         return 1.0
 
     c_domain = c_toks - _GENERIC_KEY_TOKENS

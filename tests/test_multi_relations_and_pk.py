@@ -235,6 +235,8 @@ def test_foreign_keys_on_different_columns_survive_opposite_directions() -> None
         ("region_code", "product_codes", "product_code", []),
         ("store_no", "item_no", "item_no", []),
         ("code_id", "codes", "id", [1]),
+        ("code", "customers", "code", []),
+        ("code_id", "codes", "code_id", [1]),
         ("code_code_id", "codes", "id", []),
         ("num_code_id", "code_nums", "id", []),
         ("code_num_id", "code_nums", "id", [1]),
