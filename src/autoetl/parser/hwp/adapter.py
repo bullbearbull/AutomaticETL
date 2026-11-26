@@ -242,6 +242,7 @@ def _scan_hwp_section_records(
     pos = 0
     end = len(data)
     default_size = page_size_pt.get(cur_page, (_A4_WIDTH_PT, _A4_HEIGHT_PT))
+    default_cols = page_columns.get(cur_page, 1)
     page_to_section[cur_page] = sec_idx
 
     while pos + 4 <= end:
@@ -267,6 +268,8 @@ def _scan_hwp_section_records(
                     cur_page += 1
                     page_to_section[cur_page] = sec_idx
                     page_size_pt.setdefault(cur_page, default_size)
+                    if default_cols > 1:
+                        page_columns.setdefault(cur_page, default_cols)
             para_to_page[(sec_idx, para_idx)] = cur_page
             para_idx += 1
         elif tag_id == 0x49 and len(payload) >= 40:
@@ -284,6 +287,7 @@ def _scan_hwp_section_records(
             if ctrl_id == b"dloc":  # 'cold' LE
                 col_attr = struct.unpack_from("<H", payload, 4)[0]
                 col_cnt = max(1, (col_attr >> 2) & 0xFF)
+                default_cols = col_cnt
                 page_columns[cur_page] = col_cnt
 
     return cur_page
@@ -434,6 +438,7 @@ def _scan_hwpx_sections(
         section_start_page[sec_idx] = cur_page
         page_to_section[cur_page] = sec_idx
         sec_default_size = (_A4_WIDTH_PT, _A4_HEIGHT_PT)
+        sec_default_cols = 1
         page_size_pt.setdefault(cur_page, sec_default_size)
         try:
             root = ET.fromstring(zf.read(sec_info))
@@ -449,6 +454,8 @@ def _scan_hwpx_sections(
                 cur_page += 1
                 page_to_section[cur_page] = sec_idx
                 page_size_pt.setdefault(cur_page, sec_default_size)
+                if sec_default_cols > 1:
+                    page_columns.setdefault(cur_page, sec_default_cols)
 
             para_to_page[(sec_idx, para_idx)] = cur_page
             para_idx += 1
@@ -471,11 +478,14 @@ def _scan_hwpx_sections(
                         page_size_pt[cur_page] = sec_default_size
                 elif d_local == "colPr":
                     try:
-                        col_cnt = int(desc.attrib.get("colCount", "1"))
+                        col_cnt = max(1, int(desc.attrib.get("colCount", "1")))
                     except ValueError:
                         col_cnt = 1
+                    sec_default_cols = col_cnt
                     if col_cnt > 1:
                         page_columns[cur_page] = col_cnt
+                    else:
+                        page_columns.pop(cur_page, None)
 
     return (
         para_to_page,
@@ -945,6 +955,7 @@ class RhwpDocumentAdapter:
 
         try:
             rhwp_mod = load_rhwp()
+            load_rhwp_nodes()
         except (ImportError, OSError) as exc:
             raise ParserInputError(
                 "rhwp 네이티브 런타임을 로드할 수 없다 "
@@ -978,8 +989,8 @@ class RhwpDocumentAdapter:
         page_renderer: PageRenderer | None,
         layout_detector: PageLayoutDetector | None,
     ) -> ParsedDocument:
-        nodes = load_rhwp_nodes()
         doc, ir, container_meta, creator_str, producer_str = self._open_rhwp_document(source_path)
+        nodes = load_rhwp_nodes()
         file_bytes = source_path.read_bytes()
         sha256_hex = hashlib.sha256(file_bytes).hexdigest()
 
@@ -1053,6 +1064,11 @@ class RhwpDocumentAdapter:
         all_visuals: list[VisualRegion] = []
         outline_entries: list[OutlineEntry] = []
         warnings: list[str] = []
+        if endnote_texts and total_pages not in selected_pages:
+            warnings.append(
+                f"선택한 페이지 범위({selected_pages})에 마지막 페이지({total_pages}p)가 "
+                f"포함되지 않아 미주 {len(endnote_texts)}건은 출력에서 생략되었다."
+            )
 
         tbl_seq = 0
         category_counts: Counter[str] = Counter()

@@ -580,8 +580,10 @@ def test_hwpx_rich_document_inspection_and_parsing(tmp_path: Path) -> None:
     assert plan.summary.total_pages == 4
     assert plan.summary.analyzed_pages == 4
     assert 3 in plan.summary.multi_column_pages
+    assert 4 in plan.summary.multi_column_pages
     assert plan.pages[1].category == PageCategory.TABLE_HEAVY
     assert plan.pages[2].metrics.column_count == 2
+    assert plan.pages[3].metrics.column_count == 2
     assert plan.pages[3].category == PageCategory.SCANNED_IMAGE
 
     outline_titles = [(o.level, o.title, o.page) for o in plan.outline]
@@ -589,13 +591,14 @@ def test_hwpx_rich_document_inspection_and_parsing(tmp_path: Path) -> None:
     assert (1, "2. 연차별 소요 예산 및 통계", 2) in outline_titles
     assert (1, "3. 시스템 구성도 및 다단 레이아웃", 3) in outline_titles
 
-    # `--pages 1` 선택 시 마지막 페이지(4p) 전용 미주는 1페이지에 섞이지 않아야 한다
+    # `--pages 1` 선택 시 마지막 페이지(4p) 전용 미주는 1페이지에 섞이지 않고 경고만 기록해야 한다
     p1_only = inspect_document(hwpx_path, options=ParseOptions(pages=(1,)))
     assert len(p1_only.pages) == 1
     from autoetl.parser import parse_document
 
     p1_doc = parse_document(hwpx_path, options=ParseOptions(pages=(1,)))
     assert not any("[미주 1]" in b.text for b in p1_doc.pages[0].blocks)
+    assert any("미주 1건" in w for w in p1_doc.warnings)
 
     doc, manifest = parse_and_export(
         hwpx_path,
@@ -1424,3 +1427,12 @@ def test_hwpx_render_cache_section_headers_and_page_mismatch_guard(
     doc_mismatch = parse_document(hwpx_path, options=ParseOptions(extract_crops=True))
     assert doc_mismatch.pages[1].visual_regions[0].crop_status == CropStatus.RENDERER_UNAVAILABLE
     assert any("조판 페이지 수(1)" in w for w in doc_mismatch.warnings)
+
+    # rhwp 런타임 로드 실패 시 원시 ImportError가 아닌 ParserInputError로 일관 변환되어야 함
+    def _fail_rhwp() -> object:
+        raise ImportError("missing libfreetype6")
+
+    monkeypatch.setattr("autoetl.parser.hwp.adapter.load_rhwp", _fail_rhwp)
+    monkeypatch.setattr("autoetl.parser.hwp.adapter.load_rhwp_nodes", _fail_rhwp)
+    with pytest.raises(ParserInputError, match="rhwp"):
+        parse_document(hwpx_path)
