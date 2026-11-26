@@ -404,6 +404,9 @@ def _infer_duckdb_col_type(values: Sequence[str]) -> tuple[str, list[Any]]:
             if col_type == "VARCHAR":
                 col_type = "BIGINT"
         elif _FLOAT_RE.fullmatch(numeric):
+            int_part = ungrouped.lstrip("+-").partition(".")[0]
+            if len(int_part) > 1 and int(int_part[0]) == 0 and text == ungrouped:
+                break
             col_type = "DOUBLE"
         else:
             break

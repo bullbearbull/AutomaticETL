@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 import zipfile
 from collections.abc import Sequence
 from contextlib import closing
@@ -450,6 +451,8 @@ def _index_test_table(
     [
         (["00123", "04567", ""], "VARCHAR"),
         (["00123", "4.5"], "VARCHAR"),
+        (["05.30", "06.15"], "VARCHAR"),
+        (["007.5", "4.5"], "VARCHAR"),
         (["9223372036854775808", "42"], "VARCHAR"),
         (["-9223372036854775809", "42"], "VARCHAR"),
         (["9" * 4301, "42"], "VARCHAR"),
@@ -470,7 +473,12 @@ def test_docindex_sql_preserves_codes_and_out_of_range_integers(
 
 @pytest.mark.parametrize(
     ("values", "expected_sum"),
-    [(["$001", "$2.75"], "3.75"), (["001,002", "2"], "1004")],
+    [
+        (["$001", "$2.75"], "3.75"),
+        (["001,002", "2"], "1004"),
+        (["$05.30", "$0.20"], "5.5"),
+        (["0.5", "-0.25"], "0.25"),
+    ],
 )
 def test_docindex_sql_aggregates_formatted_numbers_with_leading_zeros(
     tmp_path: Path, values: list[str], expected_sum: str
@@ -657,6 +665,10 @@ def test_docindex_replace_preserves_repointed_symlink_identity(
         assert len(idx.search("updated").hits) == 1
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Win32 collapses '..' lexically before evaluating symlinks",
+)
 def test_docindex_replace_symlink_parent_traversal_does_not_collide_lexically(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -670,7 +682,7 @@ def test_docindex_replace_symlink_parent_traversal_does_not_collide_lexically(
 
     link = Path("docs/link")
     try:
-        link.symlink_to(tmp_path / "archive" / "sub")
+        link.symlink_to(tmp_path / "archive" / "sub", target_is_directory=True)
     except OSError as exc:
         pytest.skip(f"symlinks unavailable in test environment: {exc}")
 
