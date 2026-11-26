@@ -163,11 +163,13 @@ class _DraftSection:
 
 
 def _source_path_keys(source_path: str) -> tuple[str, ...]:
-    """디렉터리 정보가 있는 경로의 어휘적·해석 절대 경로 키 목록을 반환한다.
+    """디렉터리 정보가 있는 경로의 기준·해석 절대 경로 키 목록을 반환한다.
 
     상대 경로는 색인 프로세스의 현재 작업 디렉터리에 실제로 존재하는 경우에만
     절대 경로로 확장해, 외부에서 생성된 파싱 번들의 미존재 상대 경로를
     현재 디렉터리 파일과 혼동하지 않도록 한다.
+    `os.path.abspath`처럼 심볼릭 링크 해석 전에 `..`를 어휘적으로 접지 않도록
+    기준 경로와 부모 디렉터리 해석 경로(`parent.resolve() / name`)를 함께 기록한다.
     """
     raw = source_path.strip()
     path = Path(raw)
@@ -177,11 +179,11 @@ def _source_path_keys(source_path: str) -> tuple[str, ...]:
         return ()
 
     keys: list[str] = []
-    with contextlib.suppress(OSError):
-        lexical = os.path.abspath(raw)
-        keys.append(lexical)
-        lexical_path = Path(lexical)
-        keys.append(str(lexical_path.parent.resolve() / lexical_path.name))
+    with contextlib.suppress(OSError, RuntimeError):
+        anchored = path if path.is_absolute() else (Path.cwd() / path)
+        keys.append(str(anchored))
+        if anchored.name not in {"", ".", ".."}:
+            keys.append(str(anchored.parent.resolve() / anchored.name))
     with contextlib.suppress(OSError, RuntimeError):
         keys.append(str(path.resolve()))
     return tuple(dict.fromkeys(keys))
@@ -1032,6 +1034,7 @@ class DocumentIndex:
             query=query,
             mode=mode,
             reranker_model=reranker_name,
+            floor_calibrated=use_floor_calibration and reranker is None,
             elapsed_ms=elapsed_ms,
             total_candidates=len(candidates),
             hits=candidates[:top_k],
@@ -1181,7 +1184,6 @@ def render_evidence_pack_markdown(pack: EvidencePack) -> str:
         )
         return "\n".join(lines) + "\n"
 
-    all_bm25_floored = all(h.bm25_score < _FTS5_BM25_FLOOR_THRESHOLD for h in pack.hits)
     for rank, hit in enumerate(pack.hits, start=1):
         path_str = " > ".join(hit.section_path) if hit.section_path else hit.title
         page_lbl = (
@@ -1191,7 +1193,7 @@ def render_evidence_pack_markdown(pack: EvidencePack) -> str:
         )
         score_detail = f"final={hit.final_score:.3f}, bm25={hit.bm25_score:.4f}"
         if (
-            all_bm25_floored
+            pack.floor_calibrated
             and hit.bm25_score < _FTS5_BM25_FLOOR_THRESHOLD
             and hit.final_score > 0.0
         ):

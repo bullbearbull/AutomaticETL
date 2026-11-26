@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import zipfile
+from collections.abc import Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -656,6 +657,47 @@ def test_docindex_replace_preserves_repointed_symlink_identity(
         assert len(idx.search("updated").hits) == 1
 
 
+def test_docindex_replace_symlink_parent_traversal_does_not_collide_lexically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "archive" / "sub").mkdir(parents=True)
+    lexical_neighbor = tmp_path / "docs" / "report.docx"
+    archived_target = tmp_path / "archive" / "report.docx"
+    _write_custom_docx(lexical_neighbor, "neighbor", "unrelated lexical neighbor")
+    _write_custom_docx(archived_target, "target", "archived symlink target")
+
+    link = Path("docs/link")
+    try:
+        link.symlink_to(tmp_path / "archive" / "sub")
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+    db_path = tmp_path / "index.sqlite"
+    assert build_document_index(lexical_neighbor, db_path).documents_indexed == 1
+
+    traversal_rel = Path("docs/link/../report.docx")
+    parsed_json = tmp_path / "traversal.json"
+    _write_index_bundle(traversal_rel, parsed_json)
+    assert build_document_index(parsed_json, db_path, replace=True).documents_indexed == 1
+
+    with DocumentIndex(db_path) as idx:
+        assert len(idx.list_documents()) == 2
+        assert len(idx.search("unrelated").hits) == 1
+        assert len(idx.search("archived").hits) == 1
+
+    _write_custom_docx(archived_target, "target", "updated archived target")
+    _write_index_bundle(archived_target, parsed_json)
+    assert build_document_index(parsed_json, db_path, replace=True).documents_indexed == 1
+
+    with DocumentIndex(db_path) as idx:
+        assert len(idx.list_documents()) == 2
+        assert len(idx.search("unrelated").hits) == 1
+        assert not idx.search("symlink").hits
+        assert len(idx.search("updated").hits) == 1
+
+
 def test_docindex_replace_does_not_bind_missing_relative_bundle_path_to_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -708,6 +750,44 @@ def test_docindex_mixed_bm25_corpus_does_not_outrank_with_floor_calibration(
     assert "소규모 코퍼스 어휘 보정" not in render_evidence_pack_markdown(pack)
 
 
+def test_docindex_mixed_corpus_reranked_floored_hit_does_not_claim_floor_calibration(
+    tmp_path: Path,
+) -> None:
+    class _StubReranker:
+        @property
+        def name(self) -> str:
+            return "stub-reranker"
+
+        @property
+        def available(self) -> bool:
+            return True
+
+        def score_pairs(self, query: str, passages: Sequence[str]) -> list[float]:
+            del query
+            return [0.95 if "common pass" in passage else 0.10 for passage in passages]
+
+    db_path = tmp_path / "mixed_rerank.sqlite"
+    paths: list[Path] = []
+    for i in range(3):
+        p = tmp_path / f"rare_{i}.docx"
+        _write_custom_docx(p, "entry", f"common rare x{i}")
+        paths.append(p)
+    for i in range(4):
+        p = tmp_path / f"common_{i}.docx"
+        _write_custom_docx(p, "entry", f"common pass y{i}")
+        paths.append(p)
+
+    assert build_document_index(paths, db_path).documents_indexed == 7
+
+    with DocumentIndex(db_path) as idx:
+        pack = idx.search("common rare", top_k=1, reranker=_StubReranker())
+
+    assert len(pack.hits) == 1
+    assert pack.hits[0].bm25_score < 1e-4
+    assert pack.floor_calibrated is False
+    assert "소규모 코퍼스 어휘 보정" not in render_evidence_pack_markdown(pack)
+
+
 def test_docindex_fts5_idf_floor_uses_vocabulary_coverage(tmp_path: Path) -> None:
     src = tmp_path / "sales.docx"
     _write_custom_docx(src, "매출", "매출 보고")
@@ -718,6 +798,7 @@ def test_docindex_fts5_idf_floor_uses_vocabulary_coverage(tmp_path: Path) -> Non
         result = idx.search("매출")
 
     assert len(result.hits) == 1
+    assert result.floor_calibrated is True
     assert result.hits[0].final_score == pytest.approx(0.625)
     assert 0.0 < result.hits[0].bm25_score < 1e-4
     assert "소규모 코퍼스 어휘 보정" in render_evidence_pack_markdown(result)

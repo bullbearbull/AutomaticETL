@@ -100,6 +100,7 @@ class EvidencePack(ContractModel):
     query: str
     mode: str = Field(description="검색 모드('fts5_bm25' 또는 'fts5+onnx_rerank')")
     reranker_model: str | None = None
+    floor_calibrated: bool = False
     elapsed_ms: float = Field(ge=0.0)
     total_candidates: NonNegativeInt = 0
     hits: list[EvidenceHit] = Field(default_factory=list)
