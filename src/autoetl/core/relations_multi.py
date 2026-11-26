@@ -33,7 +33,7 @@ from autoetl.contracts import (
 )
 from autoetl.core.context import quote_identifier
 from autoetl.core.multi_context import MultiTableContext, TableSlotContext
-from autoetl.core.pk_selector import select_primary_key
+from autoetl.core.pk_selector import _singularize, select_primary_key
 from autoetl.core.stages import s05_relations
 
 MIN_INCLUSION_RATE = 0.95
@@ -86,14 +86,6 @@ _DISALLOWED_FK_CATEGORIES = frozenset(
 )
 
 
-def _singularize(tok: str) -> str:
-    if tok.endswith("ies") and len(tok) > 4:
-        return tok[:-3] + "y"
-    if tok.endswith("s") and not tok.endswith("ss") and len(tok) > 3:
-        return tok[:-1]
-    return tok
-
-
 def _name_tokens(name: str) -> set[str]:
     parts = [p for p in _TOKEN_SPLIT_RE.split(name.lower()) if p]
     return {_singularize(p) for p in parts}
@@ -131,8 +123,13 @@ def _semantic_name_similarity(
                 if len(ct) >= 3 and len(pt) >= 3 and (pt.startswith(ct) or ct.startswith(pt)):
                     return 0.75
 
-    # 부모 테이블명 토큰과 정확 일치 (예: branch ↔ branches)
-    if c_toks & p_table_toks:
+    # 일반 토큰뿐이어도 키 접미사를 뺀 전체 이름이 부모 테이블이면 근거로 인정한다.
+    child_parts = [p for p in _TOKEN_SPLIT_RE.split(child_col.lower()) if p]
+    if (
+        len(child_parts) > 1
+        and _singularize(child_parts[-1]) in _GENERIC_KEY_TOKENS
+        and {_singularize(p) for p in child_parts[:-1]} == p_table_toks
+    ):
         return 0.85
     return 0.0
 
@@ -607,7 +604,7 @@ def _discover_cross_table_fks(
         or (fk.child_table, fk.parent_table, tuple(fk.parent_columns)) not in direct_targets
     ]
 
-    # 3. 상호 1:1 대칭 쌍(A→B 와 B→A 동시 존재) 중 신뢰도 높은 방향 하나만 유지(순환 방지)
+    # 3. 양쪽 테이블과 컬럼이 정확히 뒤집힌 1:1 쌍은 신뢰도 높은 방향 하나만 유지
     #    동률이면 더 짧은 기준 테이블명(예: employees)이 부모가 되도록 정렬
     selected.sort(
         key=lambda f: (
@@ -621,13 +618,14 @@ def _discover_cross_table_fks(
         reverse=True,
     )
     final_fks: list[CrossTableForeignKey] = []
-    seen_pairs: set[tuple[str, str]] = set()
+    seen_one_to_one: set[tuple[tuple[str, tuple[str, ...]], tuple[str, tuple[str, ...]]]] = set()
     for fk in selected:
-        if (fk.parent_table, fk.child_table) in seen_pairs and (
-            fk.cardinality is RelationshipCardinality.ONE_TO_ONE
-        ):
-            continue
-        seen_pairs.add((fk.child_table, fk.parent_table))
+        if fk.cardinality is RelationshipCardinality.ONE_TO_ONE and fk.child_slot_name is None:
+            child_endpoint = (fk.child_table, tuple(fk.child_columns))
+            parent_endpoint = (fk.parent_table, tuple(fk.parent_columns))
+            if (parent_endpoint, child_endpoint) in seen_one_to_one:
+                continue
+            seen_one_to_one.add((child_endpoint, parent_endpoint))
         final_fks.append(fk)
 
     return final_fks

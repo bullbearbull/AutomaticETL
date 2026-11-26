@@ -30,6 +30,30 @@ _SEQ_DISCRIMINATOR_RE = re.compile(
 )
 
 _MIN_ACCEPTABLE_PK_SCORE = 40.0
+_SINGULAR_FORMS = {
+    "aches": "ache",
+    "alias": "alias",
+    "aliases": "alias",
+    "apaches": "apache",
+    "axes": "axe",
+    "caches": "cache",
+    "cliches": "cliche",
+    "cookies": "cookie",
+    "dies": "die",
+    "lies": "lie",
+    "moustaches": "moustache",
+    "movies": "movie",
+    "mustaches": "mustache",
+    "niches": "niche",
+    "panaches": "panache",
+    "pies": "pie",
+    "quiches": "quiche",
+    "status": "status",
+    "statuses": "status",
+    "ties": "tie",
+    "tranches": "tranche",
+    "zombies": "zombie",
+}
 
 
 def _to_snake(name: str) -> str:
@@ -38,8 +62,13 @@ def _to_snake(name: str) -> str:
 
 def _singularize(word: str) -> str:
     w = word.lower().strip()
+    prefix, separator, last_word = w.rpartition("_")
+    if last_word in _SINGULAR_FORMS:
+        return prefix + separator + _SINGULAR_FORMS[last_word]
     if w.endswith("ies") and len(w) > 4:
         return w[:-3] + "y"
+    if w.endswith(("sses", "xes", "ches", "shes", "zzes")):
+        return w[:-2]
     if w.endswith("s") and not w.endswith("ss") and len(w) > 3:
         return w[:-1]
     return w

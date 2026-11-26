@@ -447,18 +447,6 @@ def run(
             f"키 조합 예산({key_budget}) 초과 — 크기 {key_budget_hit - 1}까지 완료, "
             f"남은 조합 약 {remaining}개"
         )
-    # 대표 키(리드 #168): 크기 → 구성 컬럼 타입 랭크 최댓값 → 컬럼 순서.
-    # 키 좌변 FD는 대표 하나에서만 낸다.
-    representative_key = min(
-        (key for key in keys if all(name in type_by for name in key.columns)),
-        key=lambda key: (
-            len(key.columns),
-            max(_type_rank(type_by[name], position[name]) for name in key.columns),
-            [position[name] for name in key.columns],
-        ),
-        default=None,
-    )
-
     # ── 근사 함수 종속(2패스) ─────────────────────────────────────────
     # 패스 1: 단일 좌변 전부를 잰다(동치 클래스를 알기 전이라 제한 없이) —
     # 좌변 수만큼만 쿼리한다. 카디널리티 커트: card(rhs) ≤ card(lhs) + 허용
@@ -551,6 +539,20 @@ def run(
         # 좌변·우변 모두 대표 컬럼만 — 비대표는 단일 출력의 '대표→멤버'가 말한다.
         compound_pool = [name for name in compound_pool if _is_representative(name)]
         representative_rhs = [rhs for rhs in rhs_pool if _is_representative(rhs)]
+        # 대표 컬럼으로만 이루어진 키 중 기존 우선순위(리드 #168)로 하나를 고른다.
+        representative_key = min(
+            (
+                key
+                for key in keys
+                if all(name in type_by and _is_representative(name) for name in key.columns)
+            ),
+            key=lambda key: (
+                len(key.columns),
+                max(_type_rank(type_by[name], position[name]) for name in key.columns),
+                [position[name] for name in key.columns],
+            ),
+            default=None,
+        )
         for size in range(2, max_lhs + 1):
             for lhs in combinations(compound_pool, size):
                 lhs_set = frozenset(lhs)

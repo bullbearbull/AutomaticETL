@@ -492,6 +492,14 @@ def _try_fixed_width_strategy(values: Sequence[str]) -> _CandidateDecomposition 
     if len(spans) < 2:
         return None
 
+    # 연도와 순번의 공통 숫자 접두사가 하나의 상수 스팬으로 합쳐졌으면 다시 분리한다.
+    _, prefix_end, prefix_is_const, _ = spans[0]
+    _, sequence_end, _, sequence_tag = spans[1]
+    if prefix_is_const and prefix_end > 4 and sequence_tag == "D":
+        prefix = "".join(tag.removeprefix("CONST:") for tag in pos_tags[:prefix_end])
+        if _is_temporal_constant_token(prefix[:4]) and _ASCII_DIGITS_RE.fullmatch(prefix[4:]):
+            spans[:2] = [(0, 4, False, "D"), (4, sequence_end, False, "D")]
+
     tokenized_rows: list[list[str]] = []
     for v in values:
         if len(v) != dom_len:

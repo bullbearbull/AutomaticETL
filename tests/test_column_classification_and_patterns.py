@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
+from autoetl.adapters.detectors import Detector, NormalizationRule, TypeGuess
 from autoetl.contracts import (
     ColumnRoleCategory,
     PhysicalType,
+    SemanticType,
     StatsKind,
     StringSegmentKind,
 )
 from autoetl.core.column_classifier import detect_ordinal_order
 from autoetl.core.multi_context import MultiTableContext, NamedTableInput, profile_all_tables
+from autoetl.core.stages import s03_types
 from autoetl.core.string_pattern import analyze_string_pattern
 
 
@@ -103,6 +108,50 @@ def test_detect_ordinal_order_korean_and_english() -> None:
     assert detect_ordinal_order(["Lv3", "Lv1", "Lv2"]) == ["Lv1", "Lv2", "Lv3"]
     assert detect_ordinal_order(["XL", "S", "M", "L"]) == ["S", "M", "L", "XL"]
     assert detect_ordinal_order(["서울", "부산", "대구"]) == []
+
+
+@pytest.mark.parametrize("sequence_base", [0, 135000])
+def test_fixed_width_year_and_sequence_accept_new_year_and_larger_sequence(
+    sequence_base: int,
+) -> None:
+    codes = [f"2026{sequence_base + i:06d}" for i in range(1, 20)]
+    table = NamedTableInput(
+        name="orders",
+        headers=("order_id", "amount"),
+        rows=tuple((code, code) for code in codes),
+    )
+    with MultiTableContext(extra_tables=[table]) as mctx:
+        order_id, amount = profile_all_tables(mctx)[0].classifications
+    decomposition = order_id.string_pattern
+
+    assert amount.string_pattern is None
+    assert decomposition is not None
+    assert decomposition.template == "{year}{seq}"
+    for year, i in [("2026", 1), ("2027", 1), ("2026", 100)]:
+        sequence = f"{sequence_base + i:06d}"
+        match = re.fullmatch(decomposition.regex_pattern, f"{year}{sequence}")
+        assert match is not None and match.groups() == (year, sequence)
+
+
+def test_type_ambiguity_uses_ranked_runner_up_below_fit_threshold() -> None:
+    def detector(name: str, confidence: float) -> Detector:
+        guess = TypeGuess(
+            physical_type=PhysicalType.STRING,
+            semantic_type=SemanticType.FREE_TEXT,
+            confidence=confidence,
+            normalization=NormalizationRule.IDENTITY,
+        )
+        return Detector(name, priority=0, detect=lambda _: guess)
+
+    table = NamedTableInput(name="values", headers=("label",), rows=(("alpha",), ("beta",)))
+    detectors = (detector("low", 0.50), detector("winner", 0.90), detector("runner_up", 0.88))
+    with MultiTableContext(extra_tables=[table]) as mctx:
+        bundle = profile_all_tables(mctx)[0]
+        slot = mctx.activate(bundle.source.table_id)
+        (assignment,) = s03_types.run(slot, bundle.ingest, bundle.profiles, detectors=detectors)
+
+    assert assignment.detector == "winner"
+    assert s03_types.AMBIGUOUS_NOTE in assignment.notes
 
 
 def test_end_to_end_column_classification_and_s4_stats() -> None:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 
+from autoetl.adapters.detectors import name_matches
 from autoetl.contracts import (
     ColumnClassification,
     ColumnProfile,
@@ -226,10 +227,17 @@ def classify_table_columns(
             if prof.length.minimum == prof.length.maximum and prof.length.minimum >= 10:
                 sample_strs = _fetch_non_missing_strings(ctx, col_id)
                 cand_pat = analyze_string_pattern(sample_strs)
-                if cand_pat is not None and any(
-                    seg.slot_category is ColumnRoleCategory.TEMPORAL for seg in cand_pat.segments
-                ):
-                    str_pattern = cand_pat
+                if cand_pat is not None:
+                    has_date_slot = any(
+                        seg.slot_category is ColumnRoleCategory.TEMPORAL
+                        for seg in cand_pat.segments
+                    )
+                    is_year_code = cand_pat.template == "{year}{seq}" and (
+                        _INDEX_NAME_RE.search(col.name) is not None
+                        or name_matches(col.name, ("code", "코드"))
+                    )
+                    if has_date_slot or is_year_code:
+                        str_pattern = cand_pat
 
             if str_pattern is not None:
                 category = ColumnRoleCategory.STRUCTURED_STRING

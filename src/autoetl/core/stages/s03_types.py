@@ -313,14 +313,18 @@ def run(
             for detector in detectors
             if (guess := detector.detect(sample)) is not None
         ]
-        passing = [pair for pair in candidates if pair[1].confidence >= fit_threshold]
-        rest = [pair for pair in candidates if pair[1].confidence < fit_threshold]
+        passing = _rank(
+            [pair for pair in candidates if pair[1].confidence >= fit_threshold], column.name
+        )
+        rest = _rank(
+            [pair for pair in candidates if pair[1].confidence < fit_threshold], column.name
+        )
         # 확인 순서: 임계치를 넘은 후보(정렬 순) → 나머지 후보(정렬 순,
         # free_text 폴백 포함). 통과 후보가 전수 확인에서 모두 탈락해도
         # 무손실 폴백까지 내려가 확정한다(재검토 4차: 전각 숫자처럼 탐지기는
         # 맞는데 정규화는 실패하는 값이 100%면, 그걸 안은 채 전부 NULL인
         # 타입으로 확정되지 않는다).
-        ranked = _rank(passing, column.name) + _rank(rest, column.name)
+        ranked = passing + rest
         if not ranked:
             # 어떤 탐지기도 후보를 내지 않은 경우(빈 커스텀 목록) — 문자열로 둔다.
             assignments.append(
