@@ -42,6 +42,7 @@ from autoetl.parser.exporters import (
 )
 from autoetl.parser.layout_detector import create_layout_detector
 from autoetl.parser.pipeline import parse_and_export, parse_page_selection, supported_extensions
+from autoetl.ui.static_files import STATIC_RESPONSE_HEADERS, load_static_bundle, lookup_static_file
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _MAX_REQUEST_BYTES = 70 * 1024 * 1024  # base64 ~50MB 원본 대응
@@ -343,6 +344,7 @@ class _ParserUiHttpServer(ThreadingHTTPServer):
         self.allow_non_loopback = allow_non_loopback
         self.bind_host = server_address[0].strip().lower()
         self.ui_html_bytes = _load_ui_html()
+        self.static_bundle = load_static_bundle()
         self.bundle_store = _BundleStore()
         self.docindex_store = _DocIndexStore()
         self.etl_session_store = _EtlSessionStore()
@@ -416,6 +418,29 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
         if not self._check_host():
             return
         path_only = self.path.split("?", 1)[0]
+        if path_only == "/next":
+            self._send_bytes(
+                HTTPStatus.TEMPORARY_REDIRECT,
+                b"",
+                content_type="text/plain; charset=utf-8",
+                extra_headers={"Location": "/next/"},
+            )
+            return
+
+        if path_only.startswith("/next/"):
+            found_static = lookup_static_file(self.server.static_bundle, path_only[len("/next/") :])
+            if found_static is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "알 수 없는 경로다."})
+                return
+            body, content_type = found_static
+            self._send_bytes(
+                HTTPStatus.OK,
+                body,
+                content_type=content_type,
+                extra_headers=STATIC_RESPONSE_HEADERS,
+            )
+            return
+
         if path_only in ("/", "/index.html"):
             self._send_bytes(
                 HTTPStatus.OK,
