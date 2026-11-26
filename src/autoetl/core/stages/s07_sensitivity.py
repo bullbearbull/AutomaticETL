@@ -40,7 +40,9 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _IPV4_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$")
 _BANK_ACCT_VALUE_RE = re.compile(r"^\d{2,4}-\d{2,6}-\d{2,7}(?:-\d{1,3})?$")
 _CAMEL_WORD_BOUNDARY_RE = re.compile(
-    r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=(?!Pv[46](?:[^a-z]|$))[A-Z][a-z])"
+    r"(?<=[a-z0-9])(?=[A-Z])"
+    r"|(?<=[A-Z])(?=(?!Pv[46](?:[^a-z]|$))[A-Z][a-z])"
+    r"|(?<![Ii][Pp][Vv])(?<=[A-Za-z])(?=[0-9])"
 )
 
 _ENTITY_NAME_EXCLUSIONS = (
@@ -162,8 +164,8 @@ _BANK_ACCOUNT_HINTS = (
     "iban",
 )
 
-_RRN_HINTS = ("주민등록번호", "주민번호", "resident_no")
-_RRN_TOKENS = ("rrn", "ssn")
+_RRN_HINTS = ("주민등록번호", "주민번호")
+_RRN_TOKENS = ("rrn", "ssn", "resident-no", "residentno")
 _CARD_HINTS = ("카드번호", "card_no", "card_number", "credit_card")
 
 _LEVEL_BY_TYPE: dict[SensitiveType, SensitivityLevel] = {
@@ -410,7 +412,7 @@ def _classify_column(
     # 3. 결정론적 컬럼명 힌트 (패턴만으로 잡기 어려운 성명·생년월일·주소·계좌 등)
     tokenized_name = _CAMEL_WORD_BOUNDARY_RE.sub("_", col_name)
     email_hint = _contains_hint(col_name, _EMAIL_HINTS)
-    if _contains_hint(tokenized_name, _RRN_HINTS) or name_matches(tokenized_name, _RRN_TOKENS):
+    if _contains_hint(col_name, _RRN_HINTS) or name_matches(tokenized_name, _RRN_TOKENS):
         _add(SensitiveType.RESIDENT_REGISTRATION_NUMBER, "name_hint", 0.92, max(best_rate, 0.80))
     if _contains_hint(col_name, _CARD_HINTS):
         _add(SensitiveType.CARD_NUMBER, "name_hint", 0.88, max(best_rate, 0.80))

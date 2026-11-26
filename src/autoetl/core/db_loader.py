@@ -962,6 +962,8 @@ def _transform_cell(
                 quantum = Decimal((0, (1,), -scale))
                 context = Context(prec=precision, rounding=ROUND_HALF_UP)
                 val = val.quantize(quantum, context=context)
+        if isinstance(val, Decimal) and val.is_zero():
+            val = val.copy_abs()
         if db_type_cast == "integer" or (
             col.physical_type is PhysicalType.INTEGER and type_cast in {"int", "integer"}
         ):

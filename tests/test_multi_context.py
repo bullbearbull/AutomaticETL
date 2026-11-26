@@ -57,14 +57,36 @@ def test_date_normalization_rejects_seven_digit_dates() -> None:
         ]
 
 
-@pytest.mark.parametrize("column", ["BusinessNumber", "businessno", "ClassName", "PassNo"])
+@pytest.mark.parametrize(
+    "column",
+    [
+        "BusinessNumber",
+        "businessno",
+        "ClassName",
+        "PassNo",
+        "residentNotes",
+        "resident_notes",
+        "residentnotes",
+    ],
+)
 def test_rrn_name_hint_does_not_match_inside_words(column: str) -> None:
     assignment, _ = _classify_column(column, None, [])
     assert assignment is None or SensitiveType.RESIDENT_REGISTRATION_NUMBER not in assignment.types
 
 
 @pytest.mark.parametrize(
-    "column", ["customer_ssn", "CustomerSSN", "rrn", "residentNo", "주민등록번호"]
+    "column",
+    [
+        "customer_ssn",
+        "CustomerSSN",
+        "customerSSN2",
+        "rrn",
+        "rrn1",
+        "resident_no",
+        "residentNo",
+        "residentNo2",
+        "주민등록번호",
+    ],
 )
 def test_rrn_name_hint_recognizes_real_identifier_names(column: str) -> None:
     assignment, _ = _classify_column(column, None, [])

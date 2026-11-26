@@ -309,6 +309,89 @@ def test_duckdb_existing_numeric_and_int4_constraints_apply_across_inferred_type
         ]
 
 
+def test_quantized_negative_zero_matches_positive_zero_in_unique_lookup() -> None:
+    """DECIMAL(5,2) UNIQUE 컬럼에서 0.001과 -0.001은 모두 Decimal('0.00')으로 중복 판정된다."""
+    source = NamedTableInput(
+        name="zero_uq",
+        headers=("id", "amount"),
+        rows=(("1", "0.001"), ("2", "-0.001")),
+    )
+    target = TargetTable(
+        name=source.name,
+        columns=[
+            TargetColumn(
+                name="id",
+                source_columns=["id"],
+                physical_type=PhysicalType.INTEGER,
+                nullable=False,
+                is_primary_key=True,
+            ),
+            TargetColumn(
+                name="amount",
+                source_columns=["amount"],
+                physical_type=PhysicalType.DECIMAL,
+                precision=5,
+                scale=2,
+                nullable=False,
+            ),
+        ],
+    )
+    plan = TableLoadStrategy(
+        source_table=source.name,
+        target_table=target.name,
+        load_order_index=0,
+        increment_mode=IncrementMode.UPSERT,
+        primary_key=["id"],
+        upsert_keys=["id"],
+        deduplication=DeduplicationRule(enabled=True, keys=["id"], keep="last"),
+        column_mappings=[
+            ColumnMapping(
+                source_column="id",
+                target_table=target.name,
+                target_column="id",
+                transform="identity",
+                type_cast="integer",
+                null_handling=NullHandling.REJECT_ROW,
+            ),
+            ColumnMapping(
+                source_column="amount",
+                target_table=target.name,
+                target_column="amount",
+                transform="strip_currency_and_comma",
+                type_cast="numeric(5, 2)",
+                null_handling=NullHandling.REJECT_ROW,
+            ),
+        ],
+        confirmed_unique_columns=["amount"],
+        expected_row_count=len(source.rows),
+    )
+
+    adapter = _DbAdapter(":memory:", "duckdb")
+    try:
+        adapter.execute("CREATE TABLE zero_uq (id INTEGER PRIMARY KEY, amount DECIMAL(5,2) UNIQUE)")
+        with MultiTableContext(extra_tables=[source]) as ctx:
+            bundle = profile_all_tables(ctx)[0]
+            read, loaded, quarantined, *_, error = _load_single_table(
+                adapter,
+                mctx=ctx,
+                bundle=bundle,
+                target_table=target,
+                table_plan=plan,
+                smap=SensitivityMap(assignments=[]),
+                batch_id="batch",
+                dataset_id="dataset",
+                loaded_at="2024-01-01T00:00:00Z",
+                include_audit_columns=False,
+                orphan_policy=OrphanPolicy.QUARANTINE,
+            )
+        assert error is None
+        assert (read, loaded) == (2, 1)
+        assert [(entry[3], entry[4]) for entry in quarantined] == [(2, "unique_violation")]
+        assert adapter.fetchall("SELECT id, amount FROM zero_uq") == [(1, Decimal("0.00"))]
+    finally:
+        adapter.close()
+
+
 def _write_korean_finance_fixture(
     data_dir: Path,
     *,
