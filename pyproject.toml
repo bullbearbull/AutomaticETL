@@ -61,6 +61,7 @@ files = [
     "src",
     "tests",
     "tools/license_check.py",
+    "tools/npm_license_check.py",
 ]
 
 [tool.pytest.ini_options]
