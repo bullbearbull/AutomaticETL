@@ -22,6 +22,8 @@ uv run python tools/license_check.py
 
 PR은 Windows·macOS·Linux × Python 3.10~3.13 CI 전 항목 통과를 기준으로 병합합니다.
 
+웹 UI(`frontend/`)를 고칠 때는 [frontend/README.md](frontend/README.md)의 개발 안내를 따라 주세요.
+
 ## 기본 규칙
 
 - **의존성**: 핵심 런타임 의존성은 허용형 라이선스(MIT·BSD·Apache-2.0·PSF·MPL-2.0 계열)만 사용하며, 새 의존성을 추가할 때는 PR에 사유와 라이선스를 명시해 주세요.
