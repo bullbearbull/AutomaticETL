@@ -8,7 +8,15 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from autoetl.contracts import IngestFormat, PhysicalType, TableSourceKind
+from autoetl.adapters.detectors import ColumnSample, NormalizationRule
+from autoetl.adapters.detectors.builtin import BUILTIN_DETECTORS
+from autoetl.contracts import (
+    IngestFormat,
+    PhysicalType,
+    SensitiveType,
+    SensitivityLevel,
+    TableSourceKind,
+)
 from autoetl.core.errors import InputError
 from autoetl.core.multi_context import (
     MultiTableContext,
@@ -17,6 +25,89 @@ from autoetl.core.multi_context import (
     profile_all_tables,
     sanitize_table_names,
 )
+from autoetl.core.pipeline import run_pipeline
+from autoetl.core.stages.s03_types import _normalize_expression
+from autoetl.core.stages.s07_sensitivity import _classify_column
+
+
+def test_period_codes_and_amounts_are_not_classified_as_dates() -> None:
+    source = NamedTableInput(
+        name="payments",
+        headers=("period", "price"),
+        rows=(("202411", "202411"), ("202412", "202412"), ("202411", "35000"), ("202412", "41000")),
+    )
+    detector = next(detector for detector in BUILTIN_DETECTORS if detector.name == "builtin.date")
+    with MultiTableContext(extra_tables=[source]) as ctx:
+        bundle = profile_all_tables(ctx)[0]
+        for index, profile in enumerate(bundle.profiles):
+            sample = ColumnSample(
+                column=profile.column,
+                values=tuple(row[index] for row in source.rows),
+                profile=profile,
+            )
+            assert detector.detect(sample) is None
+        assert all(assignment.physical_type is not PhysicalType.DATE for assignment in bundle.types)
+
+
+def test_date_normalization_rejects_seven_digit_dates() -> None:
+    expr = _normalize_expression("value", NormalizationRule.DATE, 0)
+    with duckdb.connect() as conn:
+        assert conn.execute(f"SELECT {expr} FROM (VALUES ('2024111')) AS t(value)").fetchall() == [
+            (None,),
+        ]
+
+
+@pytest.mark.parametrize("column", ["BusinessNumber", "businessno", "ClassName", "PassNo"])
+def test_rrn_name_hint_does_not_match_inside_words(column: str) -> None:
+    assignment, _ = _classify_column(column, None, [])
+    assert assignment is None or SensitiveType.RESIDENT_REGISTRATION_NUMBER not in assignment.types
+
+
+@pytest.mark.parametrize(
+    "column", ["customer_ssn", "CustomerSSN", "rrn", "residentNo", "주민등록번호"]
+)
+def test_rrn_name_hint_recognizes_real_identifier_names(column: str) -> None:
+    assignment, _ = _classify_column(column, None, [])
+    assert assignment is not None
+    assert assignment.types == [SensitiveType.RESIDENT_REGISTRATION_NUMBER]
+
+
+@pytest.mark.parametrize(
+    ("column", "samples", "expected"),
+    [
+        ("ip_address", ["10.0.0.1"], [SensitiveType.IP_ADDRESS]),
+        ("mac_address", [], []),
+        ("e_mail_address", [], [SensitiveType.EMAIL]),
+        ("email_address", [], [SensitiveType.EMAIL]),
+        ("이메일주소", [], [SensitiveType.EMAIL]),
+        ("IP주소", [], []),
+        ("URLAddress", [], []),
+        ("web_address", [], []),
+        ("wallet_address", [], []),
+        ("웹주소", [], []),
+        ("지갑주소", [], []),
+        ("shipping_address", [], [SensitiveType.ADDRESS]),
+    ],
+)
+def test_address_hint_distinguishes_network_and_postal_addresses(
+    column: str, samples: list[str], expected: list[SensitiveType]
+) -> None:
+    assignment, _ = _classify_column(column, None, samples)
+    assert (assignment.types if assignment else []) == expected
+    if expected == [SensitiveType.IP_ADDRESS]:
+        assert assignment is not None and assignment.level is SensitivityLevel.L1
+
+
+def test_single_table_pipeline_samples_duplicate_headers_by_position(tmp_path: Path) -> None:
+    source = tmp_path / "contacts.csv"
+    source.write_text(
+        "data,data\n900101-1234568,oak\n910101-1234563,elm\n920101-1234569,pine\n",
+        encoding="utf-8",
+    )
+    assignments = run_pipeline(source).sensitivity.assignments
+    assert [(a.column, a.types) for a in assignments] == [
+        ("data", [SensitiveType.RESIDENT_REGISTRATION_NUMBER]),
+    ]
 
 
 def _write_multi_sheet_xlsx(path: Path) -> Path:

@@ -14,16 +14,29 @@ import pytest
 import autoetl
 from autoetl.cli import main
 from autoetl.contracts import (
+    ColumnMapping,
     ColumnOverride,
     DatasetKind,
+    DeduplicationRule,
+    IncrementMode,
     MaskingPolicy,
+    NullHandling,
     OrphanPolicy,
+    PhysicalType,
     Purpose,
     SchemaOverrideSpec,
     SensitiveType,
+    SensitivityMap,
+    TableLoadStrategy,
+    TargetColumn,
+    TargetTable,
 )
 from autoetl.core.db_loader import (
     DEFAULT_MANAGEMENT_TABLES,
+    _DbAdapter,
+    _load_single_table,
+    _parse_temporal_date,
+    _transform_cell,
     inspect_db_catalog,
     load_tables,
     mask_value,
@@ -32,6 +45,233 @@ from autoetl.core.db_loader import (
 )
 from autoetl.core.errors import InputError
 from autoetl.core.multi_analyze import analyze_tables
+from autoetl.core.multi_context import MultiTableContext, NamedTableInput, profile_all_tables
+
+
+@pytest.mark.parametrize("mode", [IncrementMode.UPSERT, IncrementMode.WATERMARK])
+def test_keep_last_valid_primary_key_row_and_release_only_its_old_unique_values(
+    mode: IncrementMode,
+) -> None:
+    source = NamedTableInput(
+        name="items",
+        headers=("id", "code", "status"),
+        rows=(
+            ("1", "old", "initial"),
+            ("2", "taken", "other"),
+            ("1", "old", "changed"),
+            ("1", "new", "latest"),
+            ("3", "old", "reuses-released-code"),
+            ("1", "taken", "invalid"),
+            ("4", "new", "still-conflicts"),
+        ),
+    )
+    target = TargetTable(
+        name=source.name,
+        columns=[
+            TargetColumn(
+                name=name,
+                source_columns=[name],
+                physical_type=physical_type,
+                nullable=False,
+                is_primary_key=name == "id",
+            )
+            for name, physical_type in zip(
+                source.headers,
+                (PhysicalType.INTEGER, PhysicalType.STRING, PhysicalType.STRING),
+                strict=True,
+            )
+        ],
+    )
+    plan = TableLoadStrategy(
+        source_table=source.name,
+        target_table=target.name,
+        load_order_index=0,
+        increment_mode=mode,
+        primary_key=["id"],
+        upsert_keys=["id"],
+        deduplication=DeduplicationRule(enabled=True, keys=["id"], keep="last"),
+        column_mappings=[
+            ColumnMapping(
+                source_column=name,
+                target_table=target.name,
+                target_column=name,
+                type_cast="int" if name == "id" else "text",
+                null_handling=NullHandling.REJECT_ROW,
+            )
+            for name in source.headers
+        ],
+        confirmed_unique_columns=["code"],
+        expected_row_count=len(source.rows),
+    )
+
+    adapter = _DbAdapter(":memory:", "sqlite")
+    try:
+        adapter.execute(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, code TEXT UNIQUE, status TEXT)"
+        )
+        with MultiTableContext(extra_tables=[source]) as ctx:
+            bundle = profile_all_tables(ctx)[0]
+            read, loaded, quarantined, *_, error = _load_single_table(
+                adapter,
+                mctx=ctx,
+                bundle=bundle,
+                target_table=target,
+                table_plan=plan,
+                smap=SensitivityMap(assignments=[]),
+                batch_id="batch",
+                dataset_id="dataset",
+                loaded_at="2024-01-01T00:00:00Z",
+                include_audit_columns=False,
+                orphan_policy=OrphanPolicy.QUARANTINE,
+            )
+        assert error is None
+        assert (read, loaded) == (7, 3)
+        assert [(entry[3], entry[4]) for entry in quarantined] == [
+            (6, "unique_violation"),
+            (7, "unique_violation"),
+        ]
+        assert adapter.fetchall("SELECT * FROM items ORDER BY id") == [
+            (1, "new", "latest"),
+            (2, "taken", "other"),
+            (3, "old", "reuses-released-code"),
+        ]
+    finally:
+        adapter.close()
+
+
+def test_duplicate_headers_are_masked_and_loaded_by_source_position(tmp_path: Path) -> None:
+    source = NamedTableInput(
+        name="contacts",
+        headers=("id", "data", "data"),
+        rows=(("11", "900101-1234568", "oak"), ("12", "910101-1234563", "elm")),
+    )
+    db_path = tmp_path / "contacts.sqlite"
+    _, result = load_tables(extra_tables=[source], db_path=db_path, auto_mask_pii=True)
+    assert result.tables[0].masked_columns == ["data"]
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT data, data_2 FROM contacts ORDER BY id").fetchall() == [
+            ("900101-1******", "oak"),
+            ("910101-1******", "elm"),
+        ]
+
+
+def test_long_identifiers_keep_both_unique_indexes(tmp_path: Path) -> None:
+    name = "customer_order_line_items_history"
+    fields = ("customer_identifier_code_a", "customer_identifier_code_b")
+    source = NamedTableInput(
+        name=name, headers=("entry_id", *fields), rows=(("1", "AB", "AC"), ("2", "CD", "EF"))
+    )
+    spec = SchemaOverrideSpec(
+        columns=[ColumnOverride(table=name, source_column=field, unique=True) for field in fields]
+    )
+    db_path = tmp_path / "indexes.sqlite"
+    _, result = load_tables(extra_tables=[source], db_path=db_path, overrides=spec)
+    assert result.total_rows_loaded == 2
+    with sqlite3.connect(db_path) as conn:
+        indexes = conn.execute(
+            "SELECT c.name FROM pragma_index_list(?) AS i, pragma_index_info(i.name) AS c "
+            'WHERE i."unique" AND i.origin = ?',
+            (name, "c"),
+        ).fetchall()
+    assert sorted(indexes) == [(field,) for field in fields]
+
+
+@pytest.mark.parametrize("value", ["202411", "2024111"])
+def test_partial_dense_dates_are_rejected_during_load(value: str) -> None:
+    assert _parse_temporal_date(value, korean=False) is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("01012345678", "010-****-5678"),
+        ("0212345678", "02-****-5678"),
+        ("0311234567", "031-***-4567"),
+        ("050512345678", "0505-****-5678"),
+        ("02-12345678", "02-****-5678"),
+        ("0101234-5678", "010-****-5678"),
+    ],
+)
+def test_phone_mask_retains_only_area_or_service_code_and_last_four(
+    raw: str, expected: str
+) -> None:
+    assert mask_value(raw, SensitiveType.PHONE_NUMBER, MaskingPolicy.MASK) == expected
+
+
+def test_duckdb_load_keeps_full_detected_decimal_scale(tmp_path: Path) -> None:
+    source = NamedTableInput(
+        name="ledger",
+        headers=("entry_id", "amount", "exact_ratio"),
+        rows=(
+            ("1", "0.123456789012", "0.1234567890123456789012345678901234567"),
+            ("2", "0.987654321012", "0.9876543210123456789012345678901234567"),
+        ),
+    )
+    db_path = tmp_path / "precision.duckdb"
+    _, result = load_tables(extra_tables=[source], db_path=db_path, engine="duckdb")
+    assert result.total_rows_loaded == 2
+    with duckdb.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT amount, exact_ratio FROM ledger ORDER BY entry_id"
+        ).fetchall() == [(Decimal(row[1]), Decimal(row[2])) for row in source.rows]
+
+
+def test_currency_integer_larger_than_int4_is_rejected() -> None:
+    mapping = ColumnMapping(
+        source_column="amount",
+        target_table="ledger",
+        target_column="amount",
+        type_cast="int",
+        transform="strip_currency_and_comma",
+        null_handling=NullHandling.REJECT_ROW,
+    )
+    ok, val, detail = _transform_cell(
+        "3,000,000,000",
+        col=TargetColumn(
+            name="amount",
+            physical_type=PhysicalType.INTEGER,
+            source_columns=["amount"],
+            nullable=False,
+        ),
+        mapping=mapping,
+        slot_rx=None,
+        mask_policy=MaskingPolicy.NONE,
+        sensitive_type=None,
+        engine="duckdb",
+    )
+    assert (ok, val) == (False, None)
+    assert "INT4" in detail
+
+
+def test_duckdb_numeric_overflow_quarantines_rows_with_an_existing_target_type(
+    tmp_path: Path,
+) -> None:
+    greatest_precise_value = "9." + "9" * 37
+    source = NamedTableInput(
+        name="ledger",
+        headers=("entry_id", "amount", "precise"),
+        rows=(
+            ("1", "999.994", greatest_precise_value),
+            ("2", "999.995", "0.125"),
+            ("3", "-999.995", "0.125"),
+            ("4", "123456789.123", "0.125"),
+        ),
+    )
+    db_path = tmp_path / "overflow.duckdb"
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute(
+            "CREATE TABLE ledger (entry_id INTEGER PRIMARY KEY, "
+            "amount DECIMAL(5,2), precise DECIMAL(38,37))"
+        )
+    _, result = load_tables(extra_tables=[source], db_path=db_path, engine="duckdb")
+    assert (result.total_rows_loaded, result.total_rows_quarantined) == (1, 3)
+    with duckdb.connect(str(db_path)) as conn:
+        assert conn.execute("SELECT entry_id, amount, precise FROM ledger").fetchall() == [
+            (1, Decimal("999.99"), Decimal(greatest_precise_value)),
+        ]
+        assert conn.execute(
+            "SELECT DISTINCT error_category, error_column FROM _etl_quarantine_rows"
+        ).fetchall() == [("cast_error", "amount")]
 
 
 def _write_korean_finance_fixture(

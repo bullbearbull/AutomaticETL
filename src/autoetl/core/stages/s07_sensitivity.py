@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 
+from autoetl.adapters.detectors import name_matches
 from autoetl.contracts import (
     IngestManifest,
     PhysicalType,
@@ -18,10 +19,12 @@ from autoetl.contracts import (
     SensitivityAssignment,
     SensitivityLevel,
     SensitivityMap,
+    SourceColumn,
     TableProfileBundle,
     TypeAssignment,
 )
 from autoetl.core.context import RAW_TABLE, AnalysisContext, quote_identifier
+from autoetl.core.stages.s00_ingest import deduplicate_source_names
 
 SAMPLE_LIMIT = 500
 VALUE_MATCH_THRESHOLD = 0.60
@@ -36,6 +39,7 @@ _PHONE_INTL_RE = re.compile(r"^(?:\+\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]\d{3,4}[-
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _IPV4_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$")
 _BANK_ACCT_VALUE_RE = re.compile(r"^\d{2,4}-\d{2,6}-\d{2,7}(?:-\d{1,3})?$")
+_CAMEL_WORD_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 
 _ENTITY_NAME_EXCLUSIONS = (
     "branch",
@@ -105,7 +109,7 @@ _PHONE_HINTS = (
     "cell_phone",
 )
 
-_EMAIL_HINTS = ("이메일", "메일주소", "email", "e_mail")
+_EMAIL_HINTS = ("이메일", "메일주소", "email", "e_mail", "e-mail")
 
 _ADDRESS_HINTS = (
     "상세주소",
@@ -117,6 +121,31 @@ _ADDRESS_HINTS = (
     "street_address",
     "address",
     "addr",
+)
+_NETWORK_ADDRESS_HINTS = (
+    "ip",
+    "ipv4",
+    "ipv6",
+    "mac",
+    "url",
+    "web",
+    "wallet",
+    "ipaddress",
+    "ipaddr",
+    "ipv4address",
+    "ipv4addr",
+    "ipv6address",
+    "ipv6addr",
+    "macaddress",
+    "macaddr",
+    "urladdress",
+    "urladdr",
+    "webaddress",
+    "webaddr",
+    "walletaddress",
+    "walletaddr",
+    "웹주소",
+    "지갑주소",
 )
 
 _BANK_ACCOUNT_HINTS = (
@@ -131,7 +160,8 @@ _BANK_ACCOUNT_HINTS = (
     "iban",
 )
 
-_RRN_HINTS = ("주민등록번호", "주민번호", "rrn", "ssn", "resident_no")
+_RRN_HINTS = ("주민등록번호", "주민번호", "resident_no")
+_RRN_TOKENS = ("rrn", "ssn")
 _CARD_HINTS = ("카드번호", "card_no", "card_number", "credit_card")
 
 _LEVEL_BY_TYPE: dict[SensitiveType, SensitivityLevel] = {
@@ -376,7 +406,9 @@ def _classify_column(
         _add(SensitiveType.ADDRESS, "semantic_type", 0.88, max(best_rate, 0.85))
 
     # 3. 결정론적 컬럼명 힌트 (패턴만으로 잡기 어려운 성명·생년월일·주소·계좌 등)
-    if _contains_hint(col_name, _RRN_HINTS):
+    tokenized_name = _CAMEL_WORD_BOUNDARY_RE.sub("_", col_name)
+    email_hint = _contains_hint(col_name, _EMAIL_HINTS)
+    if _contains_hint(tokenized_name, _RRN_HINTS) or name_matches(tokenized_name, _RRN_TOKENS):
         _add(SensitiveType.RESIDENT_REGISTRATION_NUMBER, "name_hint", 0.92, max(best_rate, 0.80))
     if _contains_hint(col_name, _CARD_HINTS):
         _add(SensitiveType.CARD_NUMBER, "name_hint", 0.88, max(best_rate, 0.80))
@@ -384,11 +416,15 @@ def _classify_column(
         _add(SensitiveType.BANK_ACCOUNT, "name_hint", 0.86, max(best_rate, 0.80))
     if _contains_hint(col_name, _PHONE_HINTS):
         _add(SensitiveType.PHONE_NUMBER, "name_hint", 0.88, max(best_rate, 0.80))
-    if _contains_hint(col_name, _EMAIL_HINTS):
+    if email_hint:
         _add(SensitiveType.EMAIL, "name_hint", 0.88, max(best_rate, 0.80))
     if _contains_hint(col_name, _DOB_HINTS):
         _add(SensitiveType.DATE_OF_BIRTH, "name_hint", 0.90, max(best_rate, 0.85))
-    if _contains_hint(col_name, _ADDRESS_HINTS):
+    if (
+        _contains_hint(col_name, _ADDRESS_HINTS)
+        and not email_hint
+        and not name_matches(tokenized_name, _NETWORK_ADDRESS_HINTS)
+    ):
         _add(SensitiveType.ADDRESS, "name_hint", 0.85, max(best_rate, 0.80))
     if _is_person_name_column(col_name) and phys in {None, PhysicalType.STRING}:
         _add(SensitiveType.NAME, "name_hint", 0.86, max(best_rate, 0.80))
@@ -414,22 +450,20 @@ def _classify_column(
     )
 
 
-def detect_table_sensitivity(
-    bundle: TableProfileBundle,
-    slot: AnalysisContext | None = None,
+def _detect_columns(
+    columns: Sequence[SourceColumn],
+    types: Sequence[TypeAssignment],
+    slot: AnalysisContext | None,
 ) -> SensitivityMap:
-    """단일 테이블 번들(+선택 DuckDB 슬롯)에서 PII·민감 컬럼을 결정론적으로 탐지한다."""
-    type_by_col = {t.column: t for t in bundle.types}
-    col_id_by_name = (
-        {c.original_name: c.column_id for c in slot.columns} if slot is not None else {}
-    )
+    type_by_col = {t.column: t for t in types}
+    col_id_by_position = {c.position: c.column_id for c in slot.columns} if slot is not None else {}
     assignments: list[SensitivityAssignment] = []
     notes: list[str] = []
 
-    for col in bundle.ingest.columns:
+    for col in columns:
         samples: list[str] = []
         if slot is not None:
-            col_id = col_id_by_name.get(col.name)
+            col_id = col_id_by_position.get(col.index)
             if col_id is not None:
                 samples = _fetch_column_sample(slot, col_id)
         assignment, col_notes = _classify_column(col.name, type_by_col.get(col.name), samples)
@@ -440,33 +474,31 @@ def detect_table_sensitivity(
     return SensitivityMap(assignments=assignments, notes=notes)
 
 
+def detect_table_sensitivity(
+    bundle: TableProfileBundle,
+    slot: AnalysisContext | None = None,
+) -> SensitivityMap:
+    """단일 테이블 번들(+선택 DuckDB 슬롯)에서 PII·민감 컬럼을 결정론적으로 탐지한다."""
+    return _detect_columns(bundle.ingest.columns, bundle.types, slot)
+
+
 def run(ctx: AnalysisContext) -> SensitivityMap:
     """단일 테이블 파이프라인 S7 단계 실행."""
     ingest_obj = ctx.stage_artifacts.get("s00_ingest")
     types_obj = ctx.stage_artifacts.get("s03_types")
-    type_by_col: dict[str, TypeAssignment] = {}
-    if isinstance(types_obj, list):
-        for item in types_obj:
-            if isinstance(item, TypeAssignment):
-                type_by_col[item.column] = item
+    types = (
+        [item for item in types_obj if isinstance(item, TypeAssignment)]
+        if isinstance(types_obj, list)
+        else []
+    )
 
     if isinstance(ingest_obj, IngestManifest):
-        col_names = [c.name for c in ingest_obj.columns]
+        columns = ingest_obj.columns
     else:
-        col_names = [c.original_name for c in ctx.columns]
-    col_id_by_name = {c.original_name: c.column_id for c in ctx.columns}
+        names = deduplicate_source_names([c.original_name for c in ctx.columns])
+        columns = [SourceColumn(name=name, index=i) for i, name in enumerate(names)]
 
-    assignments: list[SensitivityAssignment] = []
-    notes: list[str] = []
-    for col_name in col_names:
-        col_id = col_id_by_name.get(col_name)
-        samples = _fetch_column_sample(ctx, col_id) if col_id is not None else []
-        assignment, col_notes = _classify_column(col_name, type_by_col.get(col_name), samples)
-        notes.extend(col_notes)
-        if assignment is not None:
-            assignments.append(assignment)
-
-    return SensitivityMap(assignments=assignments, notes=notes)
+    return _detect_columns(columns, types, ctx)
 
 
 __all__ = [

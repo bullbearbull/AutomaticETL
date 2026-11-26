@@ -66,6 +66,7 @@ from autoetl.core.context import RAW_TABLE, quote_identifier
 from autoetl.core.ddl.postgres import (
     INT4_MAX,
     INT4_MIN,
+    NUMERIC_LIMIT,
     build_column_comment_ddl,
     generate_ddl,
     resolve_postgres_column_types,
@@ -149,14 +150,18 @@ def _to_sql_ident(raw: str, *, used: set[str], fallback_prefix: str = "col") -> 
 
 def _decimal_precision_scale(
     stat: ColumnStats | None,
+    assignment: TypeAssignment | None = None,
 ) -> tuple[int | None, int | None]:
+    if assignment is not None and assignment.precision is not None and assignment.scale is not None:
+        return (assignment.precision, assignment.scale)
     if stat is None or stat.numeric is None:
         return (None, None)
     num = stat.numeric
     max_abs = max(abs(num.minimum), abs(num.maximum))
     int_digits = len(str(int(max_abs))) if max_abs >= 1 else 1
-    scale = min(max(num.max_decimal_digits, 0), 10)
-    precision = min(max(int_digits + scale, scale + 1), 36)
+    raw_scale = min(max(num.max_decimal_digits, 0), NUMERIC_LIMIT - 1)
+    scale = min(raw_scale, max(0, NUMERIC_LIMIT - int_digits)) if int_digits <= NUMERIC_LIMIT else 0
+    precision = min(max(int_digits + scale, scale + 1), NUMERIC_LIMIT)
     return (precision, scale)
 
 
@@ -478,7 +483,7 @@ def _build_candidate(
             prec: int | None = None
             scale: int | None = None
             if phys is PhysicalType.DECIMAL:
-                prec, scale = _decimal_precision_scale(stat)
+                prec, scale = _decimal_precision_scale(stat, t_assign)
 
             nullable = False if is_pk else (prof.missing_count > 0)
             desc_parts = [f"유형: {cls.category.value}"]
@@ -566,7 +571,7 @@ def _build_candidate(
                             name=slot_sql_col,
                             physical_type=slot_phys,
                             source_columns=[col_name],
-                            nullable=prof.missing_count > 0,
+                            nullable=prof.missing_count > 0 or cls.string_pattern.coverage < 1.0,
                             is_primary_key=False,
                             foreign_key=slot_fk_spec,
                             description=slot_desc,
@@ -745,7 +750,7 @@ def _trial_cast_expr(
     col: TargetColumn,
     transform: str,
     pg_type: exp.DataType,
-    slot_spec: tuple[str, str, int] | None,
+    extracted: str | None,
 ) -> tuple[str, int | None, bool]:
     """시험 적재용 DuckDB 변환 SQL, VARCHAR 최대 길이, INT4 범위 검사 여부를 반환한다."""
     pg_sql = pg_type.sql(dialect="postgres")
@@ -758,10 +763,7 @@ def _trial_cast_expr(
     if col.is_identity or transform == "generated_always_as_identity":
         return "row_number() OVER ()", None, False
 
-    if slot_spec is not None:
-        _src_name, pattern, cap_group = slot_spec
-        pat_lit = _sql_literal(pattern)
-        extracted = f"NULLIF(regexp_extract({qcol}, {pat_lit}, {cap_group}), '')"
+    if extracted is not None:
         if col.physical_type is PhysicalType.INTEGER:
             inner = (
                 f"CASE WHEN regexp_matches({extracted}, '^[+-]?\\d+$') "
@@ -826,7 +828,8 @@ def _trial_cast_expr(
             f"CAST(TRY_STRPTIME(trim({qcol}), '%Y-%m-%d') AS DATE), "
             f"CAST(TRY_STRPTIME(trim({qcol}), '%Y/%m/%d') AS DATE), "
             f"CAST(TRY_STRPTIME(trim({qcol}), '%Y.%m.%d') AS DATE), "
-            f"CAST(TRY_STRPTIME(trim({qcol}), '%Y%m%d') AS DATE), "
+            f"CASE WHEN regexp_full_match(trim({qcol}), '[0-9]{{8}}') "
+            f"THEN CAST(TRY_STRPTIME(trim({qcol}), '%Y%m%d') AS DATE) END, "
             f"CASE WHEN regexp_matches(trim({qcol}), '^\\d+$') "
             f"AND TRY_CAST(trim({qcol}) AS INTEGER) "
             f"BETWEEN {EXCEL_SERIAL_MIN} AND {EXCEL_SERIAL_MAX} "
@@ -904,6 +907,7 @@ def _run_trial_load(
     cand = built.candidate
     load_order = _topological_order(cand)
     table_by_name = {t.name: t for t in cand.tables}
+    bundle_by_name = {b.source.table_name: b for b in bundles}
     trial_name_by_table: dict[str, str] = {}
     col_alias_by_table: dict[str, dict[str, str]] = {}
     created_temps: list[str] = []
@@ -919,7 +923,9 @@ def _run_trial_load(
             target_table = table_by_name[t_name]
             src_name = built.source_table_map[t_name]
             slot = mctx.get_by_name(src_name)
-            col_id_by_src = {c.original_name: c.column_id for c in slot.columns}
+            col_id_by_src = {
+                c.name: slot.column_id_of(c.index) for c in bundle_by_name[src_name].ingest.columns
+            }
             src_rel = f"{slot.table_info.table_id}.{RAW_TABLE}"
             temp_tbl = f"_autoetl_trial_{idx}"
             trial_name_by_table[t_name] = temp_tbl
@@ -946,14 +952,22 @@ def _run_trial_load(
 
                 qcol = quote_identifier(raw_cid)
                 miss_pred = _raw_missing_predicate(qcol)
+                extracted = None
+                if slot_spec is not None:
+                    _src_name, pattern, cap_group = slot_spec
+                    pat_lit = _sql_literal(pattern)
+                    extracted = f"NULLIF(regexp_extract({qcol}, {pat_lit}, {cap_group}), '')"
                 inner_expr, varchar_limit, check_int4 = _trial_cast_expr(
-                    qcol, col, transform, pg_type, slot_spec
+                    qcol, col, transform, pg_type, extracted
                 )
                 wrapped = f"CASE WHEN ({miss_pred}) THEN NULL ELSE ({inner_expr}) END"
                 select_exprs.append(f"{wrapped} AS {alias}")
 
                 # 비결측 원시 값이 변환 후 NULL이 되거나 DDL 길이/정수 범위를 초과하면 실패
-                fail_parts = [f"(NOT ({miss_pred}) AND ({wrapped}) IS NULL)"]
+                cast_input = f"NOT ({miss_pred})"
+                if extracted is not None and col.nullable:
+                    cast_input += f" AND ({extracted}) IS NOT NULL"
+                fail_parts = [f"({cast_input} AND ({wrapped}) IS NULL)"]
                 if varchar_limit is not None:
                     fail_parts.append(
                         f"(({wrapped}) IS NOT NULL AND "
@@ -1141,7 +1155,7 @@ def _score_candidate(
         redundancy_val = 76.0 + (20.0 * omitted_count / total_derivations)
     else:
         redundancy_val = 88.0 if cand.pattern is SchemaPattern.THIRD_NORMAL_FORM else 80.0
-    if built.materialized_slot_count > 0 and cand.id == "C2_COMPACT_RAW":
+    if cand.id == "C2_COMPACT_RAW":
         redundancy_val = min(100.0, redundancy_val + 4.0)
 
     # 용도 적합성

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from datetime import datetime
+from datetime import date, datetime
 
 from autoetl.adapters.detectors import (
     HINT_KEYWORDS,
@@ -29,7 +29,7 @@ from autoetl.adapters.detectors import (
 )
 from autoetl.contracts import PhysicalType, SemanticType
 
-__all__ = ["BUILTIN_DETECTORS", "EXCEL_SERIAL_MAX", "EXCEL_SERIAL_MIN"]
+__all__ = ["BUILTIN_DETECTORS", "EXCEL_SERIAL_MAX", "EXCEL_SERIAL_MIN", "parse_date_text"]
 
 # re.ASCII: \d·\s를 ASCII로만 본다(재검토 4차 정리). 정규화의 DuckDB RE2도
 # ASCII만 받아 전각 숫자가 탐지기와 정규화에서 같게 취급된다.
@@ -41,6 +41,7 @@ _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", re.ASCII)
 _URL = re.compile(r"^https?://\S+$", re.ASCII)
 _TIME = re.compile(r"^(\d{1,2}):(\d{2})(:(\d{2}))?$", re.ASCII)
 _TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?(\.\d+)?$", re.ASCII)
+_DENSE_DATE = re.compile(r"[0-9]{8}")
 
 BOOLEAN_PAIRS: tuple[frozenset[str], ...] = (
     frozenset({"y", "n"}),
@@ -71,15 +72,20 @@ def _fit(values: tuple[str, ...], predicate: Callable[[str], object]) -> float:
     return sum(1 for value in values if predicate(value)) / len(values)
 
 
-def _is_date_text(value: str) -> bool:
-    """문자열 날짜 4형식(ISO·슬래시·점·밀집) 판정."""
+def parse_date_text(value: str) -> date | None:
+    """문자열 날짜 4형식(ISO·슬래시·점·밀집)을 파싱한다."""
     for fmt in DATE_FORMATS:
+        if fmt == "%Y%m%d" and _DENSE_DATE.fullmatch(value) is None:
+            continue
         try:
-            datetime.strptime(value, fmt)
-            return True
+            return datetime.strptime(value, fmt).date()
         except ValueError:
             continue
-    return False
+    return None
+
+
+def _is_date_text(value: str) -> bool:
+    return parse_date_text(value) is not None
 
 
 def _is_excel_serial(value: str) -> bool:

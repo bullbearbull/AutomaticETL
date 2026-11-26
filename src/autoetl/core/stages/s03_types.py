@@ -139,7 +139,11 @@ def _normalize_expression(
     elif rule is NormalizationRule.DATE:
         parsed = ", ".join(
             f"CAST(TRY_STRPTIME({quoted}, '{fmt}') AS DATE)"
-            for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d")
+            for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d")
+        )
+        dense = (
+            f"CASE WHEN regexp_full_match(trim({quoted}), '[0-9]{{8}}') "
+            f"THEN CAST(TRY_STRPTIME(trim({quoted}), '%Y%m%d') AS DATE) END"
         )
         # 시리얼 분기도 정수 형태일 때만 — TRY_CAST INTEGER는 소수를 반올림한다.
         serial = (
@@ -148,7 +152,7 @@ def _normalize_expression(
             f"AND {EXCEL_SERIAL_MAX} THEN DATE '1899-12-30' + "
             f"TRY_CAST({quoted} AS INTEGER) ELSE NULL END"
         )
-        inner = f"COALESCE({parsed}, {serial})"
+        inner = f"COALESCE({parsed}, {dense}, {serial})"
     elif rule is NormalizationRule.TIMESTAMP:
         # TIMESTAMP는 마이크로초(6자리)까지만 담는다 — 7자리 이상 소수초는
         # 조용히 잘린다(무손실 위반, 재검토 4차). 6자리 이하 형태만 변환한다.
