@@ -88,7 +88,7 @@ frontend/
 | 부품 | 쓰는 곳 |
 | -- | -- |
 | `Button` | 모든 버튼. `variant`는 `primary`·`secondary`(기본)·`quiet`. 누를 때는 `onPress`를 쓴다. |
-| `AppTabs` | 위쪽 탭 줄(App.tsx). 화살표 키로 이동하는 표준 탭이다. |
+| `AppTabs` | 위쪽 탭 줄(App.tsx). 화살표 키로 이동하는 표준 탭이다. 한 번 연 탭은 다른 탭을 보는 동안에도 숨겨진 채 남아 있어서 읽던 일과 결과가 사라지지 않는다. 그래서 숨겨진 동안에도 그 탭의 요청과 타이머는 계속 돈다. |
 | `StepIndicator` | `1 넣기 · 2 확인·다듬기 · 3 내보내기`. `current`에 지금 단계를 넘긴다. |
 | `StatusBar` | 아래 진행 상태 줄. `message`, `tone`, `startedAt`, `endedAt`. 문장은 `role="status"`로 읽히고 걸린 시간은 따로 보인다. |
 | `ErrorNotice` | 오류 안내. `AppError`를 그대로 넘기면 무슨 일 · 왜 · 어떻게와 자세히(원래 글)를 보여 준다. |

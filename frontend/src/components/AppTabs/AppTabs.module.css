@@ -49,3 +49,8 @@
   flex: 1;
   min-width: 0;
 }
+
+/* A kept-mounted panel of a tab that is not selected. */
+.panel[data-inert] {
+  display: none;
+}
