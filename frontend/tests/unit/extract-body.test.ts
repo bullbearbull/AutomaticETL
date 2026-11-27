@@ -87,6 +87,14 @@ test('fenced code is left exactly as it is', () => {
   assert.deepEqual(body.segments, [{ kind: 'text', markdown: markdown.trimEnd() }]);
 });
 
+test('blank lines inside fenced code are kept; runs outside are still squeezed', () => {
+  const markdown = ['앞 문단', '', '', '', '```text', 'first', '', '', 'last', '```', '', '', '뒤 문단'].join('\n');
+  const expected = ['앞 문단', '', '```text', 'first', '', '', 'last', '```', '', '뒤 문단'].join('\n');
+  const body = buildBody({ markdown, tables: [], visuals: [], unit: 'page' });
+  assert.deepEqual(body.segments, [{ kind: 'text', markdown: expected }]);
+  assert.equal(body.copyText, expected);
+});
+
 test('a figure the vision step described becomes a figure part', () => {
   const markdown = ['<!-- p001_v01: vector_diagram via local -->', '*흐름도*', '<sub>시각 해석: `local`</sub>', '', '설명 글'].join('\n');
   const body = buildBody({

@@ -61,13 +61,35 @@ function splitLines(text: string): string[] {
   return text.replace(/\r\n?/g, '\n').split('\n');
 }
 
-/** Joins lines, drops blank lines at both ends and squeezes runs of blank lines. */
+const BLANK = /^[ \t]*$/;
+
+/**
+ * Joins lines, drops blank lines at both ends and squeezes runs of blank
+ * lines into one. Lines inside a code fence are kept exactly as they are.
+ */
 function tidy(lines: readonly string[]): string {
-  return lines
-    .join('\n')
-    .replace(/^(?:[ \t]*\n)+/, '')
-    .replace(/\n(?:[ \t]*\n){2,}/g, '\n\n')
-    .trimEnd();
+  const kept: string[] = [];
+  let blanks: string[] = [];
+  let fence: { char: string; size: number } | null = null;
+  for (const line of lines) {
+    if (fence === null && BLANK.test(line)) {
+      blanks.push(line);
+      continue;
+    }
+    if (blanks.length > 0 && kept.length > 0) kept.push(blanks.length > 1 ? '' : (blanks[0] as string));
+    blanks = [];
+    kept.push(line);
+    if (fence !== null) {
+      if (closesFence(line, fence)) fence = null;
+      continue;
+    }
+    const open = FENCE_OPEN.exec(line);
+    if (open) {
+      const marker = open[1] as string;
+      fence = { char: marker[0] as string, size: marker.length };
+    }
+  }
+  return kept.join('\n').trimEnd();
 }
 
 /** Whether a table's markdown starts with the "이전 페이지 표에서 이어짐" note. */
