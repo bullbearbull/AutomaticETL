@@ -31,6 +31,10 @@ export interface WorkspaceProps {
  *   목록 → 결과 → 근거 → 내보내기, then the status bar.
  *
  * Breakpoints are in em, so they follow the browser's font size and zoom.
+ * On medium screens 근거 comes before 결과 in the DOM as well, so the reading
+ * and focus order match the screen. The cost: when a resize or zoom crosses
+ * into or out of medium, React mounts 근거 again, and state inside it (an
+ * open 자세히, for example) and focus in it start over.
  */
 export function Workspace({
   list,
