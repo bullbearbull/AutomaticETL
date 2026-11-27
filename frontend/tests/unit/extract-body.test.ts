@@ -106,3 +106,13 @@ test('a title that only repeats the file name is left out of the view', () => {
   assert.deepEqual(body.segments, [{ kind: 'text', markdown: '본문' }]);
   assert.equal(body.copyText, '# 보고서.pdf\n\n본문');
 });
+
+test('a table with very many rows does not overflow the call stack', () => {
+  // Spreading this many lines into one call throws RangeError in V8.
+  const rows = Array.from({ length: 150_000 }, (_, index) => `| ${index} | 값 |`);
+  const table = ['| 번호 | 값 |', '| --- | --- |', ...rows].join('\n');
+  const markdown = ['<!-- Page 1 | category=digital_text | strategy=native_text -->', '## Page 1 (디지털 본문 · 네이티브 텍스트 추출)', '', table, '', '끝'].join('\n');
+  const body = buildBody({ markdown, tables: [{ markdown: table, caption: null }], visuals: [], unit: 'page' });
+  assert.deepEqual(body.segments.map((segment) => segment.kind), ['table', 'text']);
+  assert.ok(body.copyText.includes(table));
+});

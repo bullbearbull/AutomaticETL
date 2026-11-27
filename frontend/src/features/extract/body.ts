@@ -229,7 +229,7 @@ export function buildBody(input: BodyInput): BodyModel {
         caption: input.tables[table]?.caption ?? null,
         continued: isContinuedTable(input.tables[table]?.markdown ?? ''),
       });
-      copy.push(...tableText);
+      for (const tableLine of tableText) copy.push(tableLine);
       index += tableText.length - 1;
       continue;
     }

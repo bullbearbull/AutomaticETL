@@ -31,7 +31,7 @@ export function DataTable({ name, columns, rows, copyable = true, onCopied }: Da
 
   useEffect(() => () => window.clearTimeout(timer.current), []);
 
-  const width = Math.max(columns?.length ?? 0, ...rows.map((row) => row.length));
+  const width = rows.reduce((widest, row) => Math.max(widest, row.length), columns?.length ?? 0);
   const pad = (row: readonly TableCell[]) =>
     Array.from({ length: width }, (_, index) => {
       const cell = row[index];
