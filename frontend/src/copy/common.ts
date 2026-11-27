@@ -77,6 +77,16 @@ export const comingSoonCopy = {
   link: '기존 화면에서 열기',
 } as const;
 
+/** A tab whose screen could not be loaded, or stopped with an error. */
+export const tabErrorCopy = {
+  notice: {
+    what: '이 탭을 열지 못했어요',
+    why: 'AutoETL이 꺼졌거나, 이 탭 화면을 불러오다 문제가 생겼어요.',
+    how: 'AutoETL이 켜져 있는지 확인하고 [다시 불러오기]를 눌러 주세요. 다른 탭의 내용은 그대로 있어요.',
+  },
+  retry: '다시 불러오기',
+} as const;
+
 export const markdownCopy = {
   image: (alt: string) => (alt ? `[그림: ${alt}]` : '[그림]'),
   tableRegion: '본문 표, 옆으로 밀어 볼 수 있어요',

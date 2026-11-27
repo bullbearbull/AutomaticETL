@@ -38,7 +38,7 @@ frontend/
   vite.config.ts          base /next/, 출력 위치, 고정 파일 이름, 개발 프록시
   public/                 그대로 복사되는 파일(favicon.svg)
   src/
-    app/                  App.tsx(위쪽 줄·탭 목록), main.tsx            [공유]
+    app/                  App.tsx(위쪽 줄·탭 목록), TabContent.tsx, main.tsx [공유]
     styles/               tokens.css(디자인 토큰), base.css              [공유]
     components/           공유 부품. components/index.ts에서 가져온다   [공유]
     copy/common.ts        여러 탭이 함께 쓰는 문구                        [공유]
@@ -105,6 +105,8 @@ frontend/
 | `VisuallyHidden`, `Icon` | 화면 낭독기 전용 글, 장식용 아이콘. |
 
 `App.tsx`는 끌어 놓기 칸 밖에 떨어진 파일을 막는다(그대로 두면 브라우저가 그 파일을 열어 화면과 읽은 결과가 모두 사라진다). 파일을 받을 곳은 `FileDropZone`이나 React Aria의 `useDrop`으로 만든다. 이들은 이벤트를 먼저 받아 취소하므로 막히지 않는다.
+
+탭 화면은 `app/TabContent.tsx`가 처음 열 때 불러온다. 탭 파일을 받지 못하거나 탭이 그리다 오류를 내면 그 탭 칸에만 오류 안내와 [다시 불러오기]가 뜨고, 다른 탭과 그 결과는 그대로 남는다.
 
 공유 도우미: `api/http.ts`의 `getJson`·`postJson`(JSON 헤더, `AbortSignal`, 실패는 모두 `AppError`), `lib/errors.ts`의 `AppError`·`errorFromResponse`·`unsupportedFileError`, `lib/files.ts`의 `readFileAsBase64`·`checkFile`·`formatBytes`, `lib/tableClipboard.ts`, `lib/markdown.ts`, `lib/korean.ts`(`withParticle('표 2', '을/를')` → "표 2를").
 

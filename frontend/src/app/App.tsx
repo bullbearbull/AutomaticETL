@@ -1,17 +1,18 @@
-import { lazy, Suspense, useEffect, useState, type ComponentType, type LazyExoticComponent } from 'react';
+import { useEffect, useState } from 'react';
 import { appCopy, tabIds, tabLabels, type TabId } from '../copy/common.ts';
 import { AppTabs, StatusBar, TrustBadge, type AppTabItem } from '../components/index.ts';
 import styles from './App.module.css';
+import { TabContent, type TabLoader } from './TabContent.tsx';
 
 /**
  * Each tab is a lazy entry with a unique file name, so the build writes its
  * code to its own assets/<Name>Tab.js and .css. Shared code stays in index.
  */
-const tabComponents: Record<TabId, LazyExoticComponent<ComponentType>> = {
-  extract: lazy(() => import('../features/extract/ExtractTab.tsx')),
-  database: lazy(() => import('../features/database/DatabaseTab.tsx')),
-  search: lazy(() => import('../features/search/SearchTab.tsx')),
-  settings: lazy(() => import('../features/settings/SettingsTab.tsx')),
+const tabLoaders: Record<TabId, TabLoader> = {
+  extract: () => import('../features/extract/ExtractTab.tsx'),
+  database: () => import('../features/database/DatabaseTab.tsx'),
+  search: () => import('../features/search/SearchTab.tsx'),
+  settings: () => import('../features/settings/SettingsTab.tsx'),
 };
 
 function TabLoading() {
@@ -43,19 +44,12 @@ export function App() {
     };
   }, []);
 
-  const items: AppTabItem<TabId>[] = tabIds.map((id) => {
-    const TabComponent = tabComponents[id];
-    return {
-      id,
-      label: tabLabels[id],
-      placement: id === 'settings' ? 'end' : 'start',
-      panel: (
-        <Suspense fallback={<TabLoading />}>
-          <TabComponent />
-        </Suspense>
-      ),
-    };
-  });
+  const items: AppTabItem<TabId>[] = tabIds.map((id) => ({
+    id,
+    label: tabLabels[id],
+    placement: id === 'settings' ? 'end' : 'start',
+    panel: <TabContent load={tabLoaders[id]} fallback={<TabLoading />} />,
+  }));
 
   return (
     <div className={styles.shell}>
