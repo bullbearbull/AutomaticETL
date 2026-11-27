@@ -2,7 +2,7 @@ import AxeBuilder from '@axe-core/playwright';
 import type { Page } from '@playwright/test';
 import { expect } from './fixtures.ts';
 
-const WCAG_TAGS = ['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'];
+const WCAG_TAGS = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'];
 
 /** Runs axe on the whole page and expects no violations, listing any it finds by rule and element. */
 export async function expectNoAxeViolations(page: Page): Promise<void> {
