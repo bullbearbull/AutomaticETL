@@ -1,4 +1,7 @@
-"""새 웹 화면(`/next/`) 정적 파일 응답·경로 검증 테스트(실제 빌드 결과 없이 임시 폴더 사용)."""
+"""새 웹 화면(`/next/`) 정적 파일 응답·경로 검증 테스트.
+
+대부분은 실제 빌드 결과 없이 임시 폴더를 쓰고, 끝의 테스트는 패키지에 든 실제 빌드 결과를 읽는다.
+"""
 
 from __future__ import annotations
 
@@ -394,3 +397,73 @@ def test_root_still_serves_classic_app_html(next_server: LocalParserUiServer) ->
     # 서버는 app.html을 텍스트로 읽으므로 CRLF로 체크아웃된 환경에서도 LF로 보낸다.
     assert body == app_html.replace(b"\r\n", b"\n")
     assert "문서 글·표 추출" in body.decode("utf-8")
+
+
+class _BuiltIndexRefs(HTMLParser):
+    """빌드된 index.html의 `<script src>`와 `<link rel href>`를 (종류, 경로)로 모은다."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refs: list[tuple[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        if tag == "script" and values.get("src"):
+            self.refs.append(("script", values["src"] or ""))
+        elif tag == "link" and values.get("href"):
+            for rel in (values.get("rel") or "").split():
+                self.refs.append((rel.lower(), values["href"] or ""))
+
+
+@pytest.fixture(scope="module")
+def built_bundle() -> static_files.StaticBundle:
+    """패키지에 든 실제 빌드 결과를 바꾸지 않고 읽은 번들. 빌드 결과가 없으면 건너뛴다."""
+    bundle = static_files.load_static_bundle()
+    if "index.html" not in bundle:
+        pytest.skip(
+            "src/autoetl/ui/static/index.html이 없다. "
+            "frontend에서 npm ci && npm run build로 빌드한 뒤 다시 실행한다."
+        )
+    return bundle
+
+
+@pytest.fixture(scope="module")
+def built_server(built_bundle: static_files.StaticBundle) -> Iterator[LocalParserUiServer]:
+    """실제 빌드 결과로 기동한 서버."""
+    with create_ui_server(host="127.0.0.1", port=0) as srv:
+        yield srv
+
+
+def test_built_next_screen_is_served(
+    built_bundle: static_files.StaticBundle, built_server: LocalParserUiServer
+) -> None:
+    """실제 빌드 결과의 index.html과 그 스크립트·스타일·modulepreload·아이콘이 모두 응답된다.
+
+    탭 결과 파일(`assets/ExtractTab.js`·`.css`)이 번들에 있고, 빌드가 만든
+    `THIRD_PARTY_LICENSES.md`는 허용 확장자가 아니라 응답하지 않는다.
+    """
+    assert "assets/ExtractTab.js" in built_bundle
+    assert "assets/ExtractTab.css" in built_bundle
+
+    status, headers, index_body = _get(built_server.port, "/next/")
+    assert status == 200
+    assert index_body == built_bundle["index.html"][0]
+    assert headers["content-type"] == "text/html; charset=utf-8"
+    assert headers["content-security-policy"] == _EXPECTED_CSP
+
+    collector = _BuiltIndexRefs()
+    collector.feed(index_body.decode("utf-8"))
+    collector.close()
+    kinds = {kind for kind, _ in collector.refs}
+    assert {"script", "stylesheet", "modulepreload", "icon"} <= kinds, collector.refs
+    for kind, ref in collector.refs:
+        assert ref.startswith("/next/"), (kind, ref)
+        status, headers, body = _get(built_server.port, ref)
+        assert status == 200, ref
+        assert headers["content-type"] == _EXPECTED_MIME[Path(ref).suffix], ref
+        assert body == built_bundle[ref.removeprefix("/next/")][0], ref
+
+    licenses = resources.files("autoetl.ui").joinpath("static").joinpath("THIRD_PARTY_LICENSES.md")
+    assert licenses.is_file()
+    assert "THIRD_PARTY_LICENSES.md" not in built_bundle
+    _assert_not_found(*_get(built_server.port, "/next/THIRD_PARTY_LICENSES.md"))
