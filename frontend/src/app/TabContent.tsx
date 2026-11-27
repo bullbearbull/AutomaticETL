@@ -119,9 +119,9 @@ export interface TabContentProps {
 }
 
 /**
- * One tab's screen, loaded the first time the tab opens. React keeps a lazy
- * component that failed failed, so [다시 불러오기] makes a new one, which asks
- * for the files again, and a new boundary.
+ * One tab's screen, loaded the first time the tab opens. A lazy component
+ * that failed stays failed in React, so [다시 불러오기] makes a new one, which
+ * asks for the files again, inside a new boundary.
  */
 export function TabContent({ source, fallback }: TabContentProps) {
   const [attempt, setAttempt] = useState(0);

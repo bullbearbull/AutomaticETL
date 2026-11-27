@@ -38,6 +38,9 @@ export function FileDropZone({
   isDisabled = false,
 }: FileDropZoneProps) {
   const handleDrop = async (event: { items: readonly DropItem[] }) => {
+    // getFile() resolves to the File that React Aria took from the drop; it
+    // does not read the file. The code that receives the files reads them and
+    // reports read errors. Folders arrive as 'directory' items and are skipped.
     const files: File[] = [];
     for (const item of event.items) {
       if (item.kind === 'file') files.push(await item.getFile());

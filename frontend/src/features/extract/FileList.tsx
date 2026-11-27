@@ -16,6 +16,7 @@ export interface FileListProps {
   reread: { name: string; onReread: () => void } | null;
 }
 
+/** As in FileDropZone: getFile() does not read the file, and folders are skipped. */
 async function filesFrom(items: readonly DropItem[]): Promise<File[]> {
   const files: File[] = [];
   for (const item of items) {
