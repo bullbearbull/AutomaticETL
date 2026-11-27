@@ -57,6 +57,7 @@ frontend/
 ### 탭을 고칠 때 건드리는 곳
 
 - 탭 하나의 작업은 그 탭의 폴더 `src/features/<탭>/`만 고친다. 서버와 주고받는 요청·응답 타입은 그 폴더의 `api.ts`에, 그 탭에서만 쓰는 문구는 `copy.ts`에 둔다. 탭의 테스트와 다시 빌드한 결과물(`src/autoetl/ui/static/`)도 같은 PR에 넣는다.
+- 탭의 단위 테스트는 `tests/unit/<탭>-*.test.ts`로 이름 짓는다(예: `tests/unit/extract-settings.test.ts`). `npm run test:unit`은 `tests/unit/` 바로 아래의 `*.test.ts`만 돌리므로 하위 폴더에 두지 않는다.
 - 탭 입구 파일 이름(`ExtractTab.tsx` 같은)은 바꾸지 않는다. `App.tsx`가 이 파일을 지연 로딩하고, 빌드가 이 이름으로 탭 결과 파일을 만든다. 입구 파일은 `export default`로 컴포넌트를 내보낸다.
 - 탭 안에서는 `import()`(동적 가져오기)를 쓰지 않는다. 결과 파일이 늘어나 다른 탭과 부딪친다.
 - 공유 부분(`app/`, `styles/`, `components/`, `copy/common.ts`, `api/http.ts`, `lib/`)은 탭 작업과 섞지 않고 **따로 PR을 낸다.** 탭에 새 공유 부품이 필요하면 그 부품을 먼저 공유 PR로 넣는다.
