@@ -82,6 +82,11 @@ test('tight list items drop the hidden paragraph; ordered lists keep start', () 
   assert.equal(show(markdownToTree('3. 셋\n4. 넷')), '<ol start=3><li>"셋"</li><li>"넷"</li></ol>');
 });
 
+test('an ordered list that starts at 1 has no start attribute', () => {
+  assert.equal(show(markdownToTree('1. 하나\n2. 둘')), '<ol><li>"하나"</li><li>"둘"</li></ol>');
+  assert.equal(show(markdownToTree('0. 영\n1. 하나')), '<ol start=0><li>"영"</li><li>"하나"</li></ol>');
+});
+
 test('code blocks keep their text as is', () => {
   const tree = markdownToTree('```\n<b>그대로</b>\n```');
   assert.equal(show(tree), '<pre><code>"<b>그대로</b>\\n"</code></pre>');

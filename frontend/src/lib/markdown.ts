@@ -114,7 +114,9 @@ function openFrame(stack: Frame[], token: Token, tag: string): void {
   }
   const attrs: MdAttrs = {};
   if (tag === 'ol') {
-    const start = Number(token.attrGet('start'));
+    // markdown-it leaves `start` out when the list starts at 1.
+    const raw = token.attrGet('start');
+    const start = raw === null ? 1 : Number(raw);
     if (Number.isInteger(start) && start !== 1) attrs.start = start;
   }
   if (tag === 'th' || tag === 'td') {
