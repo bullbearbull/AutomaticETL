@@ -1,0 +1,122 @@
+.root {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+/* The whole list area takes dropped files. */
+.drop {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+  margin: calc(var(--space-2) * -1);
+  padding: var(--space-2);
+  border: var(--border-width-strong) dashed transparent;
+  border-radius: var(--radius-panel);
+}
+
+.drop[data-drop-target] {
+  border-color: var(--color-text);
+  background: var(--color-bg-subtle);
+}
+
+.heading {
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+  font-weight: var(--font-weight-strong);
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  min-width: 0;
+  min-height: var(--target-min);
+  padding: var(--space-2);
+  border: var(--border-width) solid transparent;
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+.item[data-hovered] {
+  background: var(--color-bg-subtle);
+}
+
+/* Selected: tinted, bold name and a dark edge, so it never depends on colour alone. */
+.item[data-selected] {
+  border-color: var(--color-border-input);
+  background: var(--color-bg-subtle);
+}
+
+.item[data-selected] .name {
+  font-weight: var(--font-weight-strong);
+}
+
+.icon {
+  display: inline-flex;
+  flex: none;
+  width: 1em;
+  margin-top: 0.2em;
+  font-size: var(--font-size-small);
+}
+
+.done {
+  color: var(--color-status-done);
+}
+
+.error {
+  color: var(--color-status-error);
+}
+
+.reading,
+.queued {
+  color: var(--color-text);
+}
+
+.text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.name {
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+  overflow-wrap: anywhere;
+}
+
+.meta {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-tiny);
+  line-height: var(--line-height-tiny);
+}
+
+.metaError {
+  color: var(--color-status-error);
+}
+
+.settings {
+  min-width: 0;
+}
+
+.reread {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+/* Never display: none, so screen readers keep the live region. */
+.rereadText {
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+}
