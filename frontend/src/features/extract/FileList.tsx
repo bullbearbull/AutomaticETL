@@ -73,7 +73,8 @@ export function FileList({ entries, selectedId, onSelect, onFiles, settings, rer
                 <EntryIcon status={entry.status} />
               </span>
               <span className={styles.text}>
-                <span className={styles.name}>{entry.name}</span>
+                {/* The space keeps name and note apart in the text, so the visible text stays inside the label. */}
+                <span className={styles.name}>{entry.name}</span>{' '}
                 <span className={`${styles.meta} ${entry.status === 'error' ? styles.metaError : ''}`}>
                   {entryMeta(entry)}
                 </span>
