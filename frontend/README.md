@@ -67,6 +67,7 @@ frontend/
 
 - 결과는 `src/autoetl/ui/static/`에 쓰고 저장소에 커밋한다. 파일 이름에 해시를 붙이지 않고, 같은 소스는 늘 같은 바이트로 빌드된다. CI가 다시 빌드해 커밋된 결과와 같은지 확인한다.
 - 공유 코드는 `assets/index.js`와 `assets/index.css`에, 탭 폴더의 코드는 그 탭의 `assets/<이름>Tab.js`와 `assets/<이름>Tab.css`에 들어간다. 그래서 탭 폴더 안의 줄을 고치면 그 탭의 결과 파일만 바뀐다. 다만 탭이 그동안 아무도 쓰지 않던 공유 부품이나 라이브러리 기능을 처음 쓰면 `assets/index.js`도 바뀐다.
+- 탭이 `react` 같은 CommonJS 패키지를 직접 가져오면 `assets/rolldown-runtime.js`가 생긴다. 여러 결과 파일이 함께 쓰는 번들러 실행 도우미(CommonJS 모듈을 ES 모듈로 바꾸는 함수 등)다. 이름은 고정이고, `index.html`이 `modulepreload`로 미리 불러온다.
 - `THIRD_PARTY_LICENSES.md`는 빌드가 번들에 들어간 패키지의 라이선스를 모아 쓴 파일이다. 손대지 않는다.
 - 새 main으로 리베이스한 뒤에는 `npm ci && npm run build`를 다시 실행하고 그 결과를 커밋한다. **`src/autoetl/ui/static/` 아래 파일은 충돌이 나도 손으로 합치지 않는다.** 다시 빌드한 결과가 정답이다.
 
