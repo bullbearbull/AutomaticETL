@@ -56,6 +56,8 @@ test('safeHref checks the scheme after removing control characters', () => {
   assert.equal(safeHref(' javascript:alert(1)'), undefined);
   assert.equal(safeHref('//evil.example/x'), undefined);
   assert.equal(safeHref('/\\evil.example'), undefined);
+  assert.equal(safeHref('\\/evil.example/x'), undefined);
+  assert.equal(safeHref('\\\\evil.example/x'), undefined);
   assert.equal(safeHref('mailto:someone@example.com'), 'mailto:someone@example.com');
   assert.equal(safeHref('HTTPS://example.com'), 'HTTPS://example.com');
   assert.equal(safeHref('tables/table_1.csv'), 'tables/table_1.csv');

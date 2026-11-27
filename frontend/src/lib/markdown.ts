@@ -86,7 +86,8 @@ export function safeHref(raw: string | null | undefined): string | undefined {
     return SAFE_SCHEMES.has(scheme[1]!.toLowerCase()) ? raw.trim() : undefined;
   }
   // `//host/path` is protocol-relative: it would leave this PC's page.
-  if (cleaned.startsWith('//') || cleaned.startsWith('\\\\') || cleaned.startsWith('/\\')) return undefined;
+  // Browsers read `\` as `/` here, so any mix of the two counts.
+  if (/^[/\\]{2}/.test(cleaned)) return undefined;
   return raw.trim();
 }
 
