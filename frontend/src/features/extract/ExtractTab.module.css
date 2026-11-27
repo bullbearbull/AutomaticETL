@@ -11,3 +11,9 @@
   bottom: 0;
   min-width: 0;
 }
+
+/* Focus never lands under the sticky status line (WCAG 2.4.11). The tab
+   sets --extract-status-height to the line's measured height. */
+.root * {
+  scroll-margin-bottom: calc(var(--extract-status-height, 0px) + var(--space-2));
+}

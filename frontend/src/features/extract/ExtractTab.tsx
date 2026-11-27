@@ -40,6 +40,8 @@ export default function ExtractTab() {
 
   const nextId = useRef(0);
   const running = useRef<{ id: string; controller: AbortController } | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const statusRef = useRef<HTMLDivElement>(null);
   const resultHeading = useRef<HTMLHeadingElement>(null);
   const startHeading = useRef<HTMLHeadingElement>(null);
   const pendingFocus = useRef<FocusTarget | null>(null);
@@ -70,6 +72,19 @@ export default function ExtractTab() {
 
   // Stop a read in progress when the tab goes away.
   useEffect(() => () => running.current?.controller.abort(), []);
+
+  // A control scrolled into view by focus stays clear of the sticky status
+  // line, whose height changes as its text wraps (see ExtractTab.module.css).
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    const status = statusRef.current;
+    if (!root || !status) return undefined;
+    const measure = () => root.style.setProperty('--extract-status-height', `${status.offsetHeight}px`);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(status);
+    return () => observer.disconnect();
+  }, []);
 
   // Move focus where the user expects it after a change that removed the
   // focused control; and never leave focus on <body>.
@@ -142,6 +157,7 @@ export default function ExtractTab() {
 
   return (
     <div
+      ref={rootRef}
       className={styles.root}
       onFocus={(event) => {
         lastFocused.current = event.target;
@@ -197,7 +213,7 @@ export default function ExtractTab() {
       )}
 
       {/* One status line for both screens, so its live region stays in place and every change is read out. */}
-      <div className={styles.status}>
+      <div ref={statusRef} className={styles.status}>
         <StatusBar message={status.message} tone={status.tone} startedAt={status.startedAt} endedAt={status.endedAt} />
       </div>
     </div>
