@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import type { Page, Response } from '@playwright/test';
-import { exportCopy, rereadCopy } from '../src/features/extract/copy.ts';
+import { exportCopy, quoted, rereadCopy } from '../src/features/extract/copy.ts';
 import { openWithDocx, parseThroughApi, statusLine } from './support/app.ts';
 import { docxFile } from './support/docx.ts';
 import { expect, test } from './support/fixtures.ts';
@@ -34,7 +34,7 @@ test('[ZIP으로 저장하기] saves the ZIP under the name the server gives', a
 
   const saved = await readFile(await (await download).path());
   expect(saved.subarray(0, 4)).toEqual(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
-  await expect(statusLine(page, exportCopy.saveStarted)).toBeVisible();
+  await expect(statusLine(page, exportCopy.saveStarted(serverName))).toBeVisible();
 });
 
 test('a ZIP the server has dropped offers [다시 읽기] and saves nothing', async ({ page, request }) => {
@@ -58,6 +58,8 @@ test('a ZIP the server has dropped offers [다시 읽기] and saves nothing', as
   await expect(page.getByRole('button', { name: rereadCopy.button, exact: true })).toBeFocused();
   await expect(statusLine(page, exportCopy.zipMissing)).toBeVisible();
   await expect(page.getByRole('button', { name: exportCopy.saveZip })).toHaveCount(0);
-  await expect(statusLine(page, exportCopy.saveStarted)).toHaveCount(0);
+  // The save message for any file name: its text after the quoted name.
+  const savedTail = exportCopy.saveStarted('').slice(quoted('').length);
+  await expect(statusLine(page, savedTail)).toHaveCount(0);
   expect(downloads).toBe(0);
 });

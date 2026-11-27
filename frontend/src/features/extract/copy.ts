@@ -238,7 +238,8 @@ export const exportCopy = {
   saveZip: 'ZIP으로 저장하기',
   copied: '본문을 복사했어요. 붙여 넣으면 돼요.',
   copyFailed: '본문을 복사하지 못했어요. 본문을 직접 골라 복사해 주세요.',
-  saveStarted: 'ZIP 파일 저장을 시작했어요. 브라우저가 파일을 저장하는 폴더에서 찾을 수 있어요.',
+  /** The server always names the ZIP `…_autoetl_bundle.zip`, and "zip" is read 집, so 으로. */
+  saveStarted: (fileName: string) => `${quoted(fileName)}으로 저장해요. 보통 “다운로드” 폴더에 들어가요.`,
   expired: '이 파일의 ZIP은 더 이상 남아 있지 않아요. 다시 읽으면 새로 만들어요.',
   zipMissing: 'ZIP 파일이 남아 있지 않아 저장하지 못했어요.',
   zipFailed: 'ZIP 파일을 받지 못했어요. AutoETL이 켜져 있는지 확인하고 다시 눌러 주세요.',

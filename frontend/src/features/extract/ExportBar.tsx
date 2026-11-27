@@ -115,7 +115,7 @@ export function ExportBar({
         saveBlob(outcome.blob, outcome.fileName);
         onZipFetched();
         onExported();
-        show(exportCopy.saveStarted, true);
+        show(exportCopy.saveStarted(outcome.fileName), true);
         return;
       case 'missing':
         onZipMissing();
