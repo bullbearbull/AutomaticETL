@@ -102,4 +102,19 @@ test('[엑셀용으로 복사하기] puts TSV and an HTML table on the clipboard
   expect(html).toMatch(/<table[\s>]/);
   for (const cell of docxText.table[0]) expect(html).toContain(`<th>${cell}</th>`);
   for (const cell of docxText.table[1]) expect(html).toContain(`<td>${cell}</td>`);
+
+  // A second copy empties the line before the same message comes back, so
+  // screen readers read it again. An unchanged line would not be read.
+  await status.evaluate((line) => {
+    const seen = { emptied: false };
+    (window as unknown as { copyLine: typeof seen }).copyLine = seen;
+    new MutationObserver((records) => {
+      if (records.some((record) => record.removedNodes.length > 0)) seen.emptied = true;
+    }).observe(line, { childList: true });
+  });
+  await body.getByRole('button', { name: buttonCopy.copyForExcel }).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { copyLine: { emptied: boolean } }).copyLine.emptied))
+    .toBe(true);
+  await expect(status).toContainText(message);
 });

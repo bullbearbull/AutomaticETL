@@ -39,7 +39,9 @@ export function DataTable({ name, columns, rows, copyable = true, onCopied }: Da
     });
 
   const handleCopy = async () => {
+    // Clear the last message, so the same message after this copy is read out again.
     window.clearTimeout(timer.current);
+    setMessage(null);
     try {
       const all = columns ? [columns, ...rows] : rows;
       const result = await copyTable(all, { headerRows: columns ? 1 : 0 });
