@@ -54,7 +54,9 @@ test('a ZIP the server has dropped offers [다시 읽기] and saves nothing', as
   expect((await response).status()).toBe(404);
 
   await expect(page.getByText(exportCopy.expired)).toBeVisible();
-  await expect(page.getByRole('button', { name: rereadCopy.button, exact: true })).toBeVisible();
+  // The pressed button becomes [다시 읽기] and keeps focus.
+  await expect(page.getByRole('button', { name: rereadCopy.button, exact: true })).toBeFocused();
+  await expect(statusLine(page, exportCopy.zipMissing)).toBeVisible();
   await expect(page.getByRole('button', { name: exportCopy.saveZip })).toHaveCount(0);
   await expect(statusLine(page, exportCopy.saveStarted)).toHaveCount(0);
   expect(downloads).toBe(0);

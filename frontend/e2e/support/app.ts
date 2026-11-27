@@ -55,7 +55,8 @@ export async function openWithDocx(page: Page): Promise<void> {
  * `Input.dispatchDragEvent`), the way a file dragged from the desktop
  * arrives. CDP drags take file paths, so each file is written to its own
  * folder under the test's output folder and keeps its name. Use ASCII
- * names: in a non-UTF-8 locale Chromium drops a non-ASCII path silently.
+ * names: when the locale is not UTF-8 (for example LC_ALL=C), Chromium
+ * silently drops a path it cannot encode.
  */
 export async function dropFiles(page: Page, target: Locator, files: readonly FilePayload[], testInfo: TestInfo) {
   const paths: string[] = [];

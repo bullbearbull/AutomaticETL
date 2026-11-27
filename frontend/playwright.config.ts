@@ -18,6 +18,10 @@ export default defineConfig({
     baseURL: ORIGIN,
     trace: 'off',
     locale: 'ko-KR',
+    // On Linux, Chromium encodes file names with the locale's character set.
+    // In a C/POSIX locale a Korean download name falls back to "download",
+    // so give the browser a UTF-8 character type, as a desktop session has.
+    ...(process.platform === 'linux' ? { launchOptions: { env: { ...process.env, LC_CTYPE: 'C.UTF-8' } } } : {}),
   },
   projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
   webServer: {
