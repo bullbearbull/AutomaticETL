@@ -103,6 +103,8 @@ frontend/
 | `ComingSoon` | 준비 중인 탭. 지금 화면(`/`)으로 가는 링크를 보여 준다. |
 | `VisuallyHidden`, `Icon` | 화면 낭독기 전용 글, 장식용 아이콘. |
 
+`App.tsx`는 끌어 놓기 칸 밖에 떨어진 파일을 막는다(그대로 두면 브라우저가 그 파일을 열어 화면과 읽은 결과가 모두 사라진다). 파일을 받을 곳은 `FileDropZone`이나 React Aria의 `useDrop`으로 만든다. 이들은 이벤트를 먼저 받아 취소하므로 막히지 않는다.
+
 공유 도우미: `api/http.ts`의 `getJson`·`postJson`(JSON 헤더, `AbortSignal`, 실패는 모두 `AppError`), `lib/errors.ts`의 `AppError`·`errorFromResponse`·`unsupportedFileError`, `lib/files.ts`의 `readFileAsBase64`·`checkFile`·`formatBytes`, `lib/tableClipboard.ts`, `lib/markdown.ts`, `lib/korean.ts`(`withParticle('표 2', '을/를')` → "표 2를").
 
 ## 문구
