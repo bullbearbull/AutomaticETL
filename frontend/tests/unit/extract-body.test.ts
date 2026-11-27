@@ -95,6 +95,13 @@ test('blank lines inside fenced code are kept; runs outside are still squeezed',
   assert.equal(body.copyText, expected);
 });
 
+test('a code fence left open at the end keeps its last lines as they are', () => {
+  const markdown = ['앞 문단', '', '```text', 'first', '', ''].join('\n');
+  const body = buildBody({ markdown, tables: [], visuals: [], unit: 'page' });
+  assert.deepEqual(body.segments, [{ kind: 'text', markdown }]);
+  assert.equal(body.copyText, markdown);
+});
+
 test('a figure the vision step described becomes a figure part', () => {
   const markdown = ['<!-- p001_v01: vector_diagram via local -->', '*흐름도*', '<sub>시각 해석: `local`</sub>', '', '설명 글'].join('\n');
   const body = buildBody({

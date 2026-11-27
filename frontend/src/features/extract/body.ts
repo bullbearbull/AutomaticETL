@@ -65,7 +65,8 @@ const BLANK = /^[ \t]*$/;
 
 /**
  * Joins lines, drops blank lines at both ends and squeezes runs of blank
- * lines into one. Lines inside a code fence are kept exactly as they are.
+ * lines into one. Lines inside a code fence are kept exactly as they are,
+ * also when the fence is left open and runs to the end.
  */
 function tidy(lines: readonly string[]): string {
   const kept: string[] = [];
@@ -89,7 +90,8 @@ function tidy(lines: readonly string[]): string {
       fence = { char: marker[0] as string, size: marker.length };
     }
   }
-  return kept.join('\n').trimEnd();
+  const text = kept.join('\n');
+  return fence === null ? text.trimEnd() : text;
 }
 
 /** Whether a table's markdown starts with the "이전 페이지 표에서 이어짐" note. */
