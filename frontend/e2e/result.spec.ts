@@ -73,6 +73,12 @@ test('[엑셀용으로 복사하기] puts TSV and an HTML table on the clipboard
   await openWithDocx(page);
   const body = resultRegion(page).getByRole('tabpanel', { name: resultCopy.body });
 
+  // The empty result line is already in the accessibility tree, as a live
+  // region must be for screen readers to read a new message.
+  const status = body.getByRole('figure').filter({ hasText: resultCopy.tableName(1) }).getByRole('status');
+  await expect(status).toHaveCount(1);
+  await expect(status).toBeEmpty();
+
   // Start from a known clipboard, so a copy that silently did nothing fails.
   await page.evaluate(() => navigator.clipboard.writeText('-'));
   await body.getByRole('button', { name: buttonCopy.copyForExcel }).click();
