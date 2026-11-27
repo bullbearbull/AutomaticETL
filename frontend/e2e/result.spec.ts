@@ -1,6 +1,6 @@
 import { buttonCopy, tableCopy, workspaceCopy } from '../src/copy/common.ts';
-import { evidenceCopy, resultCopy, routingCopy, unitCopy } from '../src/features/extract/copy.ts';
-import { openWithDocx, resultRegion } from './support/app.ts';
+import { evidenceCopy, exportCopy, resultCopy, routingCopy, unitCopy } from '../src/features/extract/copy.ts';
+import { openWithDocx, resultRegion, statusLine } from './support/app.ts';
 import { DOCX_NAME, docxText } from './support/docx.ts';
 import { expect, test } from './support/fixtures.ts';
 import { ORIGIN } from './support/server.ts';
@@ -117,4 +117,33 @@ test('[엑셀용으로 복사하기] puts TSV and an HTML table on the clipboard
     .poll(() => page.evaluate(() => (window as unknown as { copyLine: { emptied: boolean } }).copyLine.emptied))
     .toBe(true);
   await expect(status).toContainText(message);
+});
+
+test('[본문 복사하기] copies the body, and a second copy is read out again', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: ORIGIN });
+  await openWithDocx(page);
+
+  // Start from a known clipboard, so a copy that silently did nothing fails.
+  await page.evaluate(() => navigator.clipboard.writeText('-'));
+  const copy = page.getByRole('button', { name: exportCopy.copyBody });
+  await copy.click();
+
+  const line = statusLine(page, exportCopy.copied);
+  await expect(line).toBeVisible();
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toContain(docxText.paragraph);
+
+  // A second copy empties the line before the same message comes back, so
+  // screen readers read it again. An unchanged line would not be read.
+  await line.evaluate((element) => {
+    const seen = { emptied: false };
+    (window as unknown as { bodyLine: typeof seen }).bodyLine = seen;
+    new MutationObserver((records) => {
+      if (records.some((record) => record.removedNodes.length > 0)) seen.emptied = true;
+    }).observe(element, { childList: true });
+  });
+  await copy.click();
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { bodyLine: { emptied: boolean } }).bodyLine.emptied))
+    .toBe(true);
+  await expect(line).toContainText(exportCopy.copied);
 });

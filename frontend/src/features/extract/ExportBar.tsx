@@ -86,6 +86,9 @@ export function ExportBar({
   };
 
   const copyBody = async () => {
+    // Clear the last message, so the same message after this copy is read out again.
+    window.clearTimeout(timer.current);
+    setMessage(null);
     try {
       if (!navigator.clipboard) throw new Error('clipboard unavailable');
       await navigator.clipboard.writeText(copyText);
