@@ -1,12 +1,12 @@
 /**
- * Requests and responses of `POST /api/parse` and the ZIP link
- * `GET /api/download/<bundle_id>`. The response is checked field by field,
- * so a missing or odd value becomes an empty one instead of breaking the
- * screen.
+ * Requests and responses of `POST /api/parse` and of the ZIP at
+ * `GET /api/download/<bundle_id>`. The parse response is checked field by
+ * field, so a missing or odd value becomes an empty one instead of breaking
+ * the screen.
  */
 import { postJson, type RequestOptions } from '../../api/http.ts';
 import { errorCopy } from '../../copy/common.ts';
-import { AppError } from '../../lib/errors.ts';
+import { AppError, isAbortError } from '../../lib/errors.ts';
 import { extractErrorCopy } from './copy.ts';
 
 /** `options` of POST /api/parse. */
@@ -99,9 +99,83 @@ export async function parseDocument(request: ParseRequest, options: RequestOptio
   return normalizeParseResponse(raw);
 }
 
-/** The ZIP link of a result. */
+/** Where the ZIP of a result is fetched from. */
 export function downloadPath(bundleId: string): string {
   return `/api/download/${encodeURIComponent(bundleId)}`;
+}
+
+/** The name a saved ZIP gets when the server sends none. */
+export const ZIP_FALLBACK_NAME = 'autoetl_bundle.zip';
+
+/** The last part of a path, so a name can never point into a folder. */
+function baseName(name: string): string {
+  return (name.split(/[\\/]/).pop() ?? '').trim();
+}
+
+/**
+ * The file name in a Content-Disposition header: `filename*=UTF-8''…`
+ * first, then `filename="…"`, then ZIP_FALLBACK_NAME.
+ */
+export function zipFileName(contentDisposition: string | null): string {
+  const header = contentDisposition ?? '';
+  const extended = /(?:^|;)\s*filename\*\s*=\s*([^';]*)'[^';]*'([^;]*)/i.exec(header);
+  if (extended && (extended[1] ?? '').trim().toLowerCase() === 'utf-8') {
+    try {
+      const name = baseName(decodeURIComponent((extended[2] ?? '').trim()));
+      if (name) return name;
+    } catch {
+      // A broken %-escape: use the plain name below.
+    }
+  }
+  const plain = /(?:^|;)\s*filename\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;\s]+))/i.exec(header);
+  if (plain) {
+    const name = baseName((plain[1] ?? plain[2] ?? '').replace(/\\(.)/g, '$1'));
+    if (name) return name;
+  }
+  return ZIP_FALLBACK_NAME;
+}
+
+/** What GET /api/download/<bundle_id> gave back. */
+export type ZipOutcome =
+  | { type: 'ok'; blob: Blob; fileName: string }
+  /** 404: the server no longer keeps this ZIP. */
+  | { type: 'missing' }
+  /** No answer, or another status. `status` is `null` when no answer came. */
+  | { type: 'failed'; status: number | null }
+  /** Cancelled because the export bar went away. */
+  | { type: 'aborted' };
+
+/** The browser part of fetchZip, swapped out in tests. */
+export interface ZipDeps {
+  fetch: (url: string, init: RequestInit) => Promise<Response>;
+}
+
+export const browserZipDeps: ZipDeps = {
+  fetch: (url, init) => fetch(url, init),
+};
+
+/**
+ * Fetches the ZIP of a result and sorts out the answer. The server keeps
+ * only the last 10 ZIPs it made, for the classic page and other tools too,
+ * and forgets them all when it restarts, so asking is the only sure way to
+ * know this ZIP is still there.
+ */
+export async function fetchZip(bundleId: string, signal: AbortSignal, deps: ZipDeps = browserZipDeps): Promise<ZipOutcome> {
+  let response: Response;
+  try {
+    response = await deps.fetch(downloadPath(bundleId), { credentials: 'same-origin', signal });
+  } catch (error) {
+    return signal.aborted || isAbortError(error) ? { type: 'aborted' } : { type: 'failed', status: null };
+  }
+  if (response.status === 404) return { type: 'missing' };
+  if (response.status !== 200) return { type: 'failed', status: response.status };
+  try {
+    const blob = await response.blob();
+    if (signal.aborted) return { type: 'aborted' };
+    return { type: 'ok', blob, fileName: zipFileName(response.headers.get('Content-Disposition')) };
+  } catch (error) {
+    return signal.aborted || isAbortError(error) ? { type: 'aborted' } : { type: 'failed', status: response.status };
+  }
 }
 
 /** Image data URLs the screen shows; anything else is dropped. */

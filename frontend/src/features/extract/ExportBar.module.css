@@ -22,27 +22,12 @@
   gap: var(--space-2);
 }
 
-/* A link that looks like the primary button (one per screen). */
-.zip {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-height: var(--control-height-primary);
-  padding: var(--space-1) var(--space-4);
-  border: var(--border-width) solid var(--color-text);
-  border-radius: var(--radius-control);
-  background: var(--color-text);
-  color: var(--color-text-inverse);
-  font-size: var(--font-size-body);
-  line-height: var(--line-height-small);
-  font-weight: var(--font-weight-strong);
-  text-decoration: none;
-  transition: background-color var(--duration-fast);
-}
-
-.zip:hover,
-.zip:active {
-  background: var(--color-primary-hover);
+/* While the ZIP is being fetched the button keeps focus but looks unavailable. */
+.zip[data-pending] {
+  border-color: var(--color-border-input);
+  background: var(--color-bg-subtle);
+  color: var(--color-text-secondary);
+  cursor: progress;
 }
 
 .expired,

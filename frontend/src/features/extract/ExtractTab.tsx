@@ -202,6 +202,7 @@ export default function ExtractTab() {
                 expired={isZipExpired(state, selected)}
                 onExported={() => dispatch({ type: 'exported', id: selected.id })}
                 onZipFetched={() => dispatch({ type: 'zipFetched', id: selected.id })}
+                onZipMissing={() => dispatch({ type: 'zipMissing', id: selected.id })}
                 onReread={() => rereadEntry(selected.id)}
               />
             ) : undefined

@@ -236,3 +236,27 @@ test(`a ZIP is gone once ${SERVER_KEEPS_ZIPS} newer ZIPs were made, unless it wa
   ], fetched);
   assert.equal(isZipExpired(refreshed, refreshed.entries[0]!), false);
 });
+
+test('a ZIP the server no longer has is gone until the file is read again', () => {
+  const done = run([
+    { type: 'add', files: [file('a', '가.pdf'), file('b', '나.pdf')] },
+    { type: 'start', id: 'a', settings: DEFAULT_SETTINGS, now: 1 },
+    { type: 'succeed', id: 'a', result: RESULT, now: 2 },
+    { type: 'start', id: 'b', settings: DEFAULT_SETTINGS, now: 3 },
+    { type: 'succeed', id: 'b', result: RESULT, now: 4 },
+  ]);
+  assert.equal(isZipExpired(done, done.entries[0]!), false);
+  const missing = run([{ type: 'zipMissing', id: 'a' }], done);
+  assert.equal(isZipExpired(missing, missing.entries[0]!), true);
+  assert.equal(isZipExpired(missing, missing.entries[1]!), false);
+  assert.equal(run([{ type: 'zipMissing', id: 'a' }], missing).entries[0], missing.entries[0]);
+  // Fetching cannot bring it back; a new read makes a new ZIP.
+  const fetched = run([{ type: 'zipFetched', id: 'a' }], missing);
+  assert.equal(isZipExpired(fetched, fetched.entries[0]!), true);
+  const reread = run([
+    { type: 'retry', id: 'a' },
+    { type: 'start', id: 'a', settings: DEFAULT_SETTINGS, now: 5 },
+    { type: 'succeed', id: 'a', result: RESULT, now: 6 },
+  ], missing);
+  assert.equal(isZipExpired(reread, reread.entries[0]!), false);
+});

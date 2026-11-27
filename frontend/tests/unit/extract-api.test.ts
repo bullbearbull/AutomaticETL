@@ -2,10 +2,14 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   downloadPath,
+  fetchZip,
   normalizeParseResponse,
   parseDocument,
   safeImageDataUrl,
+  ZIP_FALLBACK_NAME,
+  zipFileName,
   type ParseRequest,
+  type ZipDeps,
 } from '../../src/features/extract/api.ts';
 import { AppError } from '../../src/lib/errors.ts';
 import { sampleRaw, TINY_PNG } from './extract-sample.ts';
@@ -100,4 +104,97 @@ test('parseDocument turns a 422 into an AppError', async () => {
     parseDocument({ filename: 'a.pdf', content_base64: 'JVBERi0=', options: {} as never }, { fetchImpl }),
     (error: unknown) => error instanceof AppError && error.kind === 'unreadable' && error.status === 422,
   );
+});
+
+/** The header the local server sends: an ASCII name and the UTF-8 name. */
+function disposition(utf8Name: string, asciiName = 'autoetl_bundle.zip'): string {
+  return `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(utf8Name)}`;
+}
+
+test('the saved ZIP takes the UTF-8 name first', () => {
+  assert.equal(zipFileName(disposition('문서관리_규정_예시_autoetl_bundle.zip')), '문서관리_규정_예시_autoetl_bundle.zip');
+  assert.equal(zipFileName(`ATTACHMENT; FILENAME*=utf-8'ko'${encodeURIComponent('표 모음.zip')}`), '표 모음.zip');
+});
+
+test('without a usable UTF-8 name the plain name is used', () => {
+  assert.equal(zipFileName('attachment; filename="report.zip"'), 'report.zip');
+  assert.equal(zipFileName('attachment; filename=plain.zip'), 'plain.zip');
+  assert.equal(zipFileName('attachment; filename="a \\"b\\".zip"'), 'a "b".zip');
+  // A broken %-escape and a charset other than UTF-8 are skipped.
+  assert.equal(zipFileName(`attachment; filename="safe.zip"; filename*=UTF-8''%E0%A4%A.zip`), 'safe.zip');
+  assert.equal(zipFileName(`attachment; filename="latin.zip"; filename*=ISO-8859-1''%E9t%E9.zip`), 'latin.zip');
+});
+
+test('without any name the ZIP gets the fallback name', () => {
+  assert.equal(ZIP_FALLBACK_NAME, 'autoetl_bundle.zip');
+  assert.equal(zipFileName(null), ZIP_FALLBACK_NAME);
+  assert.equal(zipFileName('attachment'), ZIP_FALLBACK_NAME);
+  assert.equal(zipFileName(`attachment; filename*=UTF-8''%ZZ`), ZIP_FALLBACK_NAME);
+  assert.equal(zipFileName('attachment; filename=""'), ZIP_FALLBACK_NAME);
+});
+
+test('a ZIP name never points into a folder', () => {
+  assert.equal(zipFileName(`attachment; filename*=UTF-8''${encodeURIComponent('../../결과.zip')}`), '결과.zip');
+  assert.equal(zipFileName('attachment; filename="C:\\\\temp\\\\x.zip"'), 'x.zip');
+});
+
+const ZIP_BYTES = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00]);
+
+function zipDeps(answer: () => Promise<Response>, seen: { url?: string; init?: RequestInit } = {}): ZipDeps {
+  return {
+    fetch: async (url, init) => {
+      seen.url = url;
+      seen.init = init;
+      return answer();
+    },
+  };
+}
+
+test('fetchZip asks for the ZIP and hands back its bytes and name', async () => {
+  const seen: { url?: string; init?: RequestInit } = {};
+  const controller = new AbortController();
+  const deps = zipDeps(
+    async () =>
+      new Response(ZIP_BYTES, {
+        status: 200,
+        headers: { 'Content-Type': 'application/zip', 'Content-Disposition': disposition('예시_autoetl_bundle.zip') },
+      }),
+    seen,
+  );
+  const outcome = await fetchZip('6dec1208d4cdf8e2bfadfc3c', controller.signal, deps);
+  assert.equal(seen.url, '/api/download/6dec1208d4cdf8e2bfadfc3c');
+  assert.equal(seen.init?.credentials, 'same-origin');
+  assert.equal(seen.init?.signal, controller.signal);
+  assert.equal(outcome.type, 'ok');
+  if (outcome.type !== 'ok') return;
+  assert.equal(outcome.fileName, '예시_autoetl_bundle.zip');
+  assert.deepEqual(new Uint8Array(await outcome.blob.arrayBuffer()), ZIP_BYTES);
+});
+
+test('fetchZip tells a ZIP the server forgot (404) from other failures', async () => {
+  const signal = new AbortController().signal;
+  const notFound = zipDeps(async () => new Response(JSON.stringify({ error: '요청한 번들을 찾을 수 없다.' }), { status: 404 }));
+  assert.deepEqual(await fetchZip('abc', signal, notFound), { type: 'missing' });
+  const broken = zipDeps(async () => new Response('', { status: 500 }));
+  assert.deepEqual(await fetchZip('abc', signal, broken), { type: 'failed', status: 500 });
+  const offline = zipDeps(async () => {
+    throw new TypeError('Failed to fetch');
+  });
+  assert.deepEqual(await fetchZip('abc', signal, offline), { type: 'failed', status: null });
+});
+
+test('fetchZip reports a cancelled request as aborted', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const cancelled = zipDeps(async () => {
+    throw new DOMException('The operation was aborted.', 'AbortError');
+  });
+  assert.deepEqual(await fetchZip('abc', controller.signal, cancelled), { type: 'aborted' });
+  // Cancelled while the bytes were coming in.
+  const late = new AbortController();
+  const slow = zipDeps(async () => {
+    late.abort();
+    return new Response(ZIP_BYTES, { status: 200 });
+  });
+  assert.deepEqual(await fetchZip('abc', late.signal, slow), { type: 'aborted' });
 });

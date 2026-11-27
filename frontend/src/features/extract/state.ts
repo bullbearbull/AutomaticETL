@@ -31,6 +31,8 @@ export interface ExtractEntry {
   exported: boolean;
   /** `zipCount` when this result's ZIP was made or last fetched; see isZipExpired. */
   zipMark: number;
+  /** The server answered 404 for this result's ZIP. */
+  zipGone: boolean;
 }
 
 export interface ExtractState {
@@ -49,13 +51,17 @@ export type ExtractAction =
   | { type: 'remove'; id: string }
   | { type: 'select'; id: string }
   | { type: 'exported'; id: string }
-  | { type: 'zipFetched'; id: string };
+  | { type: 'zipFetched'; id: string }
+  | { type: 'zipMissing'; id: string };
 
 export const initialState: ExtractState = { entries: [], selectedId: null, zipCount: 0 };
 
 /**
- * The server keeps the last 10 ZIPs (`_MAX_CACHED_BUNDLES`) and drops the
- * least recently used one. Once 10 newer ZIPs exist, this one is gone.
+ * The server keeps the last 10 ZIPs it made (`_MAX_CACHED_BUNDLES`) and drops
+ * the least recently used one. Once this tab has made 10 newer ZIPs, this one
+ * is surely gone. It can be gone earlier too: the classic page and other
+ * tools fill the same store, and a restart empties it. So the count is
+ * only an early hint; the ZIP button asks the server (zipMissing).
  */
 export const SERVER_KEEPS_ZIPS = 10;
 
@@ -86,6 +92,7 @@ export function extractReducer(state: ExtractState, action: ExtractAction): Extr
         error: file.error,
         exported: false,
         zipMark: 0,
+        zipGone: false,
       }));
       const selected = state.entries.find((entry) => entry.id === state.selectedId);
       // Keep showing a result the user is looking at; otherwise show the new file.
@@ -117,6 +124,7 @@ export function extractReducer(state: ExtractState, action: ExtractAction): Extr
         result: action.result,
         error: null,
         zipMark: zipCount,
+        zipGone: false,
       }));
       return { ...next, zipCount };
     }
@@ -149,6 +157,8 @@ export function extractReducer(state: ExtractState, action: ExtractAction): Extr
       return update(state, action.id, (entry) => (entry.exported ? entry : { ...entry, exported: true }));
     case 'zipFetched':
       return update(state, action.id, (entry) => ({ ...entry, zipMark: state.zipCount }));
+    case 'zipMissing':
+      return update(state, action.id, (entry) => (entry.zipGone ? entry : { ...entry, zipGone: true }));
     default:
       return state;
   }
@@ -179,9 +189,9 @@ export function entryMeta(entry: ExtractEntry): string {
   }
 }
 
-/** Whether the server has surely dropped this result's ZIP. */
+/** Whether the server has surely dropped this result's ZIP: it said so, or 10 newer ZIPs exist. */
 export function isZipExpired(state: ExtractState, entry: ExtractEntry): boolean {
-  return entry.status === 'done' && state.zipCount - entry.zipMark >= SERVER_KEEPS_ZIPS;
+  return entry.status === 'done' && (entry.zipGone || state.zipCount - entry.zipMark >= SERVER_KEEPS_ZIPS);
 }
 
 export interface StatusLine {
