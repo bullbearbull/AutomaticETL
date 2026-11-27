@@ -28,7 +28,7 @@ npm ci
 
 빌드 결과를 실제 서버로 확인하려면 `npm run build` 뒤에 `uv run autoetl ui`를 실행하고 `http://127.0.0.1:8765/next/`를 연다.
 
-`test:e2e`에는 Playwright 브라우저가 필요하다. 처음 한 번 `npx playwright install chromium`으로 설치한다. `@playwright/test`와 `playwright-core`는 같은 버전으로 함께 올린다(`@axe-core/playwright`가 `playwright-core`의 타입을 쓰기 때문이다).
+`test:e2e`는 저장소 루트에서 `uv run --frozen autoetl ui --port 8799 --no-browser`로 실제 서버를 띄우고, 그 서버가 주는 빌드 결과(`/next/`)를 Chromium으로 조작한다. 그래서 먼저 저장소 루트에서 `uv sync --frozen`을, 이 폴더에서 `npm run build`를 실행해 둔다. 로컬에서는 8799 포트에 이미 떠 있는 서버를 그대로 쓴다. Playwright 브라우저는 처음 한 번 `npx playwright install chromium`으로 설치한다. 실패하면 `playwright-report/`에 보고서가 남는다(`npx playwright show-report`). `@playwright/test`와 `playwright-core`는 같은 버전으로 함께 올린다(`@axe-core/playwright`가 `playwright-core`의 타입을 쓰기 때문이다).
 
 ## 폴더 구성
 
