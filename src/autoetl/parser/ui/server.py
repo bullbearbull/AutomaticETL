@@ -4,6 +4,8 @@
 - 기본 바인딩은 `127.0.0.1` 루프백으로 고정하며, 외부 네트워크 바인딩을 기본 차단한다.
 - 업로드 파일은 요청 단위 임시 디렉터리에서 파싱 직후 삭제한다.
 - 오류 응답에 문서 원문이나 스택 트레이스를 노출하지 않는다.
+- 요청의 Host·Origin·Content-Type 헤더를 확인해, 루프백이 아닌 호스트 이름이나 다른 출처에서
+  온 요청, JSON이 아닌 요청 본문은 처리하지 않는다.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from __future__ import annotations
 import base64
 import csv
 import io
+import ipaddress
 import json
 import re
 import secrets
@@ -46,6 +49,47 @@ _MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 _MAX_CACHED_BUNDLES = 10
 _MAX_INLINE_CROP_BYTES = 4 * 1024 * 1024
 _UNSAFE_FILENAME_RE = re.compile(r'[\x00-\x1f\x7f/\\:*?"<>|]+')
+
+
+def _parse_host_header(raw: str | None) -> str | None:
+    """`Host` 헤더 값에서 포트를 뗀 소문자 호스트명을 반환한다(비었거나 형식 오류면 `None`).
+
+    대괄호 안에는 IPv6 주소만 받는다.
+    """
+    value = (raw or "").strip()
+    if value.startswith("["):
+        end = value.find("]")
+        if end < 0:
+            return None
+        hostname, rest = value[1:end], value[end + 1 :]
+        try:
+            ipaddress.IPv6Address(hostname)
+        except ValueError:
+            return None
+        port = rest[1:] if rest.startswith(":") else None
+        if rest and port is None:
+            return None
+    else:
+        hostname, sep, port_str = value.partition(":")
+        port = port_str if sep else None
+    if port is not None and not (port.isascii() and port.isdigit()):
+        return None
+    return hostname.lower() or None
+
+
+def _is_allowed_host(hostname: str, *, allow_non_loopback: bool, bind_host: str) -> bool:
+    """루프백 호스트명, 또는 비루프백 허용 모드의 IP 리터럴·바인딩 호스트인지 판정한다."""
+    if hostname in _LOOPBACK_HOSTS:
+        return True
+    if not allow_non_loopback:
+        return False
+    if hostname == bind_host:
+        return True
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return True
 
 
 def _normalize_upload_filename(raw_name: Any) -> str:
@@ -291,7 +335,15 @@ class _ParserUiHttpServer(ThreadingHTTPServer):
 
     allow_reuse_address = True
 
-    def __init__(self, server_address: tuple[str, int], handler_cls: type[BaseHTTPRequestHandler]):
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler_cls: type[BaseHTTPRequestHandler],
+        *,
+        allow_non_loopback: bool = False,
+    ):
+        self.allow_non_loopback = allow_non_loopback
+        self.bind_host = server_address[0].strip().lower()
         self.ui_html_bytes = _load_ui_html()
         self.bundle_store = _BundleStore()
         self.docindex_store = _DocIndexStore()
@@ -339,7 +391,32 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self._send_bytes(status, raw, content_type="application/json; charset=utf-8")
 
+    def _check_host(self) -> bool:
+        """`Host` 헤더의 호스트명이 허용 목록에 있는지 확인하고, 아니면 403을 응답한다."""
+        hostname = _parse_host_header(self.headers.get("Host"))
+        if hostname is not None and _is_allowed_host(
+            hostname,
+            allow_non_loopback=self.server.allow_non_loopback,
+            bind_host=self.server.bind_host,
+        ):
+            return True
+        self._send_json(HTTPStatus.FORBIDDEN, {"error": "허용하지 않는 Host 헤더다."})
+        return False
+
+    def _check_origin(self) -> bool:
+        """`Origin` 헤더가 있으면 `http://<Host>`와 같은지 확인하고, 다르면 403을 응답한다."""
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        expected = "http://" + (self.headers.get("Host") or "").strip()
+        if origin.strip().lower() == expected.lower():
+            return True
+        self._send_json(HTTPStatus.FORBIDDEN, {"error": "다른 출처에서 온 요청은 허용하지 않는다."})
+        return False
+
     def do_GET(self) -> None:
+        if not self._check_host():
+            return
         path_only = self.path.split("?", 1)[0]
         if path_only in ("/", "/index.html"):
             self._send_bytes(
@@ -373,6 +450,13 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "알 수 없는 경로다."})
 
     def _read_json_body(self) -> dict[str, Any] | None:
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.split(";", 1)[0].strip().lower() != "application/json":
+            self._send_json(
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                {"error": "요청 본문은 application/json 형식이어야 한다."},
+            )
+            return None
         cl_str = self.headers.get("Content-Length", "0")
         if not cl_str.isdigit():
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "유효하지 않은 Content-Length다."})
@@ -397,6 +481,8 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
         return req
 
     def do_POST(self) -> None:
+        if not self._check_host() or not self._check_origin():
+            return
         path_only = self.path.split("?", 1)[0]
         if path_only == "/api/parse":
             req = self._read_json_body()
@@ -1100,7 +1186,12 @@ class _ParserUiRequestHandler(BaseHTTPRequestHandler):
 
 
 class LocalParserUiServer:
-    """컨텍스트 매니저로 수명 주기를 관리하는 Auto Parser 로컬 웹 UI 서버."""
+    """컨텍스트 매니저로 수명 주기를 관리하는 Auto Parser 로컬 웹 UI 서버.
+
+    `allow_non_loopback=True`이면 루프백이 아닌 주소에도 바인딩할 수 있다. 이때도 요청의
+    Host 헤더는 루프백 이름, IP 주소, 바인딩한 호스트 이름만 받으므로 다른 호스트 이름으로
+    접속하면 403으로 거절된다.
+    """
 
     def __init__(
         self,
@@ -1113,7 +1204,9 @@ class LocalParserUiServer:
             raise ParserInputError(
                 f"로컬 웹 UI는 보안상 루프백(127.0.0.1/localhost) 바인딩만 기본 허용한다: '{host}'"
             )
-        self._httpd = _ParserUiHttpServer((host, port), _ParserUiRequestHandler)
+        self._httpd = _ParserUiHttpServer(
+            (host, port), _ParserUiRequestHandler, allow_non_loopback=allow_non_loopback
+        )
         self._thread: threading.Thread | None = None
 
     @property
@@ -1161,7 +1254,10 @@ def create_ui_server(
     port: int = 8765,
     allow_non_loopback: bool = False,
 ) -> LocalParserUiServer:
-    """백그라운드 테스트 또는 인터랙티브 실행용 `LocalParserUiServer` 인스턴스를 생성한다."""
+    """백그라운드 테스트 또는 인터랙티브 실행용 `LocalParserUiServer` 인스턴스를 생성한다.
+
+    `allow_non_loopback=True`일 때는 IP 주소나 바인딩한 호스트 이름으로 접속해야 한다.
+    """
     return LocalParserUiServer(host=host, port=port, allow_non_loopback=allow_non_loopback)
 
 
