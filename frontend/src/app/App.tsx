@@ -2,17 +2,18 @@ import { useEffect, useState } from 'react';
 import { appCopy, tabIds, tabLabels, type TabId } from '../copy/common.ts';
 import { AppTabs, StatusBar, TrustBadge, type AppTabItem } from '../components/index.ts';
 import styles from './App.module.css';
-import { TabContent, type TabLoader } from './TabContent.tsx';
+import { TabContent, type TabSource } from './TabContent.tsx';
 
 /**
  * Each tab is a lazy entry with a unique file name, so the build writes its
  * code to its own assets/<Name>Tab.js and .css. Shared code stays in index.
+ * `file` is that name; TabContent uses it to ask for the files again.
  */
-const tabLoaders: Record<TabId, TabLoader> = {
-  extract: () => import('../features/extract/ExtractTab.tsx'),
-  database: () => import('../features/database/DatabaseTab.tsx'),
-  search: () => import('../features/search/SearchTab.tsx'),
-  settings: () => import('../features/settings/SettingsTab.tsx'),
+const tabSources: Record<TabId, TabSource> = {
+  extract: { file: 'ExtractTab', load: () => import('../features/extract/ExtractTab.tsx') },
+  database: { file: 'DatabaseTab', load: () => import('../features/database/DatabaseTab.tsx') },
+  search: { file: 'SearchTab', load: () => import('../features/search/SearchTab.tsx') },
+  settings: { file: 'SettingsTab', load: () => import('../features/settings/SettingsTab.tsx') },
 };
 
 function TabLoading() {
@@ -48,7 +49,7 @@ export function App() {
     id,
     label: tabLabels[id],
     placement: id === 'settings' ? 'end' : 'start',
-    panel: <TabContent load={tabLoaders[id]} fallback={<TabLoading />} />,
+    panel: <TabContent source={tabSources[id]} fallback={<TabLoading />} />,
   }));
 
   return (

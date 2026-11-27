@@ -108,6 +108,8 @@ frontend/
 
 탭 화면은 `app/TabContent.tsx`가 처음 열 때 불러온다. 탭 파일을 받지 못하거나 탭이 그리다 오류를 내면 그 탭 칸에만 오류 안내와 [다시 불러오기]가 뜨고, 다른 탭과 그 결과는 그대로 남는다.
 
+[다시 불러오기]는 탭의 `.js`와 받지 못한 `.css`를 `?retry=<n>`을 붙인 새 주소로 다시 받는다. Safari처럼 한 번 실패한 모듈 주소를 페이지가 열려 있는 동안 기억하는 브라우저가 있어서다. 그래서 `App.tsx`의 탭 목록에는 탭마다 빌드 파일 이름(`file`, 예: `DatabaseTab`)을 함께 적는다.
+
 공유 도우미: `api/http.ts`의 `getJson`·`postJson`(JSON 헤더, `AbortSignal`, 실패는 모두 `AppError`), `lib/errors.ts`의 `AppError`·`errorFromResponse`·`unsupportedFileError`, `lib/files.ts`의 `readFileAsBase64`·`checkFile`·`formatBytes`, `lib/tableClipboard.ts`, `lib/markdown.ts`, `lib/korean.ts`(`withParticle('표 2', '을/를')` → "표 2를").
 
 ## 문구
