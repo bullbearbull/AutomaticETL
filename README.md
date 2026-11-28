@@ -87,6 +87,18 @@ etl_plan/
 
 `autoetl load` 또는 웹 UI의 **DB로 저장하기**로 적재하면 업무 테이블(행마다 `_etl_batch_id`, `_etl_dataset_id`, `_etl_loaded_at` 이력 포함)과 함께 디폴트 관리 테이블 4종(`_etl_load_batches`, `_etl_datasets`, `_etl_column_registry`, `_etl_quarantine_rows`)이 자동으로 생성되어 저장 시점·고유 ID·데이터 종류·컬럼 사전·오류 격리함을 추적할 수 있습니다.
 
+#### ETL 마스킹 키 백업과 이전
+
+키 기반 마스킹 값을 여러 환경에서 일관되게 생성하려면 같은 키를 사용하세요. 기본 키 파일은 Linux의 `$XDG_CONFIG_HOME/autoetl/masking_key.json`(변수를 지정하지 않으면 `~/.config/autoetl/masking_key.json`), macOS의 `~/Library/Application Support/autoetl/masking_key.json`, Windows의 `%APPDATA%\autoetl\masking_key.json`에 저장됩니다. `AUTOETL_MASKING_KEY_FILE`로 위치를 지정할 수 있습니다.
+
+```bash
+autoetl key status --db ./warehouse.sqlite
+autoetl key export ./masking_key.backup.json
+autoetl key import ./masking_key.backup.json
+```
+
+백업은 별도의 안전한 장소에 보관하세요. 내보내기는 새 파일에만 쓰고 POSIX에서 파일 권한을 `0600`으로 설정합니다. 같은 키를 가져오면 기존 파일을 유지합니다. 다른 키로 교체할 때는 `autoetl key import ./masking_key.backup.json --replace`를 사용하면 이전 키를 옆의 백업 파일에 보관합니다. 이전 방식의 해시가 들어 있는 DB에서 새 해시를 사용하려면 새 DB에 다시 적재하세요.
+
 ### 2. 문서 파일 하나 파싱하기 (기본 오프라인 모드)
 
 ```bash

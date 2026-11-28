@@ -58,7 +58,9 @@ def _fetch_rows(db_path: Path, engine: str, query: str) -> list[tuple[object, ..
 
 
 def _hash(value: str) -> str:
-    return "h_" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+    import hmac
+
+    return "h_" + hmac.digest(bytes(32), value.encode("utf-8"), hashlib.sha256).hex()[:24]
 
 
 @pytest.mark.parametrize("engine", ["sqlite", "duckdb"])
