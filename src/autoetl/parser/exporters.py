@@ -398,9 +398,9 @@ def render_routing_report_markdown(plan: RoutingPlan) -> str:
 
 
 def export_table_csv(table: ExtractedTable, out_path: Path) -> None:
-    """추출된 표 하나를 UTF-8 CSV로 저장한다."""
+    """추출된 표 하나를 BOM이 포함된 UTF-8 CSV로 저장한다."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8", newline="") as fh:
+    with out_path.open("w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.writer(fh)
         if table.headers:
             writer.writerow(table.headers)

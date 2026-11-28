@@ -12,8 +12,10 @@ import pytest
 
 from autoetl.cli import main as cli_main
 from autoetl.parser import (
+    BBox,
     CropStatus,
     ElementKind,
+    ExtractedTable,
     PageCategory,
     ParsedDocument,
     ParseOptions,
@@ -31,6 +33,7 @@ from autoetl.parser import (
     render_routing_report_markdown,
 )
 from autoetl.parser.adapters import UnavailablePageRenderer
+from autoetl.parser.exporters import export_table_csv
 
 # ---------------------------------------------------------------------------
 # 순수 Python PDF 1.4 픽스처 빌더 (외부 의존성 없이 정확한 벡터·이미지·폼·목차 생성)
@@ -699,7 +702,7 @@ def test_parse_and_export_bundle_files(tmp_path: Path) -> None:
 
     # 추출된 CSV 파일 검증
     first_csv = manifest.table_csv_paths[0]
-    with first_csv.open(encoding="utf-8", newline="") as fh:
+    with first_csv.open(encoding="utf-8-sig", newline="") as fh:
         rows = list(csv.reader(fh))
     assert len(rows) >= 3
     assert any("Korea" in row for row in rows)
@@ -716,6 +719,27 @@ def test_parse_and_export_bundle_files(tmp_path: Path) -> None:
     assert "다단 레이아웃" in report_md
     assert "스캔/이미지" in report_md
     assert "격자선 표 복원" in report_md
+
+
+def test_export_table_csv_writes_utf8_bom(tmp_path: Path) -> None:
+    table = ExtractedTable(
+        table_id="sample",
+        page=1,
+        bbox=BBox(x0=0, top=0, x1=1, bottom=1, norm_x0=0, norm_top=0, norm_x1=1, norm_bottom=1),
+        strategy=ParseStrategy.RULED_TABLE,
+        confidence=1.0,
+        row_count=2,
+        col_count=2,
+        headers=["구분", "설명"],
+        rows=[["샘플", '가상, "항목"\n둘째 줄']],
+    )
+    csv_path = tmp_path / "table_sample.csv"
+
+    export_table_csv(table, csv_path)
+
+    assert csv_path.read_bytes().startswith(b"\xef\xbb\xbf")
+    with csv_path.open(encoding="utf-8-sig", newline="") as fh:
+        assert list(csv.reader(fh)) == [["구분", "설명"], ["샘플", '가상, "항목"\n둘째 줄']]
 
 
 def test_parse_page_selection_validation() -> None:
