@@ -61,7 +61,7 @@ from autoetl.contracts import (
 from autoetl.core.context import RAW_TABLE, quote_identifier
 from autoetl.core.ddl.postgres import INT4_MAX, INT4_MIN
 from autoetl.core.errors import InputError
-from autoetl.core.load_planner import plan_multi_table_load
+from autoetl.core.load_planner import _plan_multi_table_load
 from autoetl.core.multi_context import (
     MultiTableContext,
     NamedTableInput,
@@ -1489,6 +1489,7 @@ def _load_single_table(
     orphan_policy: OrphanPolicy,
     table_existed_before: bool = False,
     capture_rollback_snapshots: bool = True,
+    skipped_key_masking: Mapping[str, MaskingPolicy] | None = None,
 ) -> tuple[
     int,
     int,
@@ -1514,7 +1515,8 @@ def _load_single_table(
     map_by_target = {m.target_column: m for m in table_plan.column_mappings}
     pii_type_by_col = {a.column: a.types[0] for a in smap.assignments if a.types}
     pii_level_by_col = {a.column: a.level for a in smap.assignments}
-    table_masking = table_plan.column_masking
+    # 원래의 요청 정책은 행 변환과 격리함 보호에 계속 사용한다.
+    table_masking = {**table_plan.column_masking, **(skipped_key_masking or {})}
 
     # 미리 정규식·슬롯 정보 준비
     slot_rx_by_target: dict[str, tuple[re.Pattern[str], int] | None] = {}
@@ -1969,13 +1971,14 @@ def load_tables(
 
         overrides_json = spec.model_dump_json()
 
-        load_plan = plan_multi_table_load(
+        load_plan, skipped_key_masking, masking_warnings = _plan_multi_table_load(
             tables,
             relations,
             purpose=resolved_purpose,
             decompose_strings=decompose_strings,
             mctx=mctx,
             overrides=spec,
+            engine=norm_engine,
         )
 
         analysis_warnings: list[str] = []
@@ -2001,7 +2004,7 @@ def load_tables(
         }
 
         adapter = _DbAdapter(db_path, norm_engine)
-        load_warnings: list[str] = []
+        load_warnings = list(masking_warnings)
         outcomes: list[TableLoadOutcome] = []
         mgmt_created: list[str] = []
 
@@ -2175,6 +2178,7 @@ def load_tables(
                     bundle=tb,
                     target_table=target_tbl,
                     table_plan=tp,
+                    skipped_key_masking=skipped_key_masking.get(t_name, {}),
                     smap=smap,
                     batch_id=batch_id,
                     dataset_id=dataset_id,

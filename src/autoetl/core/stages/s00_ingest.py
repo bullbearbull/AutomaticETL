@@ -368,8 +368,10 @@ _SAMPLE_END_MARKER = "autoetl-sample-end"
 """줄 수 한도에서 끊긴 표본 뒤에 붙이는 표식. 구분자 후보와 따옴표가 없다."""
 
 
-def _sample_field_counts(sample: list[str], delimiter: str, *, may_be_cut: bool) -> list[int]:
-    """표본을 한 구분자 후보로 읽어 레코드별 필드 수를 센다(빈 레코드 제외).
+def _sample_field_counts(
+    sample: list[str], delimiter: str, *, may_be_cut: bool
+) -> tuple[list[int], bool]:
+    """빈 레코드를 제외한 필드 수와 CSV 레코드 단위 읽기 성공 여부를 돌려준다.
 
     may_be_cut이면 표본이 줄 수 한도에서 끊긴 것이라, 마지막 레코드가 인용된
     줄바꿈 안에서 잘렸을 수 있다. 표본 뒤에 표식 한 줄을 붙여 읽으면, 온전한
@@ -387,11 +389,12 @@ def _sample_field_counts(sample: list[str], delimiter: str, *, may_be_cut: bool)
             last = rows.pop()
             if last != [_SAMPLE_END_MARKER] and not rows:
                 rows.append(last)
-        return [len(row) for row in rows]
+        return [len(row) for row in rows], True
     except csv.Error:
-        return [
+        counts = [
             len(row) for line in sample for row in csv.reader([line], delimiter=delimiter) if row
         ]
+        return counts, False
 
 
 def _choose_delimiter(load_path: Path, path: Path) -> str:
@@ -400,23 +403,31 @@ def _choose_delimiter(load_path: Path, path: Path) -> str:
     표본은 물리 줄 단위로 제한하되 CSV 레코드 단위로 읽어 인용된 줄바꿈을
     보존한다. 빈 레코드는 행 수를 셀 때와 마찬가지로 제외한다. 표본이 줄 수
     한도에서 끊겨 마지막 레코드가 잘렸으면 그 레코드는 세지 않는다.
+    여러 필드를 만드는 후보를 우선하고, 그 안에서 레코드 단위로 읽힌
+    후보를 물리 줄 단위로 읽은 후보보다 우선한다.
     """
     with _open_text(load_path) as source:
         sample = list(itertools.islice(source, DELIMITER_SAMPLE_LINES))
     if not sample:
         return DELIMITER_CANDIDATES[0]
     sample_is_full = len(sample) == DELIMITER_SAMPLE_LINES
-    best: tuple[int, float, int, int] | None = None
+    best: tuple[int, int, float, int, int] | None = None
     chosen = DELIMITER_CANDIDATES[0]
     for priority, delimiter in enumerate(DELIMITER_CANDIDATES):
         try:
-            counts = _sample_field_counts(sample, delimiter, may_be_cut=sample_is_full)
+            counts, record_ok = _sample_field_counts(sample, delimiter, may_be_cut=sample_is_full)
         except csv.Error as exc:
             raise _csv_input_error(path, None, exc) from exc
         if not counts:
             continue
         modal_count, hits = Counter(counts).most_common(1)[0]
-        score = (1 if modal_count > 1 else 0, hits / len(counts), modal_count, -priority)
+        score = (
+            1 if modal_count > 1 else 0,
+            1 if record_ok else 0,
+            hits / len(counts),
+            modal_count,
+            -priority,
+        )
         if best is None or score > best:
             best = score
             chosen = delimiter
