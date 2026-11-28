@@ -726,14 +726,23 @@ def _require_matching_masking_key(database_id: str, local_id: str | None) -> Non
         )
 
 
+def _existing_masking_key_id(db_path: str | Path, engine: str, *, read_only: bool) -> str | None:
+    adapter = _DbAdapter(db_path, engine, read_only=read_only)
+    try:
+        return _database_masking_key_id(adapter, reject_legacy=True)
+    finally:
+        adapter.close()
+
+
 def _prepare_masking_key(db_path: str | Path, engine: str) -> tuple[MaskingKey, bool]:
     database_id = None
     if engine == "postgres" or (str(db_path) != ":memory:" and Path(db_path).exists()):
-        adapter = _DbAdapter(db_path, engine, read_only=True)
         try:
-            database_id = _database_masking_key_id(adapter, reject_legacy=True)
-        finally:
-            adapter.close()
+            database_id = _existing_masking_key_id(db_path, engine, read_only=True)
+        except (sqlite3.Error, duckdb.Error):
+            # 읽기 전용으로 열 수 없는 파일(복구할 롤백 저널이 남은 SQLite, 같은 프로세스가
+            # 이미 열어 둔 DuckDB, URI로 쓸 수 없는 경로)은 적재와 같은 일반 연결로 조회만 한다.
+            database_id = _existing_masking_key_id(db_path, engine, read_only=False)
 
     if database_id is None:
         return get_or_create_masking_key()
@@ -2130,13 +2139,17 @@ def load_tables(
             )
         )
         masking_key = None
+        note_overrides: dict[str, str] = {}
         if needs_hash_key:
             masking_key, created = _prepare_masking_key(db_path, norm_engine)
             if created:
-                load_warnings.append(
-                    f"새 가리기 비밀 키를 만들었습니다 ({masking_key.path}). "
-                    "`autoetl key export <파일>`로 백업해 두세요."
+                backup_hint = "`autoetl key export <파일>`로 백업해 두세요."
+                created_warning = (
+                    f"새 가리기 비밀 키를 만들었습니다 ({masking_key.path}). {backup_hint}"
                 )
+                load_warnings.append(created_warning)
+                # DB는 밖으로 나갈 수 있으니, 저장하는 메모에는 이 컴퓨터의 경로를 넣지 않는다.
+                note_overrides[created_warning] = f"새 가리기 비밀 키를 만들었습니다. {backup_hint}"
             if masking_key.permission_warning:
                 load_warnings.append(masking_key.permission_warning)
 
@@ -2542,7 +2555,7 @@ def load_tables(
 
             if spec.include_management_tables:
                 p = adapter.placeholder
-                final_notes = notes or ("; ".join(load_warnings) if load_warnings else "")
+                final_notes = notes or "; ".join(note_overrides.get(w, w) for w in load_warnings)
                 adapter.execute(
                     f'UPDATE "_etl_load_batches" '
                     f'SET "status" = {p}, "total_rows_read" = {p}, '

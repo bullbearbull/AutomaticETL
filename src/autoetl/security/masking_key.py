@@ -117,6 +117,25 @@ def _ensure_private_directory(path: Path) -> None:
         path.mkdir(mode=0o700, exist_ok=True)
 
 
+def _write_new_file(path: Path, data: bytes) -> bool:
+    """Create the destination exclusively, returning false if it already exists."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return False
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError:
+        # Only this call created the file, so an incomplete one is safe to remove.
+        path.unlink(missing_ok=True)
+        raise
+    return True
+
+
 def _publish_key(path: Path, key: MaskingKey, *, overwrite: bool = False) -> bool:
     """Publish a complete file atomically, returning false for an existing destination."""
     document = {
@@ -143,6 +162,9 @@ def _publish_key(path: Path, key: MaskingKey, *, overwrite: bool = False) -> boo
                     os.link(staging, path)
                 except FileExistsError:
                     return False
+                except OSError:
+                    # FAT·exFAT 등 하드 링크가 없는 저장 장치에는 새 파일로만 직접 쓴다.
+                    return _write_new_file(path, staging.read_bytes())
         finally:
             staging.unlink(missing_ok=True)
     except OSError:
