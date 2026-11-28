@@ -57,6 +57,7 @@ def _build_minimal_pdf(
     *,
     width: float = 595.0,
     height: float = 842.0,
+    base_font: str = "Helvetica",
     images: list[tuple[str, int, int, bytes]] | None = None,
 ) -> bytes:
     """텍스트 또는 RGB 이미지가 들어 있는 최소 유효 PDF 1.4 바이트를 생성한다."""
@@ -66,7 +67,7 @@ def _build_minimal_pdf(
         objs.append(body)
         return len(objs)
 
-    f_reg = add_obj(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    f_reg = add_obj(f"<< /Type /Font /Subtype /Type1 /BaseFont /{base_font} >>".encode("ascii"))
     img_entries: list[str] = []
     for name, px_w, px_h, rgb_raw in images or []:
         compressed = zlib.compress(rgb_raw)
@@ -491,7 +492,8 @@ def _make_real_scanned_pdf(tmp_path: Path) -> Path:
         "BT /F1 16 Tf 1 0 0 1 60 635 Tm (Total Amount: 15800 USD) Tj ET\n"
     )
     src_pdf = tmp_path / "clean_source.pdf"
-    src_pdf.write_bytes(_build_minimal_pdf(text_ops))
+    # Helvetica가 고정폭 글꼴로 대체될 때 글자 간격이 달라지므로 고정폭 원본을 사용한다.
+    src_pdf.write_bytes(_build_minimal_pdf(text_ops, base_font="Courier-Bold"))
 
     renderer = PdftoppmPageRenderer()
     assert renderer.available
