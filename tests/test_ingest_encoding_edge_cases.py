@@ -46,6 +46,44 @@ def test_delimiter_ignores_blank_lines_before_pipe_header(tmp_path: Path) -> Non
         assert context.connection.execute("SELECT * FROM raw").fetchall() == [("001", "Dune", "2")]
 
 
+def test_delimiter_survives_wrong_candidate_exceeding_the_field_limit(tmp_path: Path) -> None:
+    source = tmp_path / "notes.csv"
+    first = ("a" * 35_000) + "\n" + ("a" * 35_000)
+    second = "b" * 70_000
+    source.write_text(f'first;second\n"{first}";{second}\n', encoding="utf-8", newline="")
+
+    spec = probe_source(source)
+    assert spec.delimiter == ";"
+    assert spec.header == ["first", "second"]
+    assert spec.row_count == 1
+
+
+def test_delimiter_ignores_record_cut_at_the_sample_boundary(tmp_path: Path) -> None:
+    source = tmp_path / "notes.csv"
+    note = "\n".join(f"line {index}, east, west" for index in range(30))
+    record = f'001|"{note}"|2|open\n'
+    source.write_text("code|note|qty|state\n" + (record * 3), encoding="utf-8", newline="")
+
+    spec = probe_source(source)
+    assert spec.delimiter == "|"
+    assert spec.header == ["code", "note", "qty", "state"]
+    assert spec.row_count == 3
+
+
+def test_probe_rejects_oversized_cell_that_another_delimiter_would_split(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "oversized.csv"
+    label = "fake-private-cell"
+    cell = label + (";x" * 65_536)
+    source.write_text(f"code,label\n001,{cell}\n", encoding="utf-8", newline="")
+
+    with pytest.raises(InputError, match="입력 CSV를 끝까지 읽지 못했다") as error:
+        probe_source(source)
+
+    assert label not in str(error.value)
+
+
 def test_tab_delimiter_preserves_quoted_tab_and_other_delimiters(tmp_path: Path) -> None:
     source = tmp_path / "inventory.tsv"
     label = "north\teast; west, south"

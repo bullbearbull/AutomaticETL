@@ -364,25 +364,44 @@ def _csv_input_error(path: Path, line_num: int | None, exc: csv.Error) -> InputE
     )
 
 
+def _sample_field_counts(sample: list[str], delimiter: str) -> list[int]:
+    """표본을 한 구분자 후보로 읽어 레코드별 필드 수를 센다(빈 레코드 제외).
+
+    틀린 후보는 인용된 줄바꿈 뒤의 칸까지 한 칸으로 합쳐 csv 필드 한도를 넘길 수
+    있다. 그런 후보는 줄 단위로 다시 센다. 줄 하나도 읽지 못하면 csv.Error를
+    그대로 올린다.
+    """
+    try:
+        return [len(row) for row in csv.reader(sample, delimiter=delimiter) if row]
+    except csv.Error:
+        return [
+            len(row) for line in sample for row in csv.reader([line], delimiter=delimiter) if row
+        ]
+
+
 def _choose_delimiter(load_path: Path, path: Path) -> str:
     """표본의 필드 수 일관성으로 구분자 후보를 고른다.
 
     표본은 물리 줄 단위로 제한하되 CSV 레코드 단위로 읽어 인용된 줄바꿈을
-    보존한다. 빈 레코드는 행 수를 셀 때와 마찬가지로 제외한다.
+    보존한다. 빈 레코드는 행 수를 셀 때와 마찬가지로 제외한다. 표본이 줄 수
+    한도에서 끊겼으면 마지막 레코드는 잘렸을 수 있어 세지 않는다.
     """
     with _open_text(load_path) as source:
         sample = list(itertools.islice(source, DELIMITER_SAMPLE_LINES))
     if not sample:
         return DELIMITER_CANDIDATES[0]
+    sample_is_full = len(sample) == DELIMITER_SAMPLE_LINES
     best: tuple[int, float, int, int] | None = None
     chosen = DELIMITER_CANDIDATES[0]
     for priority, delimiter in enumerate(DELIMITER_CANDIDATES):
         try:
-            counts = [len(row) for row in csv.reader(sample, delimiter=delimiter) if row]
+            counts = _sample_field_counts(sample, delimiter)
         except csv.Error as exc:
             raise _csv_input_error(path, None, exc) from exc
         if not counts:
             continue
+        if sample_is_full and len(counts) > 1:
+            counts = counts[:-1]
         modal_count, hits = Counter(counts).most_common(1)[0]
         score = (1 if modal_count > 1 else 0, hits / len(counts), modal_count, -priority)
         if best is None or score > best:
