@@ -1,4 +1,5 @@
-import { appCopy, comingSoonCopy, tabErrorCopy, tabLabels } from '../src/copy/common.ts';
+import { appCopy, tabErrorCopy, tabLabels } from '../src/copy/common.ts';
+import { startCopy as databaseStartCopy } from '../src/features/database/copy.ts';
 import { openWithDocx, resultRegion } from './support/app.ts';
 import { expectNoAxeViolations } from './support/axe.ts';
 import { docxText } from './support/docx.ts';
@@ -31,7 +32,7 @@ test('a tab that cannot load shows a notice in its own panel, and the other tabs
   await page.unroute(DATABASE_FILES);
   await tabList.getByRole('tab', { name: tabLabels.database }).click();
   await panel.getByRole('button', { name: tabErrorCopy.retry }).click();
-  await expect(panel.getByText(comingSoonCopy.body)).toBeVisible();
+  await expect(panel.getByRole('heading', { name: databaseStartCopy.title })).toBeVisible();
   await expect(panel.getByRole('alert')).toHaveCount(0);
   await expect(panel.locator(':scope > div')).toHaveCSS('flex-direction', 'column');
 
