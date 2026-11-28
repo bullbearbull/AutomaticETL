@@ -58,3 +58,82 @@ jobs:
         run: uv sync --frozen
       - name: 라이선스 검사
         run: uv run --frozen python tools/license_check.py
+      - name: npm 라이선스 검사
+        run: uv run --frozen python tools/npm_license_check.py
+      - name: wheel에 웹 UI 빌드 포함 확인
+        run: |
+          uv build --wheel -o dist-check
+          uv run --frozen python - <<'PY'
+          import glob
+          import zipfile
+
+          wheels = glob.glob("dist-check/*.whl")
+          assert len(wheels) == 1, f"wheel이 하나가 아니다: {wheels}"
+          names = set(zipfile.ZipFile(wheels[0]).namelist())
+          required = {"autoetl/ui/static/index.html", "autoetl/ui/static/assets/index.js"}
+          missing = sorted(required - names)
+          assert not missing, f"wheel에 없는 파일: {missing}"
+          print(f"{wheels[0]}에 웹 UI 빌드가 들어 있다.")
+          PY
+
+  frontend:
+    name: 웹 UI 빌드 ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: npm 의존성 설치
+        run: npm ci
+      - name: 타입 검사
+        run: npm run typecheck
+      - name: 단위 테스트
+        run: npm run test:unit
+      - name: 빌드
+        run: npm run build
+      - name: 커밋된 빌드 결과와 같은지 확인
+        shell: bash
+        run: |
+          git diff --exit-code -- ../src/autoetl/ui/static
+          test -z "$(git status --porcelain -- ../src/autoetl/ui/static)"
+
+  e2e:
+    name: 웹 UI 브라우저 테스트
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+      - name: 의존성 설치
+        run: uv sync --frozen
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: npm 의존성 설치
+        working-directory: frontend
+        run: npm ci
+      - name: Playwright 브라우저 설치
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+      - name: e2e 테스트
+        working-directory: frontend
+        run: npm run test:e2e
+      - name: Playwright 보고서 올리기
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: frontend/playwright-report

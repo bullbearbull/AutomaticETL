@@ -18,6 +18,14 @@ dist/
 build/
 *.egg-info/
 
+# Web UI (frontend/)
+node_modules/
+frontend/test-results/
+frontend/playwright-report/
+
+# CI wheel check
+dist-check/
+
 # OS
 .DS_Store
 Thumbs.db

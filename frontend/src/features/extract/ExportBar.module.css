@@ -1,0 +1,52 @@
+.bar {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  min-width: 0;
+}
+
+.contents {
+  flex: 1 1 16rem;
+  min-width: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* While the ZIP is being fetched the button keeps focus but looks unavailable. */
+.zip[data-pending] {
+  border-color: var(--color-border-input);
+  background: var(--color-bg-subtle);
+  color: var(--color-text-secondary);
+  cursor: progress;
+}
+
+.expired,
+.message {
+  flex-basis: 100%;
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+}
+
+.message {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.ok {
+  color: var(--color-status-done);
+}
+
+.warn {
+  color: var(--color-status-warning);
+}

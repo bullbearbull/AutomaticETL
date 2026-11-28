@@ -1,0 +1,1 @@
+import{ComingSoon as e,require_jsx_runtime as t,tabLabels as n}from"./index.js";var r={root:`features-database-DatabaseTab_root`},i=t();function a(){return(0,i.jsx)(`div`,{className:r.root,children:(0,i.jsx)(e,{title:n.database})})}export{a as default};

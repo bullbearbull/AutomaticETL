@@ -1,0 +1,74 @@
+.figure {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+  margin: 0;
+}
+
+/* Natural size up to the column width; a flex item would otherwise stretch. */
+.image {
+  display: block;
+  align-self: flex-start;
+  max-width: 100%;
+  height: auto;
+  border: var(--border-width) solid var(--color-divider);
+  border-radius: var(--radius-control);
+  background: var(--color-bg);
+}
+
+.missing {
+  padding: var(--space-4);
+  border: var(--border-width) dashed var(--color-border-input);
+  border-radius: var(--radius-control);
+  background: var(--color-bg-subtle);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+}
+
+.caption {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+}
+
+.captionText {
+  font-style: italic;
+}
+
+.meta {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-tiny);
+  line-height: var(--line-height-tiny);
+}
+
+.reason {
+  font-size: var(--font-size-small);
+}
+
+.reasonText {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+}
+
+.list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 16rem), 1fr));
+  gap: var(--space-6);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.item {
+  min-width: 0;
+}
+
+.empty {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+}

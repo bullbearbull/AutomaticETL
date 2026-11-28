@@ -1,0 +1,19 @@
+/* The tab's root: steps on top, the start screen or the workspace, and the status line at the bottom. */
+.root {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.status {
+  position: sticky;
+  bottom: 0;
+  min-width: 0;
+}
+
+/* Focus never lands under the sticky status line (WCAG 2.4.11). The tab
+   sets --extract-status-height to the line's measured height. */
+.root * {
+  scroll-margin-bottom: calc(var(--extract-status-height, 0px) + var(--space-2));
+}

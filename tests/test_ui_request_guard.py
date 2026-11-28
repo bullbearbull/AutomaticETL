@@ -9,7 +9,7 @@ from collections.abc import Iterator
 import pytest
 
 from autoetl.parser.ui import create_ui_server
-from autoetl.parser.ui.server import LocalParserUiServer, _is_allowed_host, _parse_host_header
+from autoetl.ui.server import LocalParserUiServer, _is_allowed_host, _parse_host_header
 
 _HOST_ERROR = "허용하지 않는 Host 헤더다."
 _ORIGIN_ERROR = "다른 출처에서 온 요청은 허용하지 않는다."

@@ -101,15 +101,15 @@ LICENSE_FIELD_ALIASES: dict[str, str] = {
     "cc0 1.0 universal": "CC0-1.0",
 }
 
-_ALLOWED_BY_UPPER = {lid.upper(): lid for lid in ALLOWED_LICENSES}
 _ALLOWED_EXCEPTIONS_UPPER = {exc.upper() for exc in ALLOWED_EXCEPTIONS}
 
 _TOKEN_RE = re.compile(r"\(|\)|AND|OR|WITH|[^\s()]+", re.IGNORECASE)
 _NAME_RE = re.compile(r"^\s*([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)")
 
 
-def evaluate_license_expression(expr: str) -> bool:
-    """SPDX 라이선스 식이 허용 목록 안에 들어 있는지 판정한다."""
+def evaluate_license_expression(expr: str, allowed: Iterable[str] = ALLOWED_LICENSES) -> bool:
+    """SPDX 라이선스 식이 허용 목록(기본값은 ALLOWED_LICENSES) 안에 들어 있는지 판정한다."""
+    allowed_upper = {lid.upper() for lid in allowed}
     tokens: list[str] = _TOKEN_RE.findall(expr)
     if not tokens:
         raise ValueError("빈 라이선스 식")
@@ -159,7 +159,7 @@ def evaluate_license_expression(expr: str) -> bool:
             return value
         if token == ")":
             raise ValueError(f"짝이 맞지 않는 닫는 괄호: {expr!r}")
-        return token.upper() in _ALLOWED_BY_UPPER
+        return token.upper() in allowed_upper
 
     result = parse_or()
     if pos != len(tokens):

@@ -1,0 +1,94 @@
+.root {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.header {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.title {
+  font-size: var(--font-size-title);
+  line-height: var(--line-height-title);
+  font-weight: var(--font-weight-strong);
+  overflow-wrap: anywhere;
+}
+
+.meta {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-tiny);
+  line-height: var(--line-height-tiny);
+}
+
+.waiting {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+}
+
+.tabs {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+/* The views wrap onto a second line on narrow screens instead of scrolling the page. */
+.tabList {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: var(--space-4);
+  border-bottom: var(--border-width) solid var(--color-divider);
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--control-height);
+  padding: 0 var(--space-1);
+  border-bottom: var(--border-width-strong) solid transparent;
+  margin-bottom: calc(var(--border-width) * -1);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+  cursor: pointer;
+}
+
+.tab[data-hovered] {
+  color: var(--color-text);
+}
+
+/* Selected: bold, dark text and an underline, never colour alone. */
+.tab[data-selected] {
+  border-bottom-color: var(--color-text);
+  color: var(--color-text);
+  font-weight: var(--font-weight-strong);
+}
+
+.tabEnd {
+  margin-left: auto;
+}
+
+.panel {
+  min-width: 0;
+}
+
+.raw {
+  margin: 0;
+  padding: var(--space-3);
+  border: var(--border-width) solid var(--color-divider);
+  border-radius: var(--radius-control);
+  background: var(--color-bg-subtle);
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
