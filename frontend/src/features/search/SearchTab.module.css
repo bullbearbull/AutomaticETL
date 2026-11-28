@@ -1,8 +1,18 @@
-/* The tab's root. Keeping a CSS file here from the start means later style
-   changes in this tab only touch this tab's own output files. */
+/* SearchTab root layout: step bar, start screen or workspace, and sticky status bar. */
 .root {
   display: flex;
   flex-direction: column;
   flex: 1;
   min-width: 0;
+}
+
+.status {
+  position: sticky;
+  bottom: 0;
+  min-width: 0;
+}
+
+/* Keep focused controls clear of the sticky status bar (WCAG 2.4.11 Focus Not Obscured). */
+.root * {
+  scroll-margin-bottom: calc(var(--search-status-height, 0px) + var(--space-2));
 }

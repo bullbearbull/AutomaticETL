@@ -2,6 +2,7 @@ import type { Page } from '@playwright/test';
 import { appCopy, comingSoonCopy, tabIds, tabLabels, type TabId } from '../src/copy/common.ts';
 import { startCopy as databaseStartCopy } from '../src/features/database/copy.ts';
 import { startCopy } from '../src/features/extract/copy.ts';
+import { startCopy as searchStartCopy } from '../src/features/search/copy.ts';
 import { openApp } from './support/app.ts';
 import { expect, test } from './support/fixtures.ts';
 
@@ -26,6 +27,9 @@ async function expectSelected(page: Page, selected: TabId) {
   } else if (selected === 'database') {
     await expect(startTitle).toBeHidden();
     await expect(panel.getByRole('heading', { name: databaseStartCopy.title })).toBeVisible();
+  } else if (selected === 'search') {
+    await expect(startTitle).toBeHidden();
+    await expect(panel.getByRole('heading', { name: searchStartCopy.title })).toBeVisible();
   } else {
     await expect(startTitle).toBeHidden();
     await expect(panel.getByRole('heading', { name: tabLabels[selected] })).toBeVisible();
