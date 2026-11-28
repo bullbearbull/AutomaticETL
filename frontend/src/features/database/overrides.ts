@@ -163,6 +163,22 @@ export function applyMaskToUnmaskedColumns(
   return next;
 }
 
+/** Returns the set of `source.tableName` values owned by `fileName` in `analysis`. */
+export function tablesOwnedByFile(analysis: AnalyzeResult | null, fileName: string): Set<string> {
+  const tables = new Set<string>();
+  if (!analysis) return tables;
+  for (const t of analysis.tables) {
+    if (
+      t.source.sourcePath === fileName ||
+      t.source.displayName === fileName ||
+      t.source.displayName.startsWith(`${fileName} `)
+    ) {
+      tables.add(t.source.tableName);
+    }
+  }
+  return tables;
+}
+
 /** Removes drafts belonging to source tables no longer present in `removedTableNames`. */
 export function pruneOverridesForTables(
   drafts: Readonly<Record<string, ColumnOverrideDraft>>,

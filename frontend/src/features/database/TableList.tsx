@@ -178,7 +178,7 @@ export function TableList({
         </div>
       ) : null}
 
-      <PurposeSelector value={purpose} onChange={onPurposeChange} compact />
+      <PurposeSelector value={purpose} onChange={onPurposeChange} compact disabled={disabled} />
       <div className={styles.settings}>{settings}</div>
     </div>
   );

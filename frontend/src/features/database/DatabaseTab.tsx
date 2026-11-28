@@ -24,7 +24,9 @@ import {
   applyMaskToUnmaskedColumns,
   buildSchemaOverrideSpec,
   hasInvalidTargetColumnNames,
+  pruneOverridesForTables,
   setOverrideDraft,
+  tablesOwnedByFile,
   type ColumnOverrideDraft,
 } from './overrides.ts';
 import {
@@ -82,6 +84,7 @@ export default function DatabaseTab() {
   const redownloadController = useRef<AbortController | null>(null);
   const debounceTimer = useRef<number | undefined>(undefined);
   const analyzeSeq = useRef(0);
+  const saveSeq = useRef(0);
   const pendingNameEditRef = useRef(false);
 
   const rootRef = useRef<HTMLDivElement>(null);
@@ -326,20 +329,9 @@ export default function DatabaseTab() {
     // Prune drafts tied to tables owned by the removed file so they never leak to remaining tables.
     let nextOverrides = stateRef.current.overrides;
     if (removed && stateRef.current.analysis) {
-      const removedTables = new Set<string>();
-      for (const t of stateRef.current.analysis.tables) {
-        if (
-          t.source.sourcePath === removed.name ||
-          t.source.displayName === removed.name ||
-          t.source.displayName.startsWith(`${removed.name} `)
-        ) {
-          removedTables.add(t.source.tableName);
-        }
-      }
+      const removedTables = tablesOwnedByFile(stateRef.current.analysis, removed.name);
       if (removedTables.size > 0) {
-        nextOverrides = Object.fromEntries(
-          Object.entries(nextOverrides).filter(([key]) => !removedTables.has(key.split('\0')[0] ?? '')),
-        );
+        nextOverrides = pruneOverridesForTables(nextOverrides, removedTables);
       }
     }
 
@@ -356,6 +348,7 @@ export default function DatabaseTab() {
 
   const handleSettingsChange = (patch: Partial<DatabaseSettings>) => {
     const cur = stateRef.current;
+    if (cur.savingDb) return;
     const nextSettings = { ...cur.settings, ...patch };
     dispatch({ type: 'setSettings', patch });
 
@@ -469,6 +462,8 @@ export default function DatabaseTab() {
     if (hasInvalidTargetColumnNames(overridesToUse, cur.analysis)) return;
 
     const startFileRev = cur.fileRevision;
+    const mySaveSeq = ++saveSeq.current;
+    let saveSettled = false;
     window.clearTimeout(debounceTimer.current);
     saveController.current?.abort();
     const controller = new AbortController();
@@ -496,9 +491,12 @@ export default function DatabaseTab() {
         afterLoad.fileRevision !== startFileRev ||
         afterLoad.editRevision !== expectedEditRevision
       ) {
+        saveSettled = true;
+        dispatch({ type: 'cancelSaveDb', now: Date.now() });
         return;
       }
 
+      saveSettled = true;
       dispatch({
         type: 'saveDbSucceeded',
         outcome,
@@ -578,6 +576,10 @@ export default function DatabaseTab() {
             seq !== analyzeSeq.current ||
             curAfterRefresh.fileRevision !== startFileRev
           ) {
+            if (!controller.signal.aborted && saveSeq.current === mySaveSeq) {
+              saveSettled = true;
+              dispatch({ type: 'cancelSaveDb', now: Date.now() });
+            }
             return;
           }
           dispatch({
@@ -586,19 +588,39 @@ export default function DatabaseTab() {
             fileRevision: startFileRev,
             now: Date.now(),
           });
-          if (curAfterRefresh.editRevision !== expectedEditRevision) return;
+          if (curAfterRefresh.editRevision !== expectedEditRevision) {
+            saveSettled = true;
+            dispatch({ type: 'cancelSaveDb', now: Date.now() });
+            return;
+          }
           await runSaveWithSession(refreshed.sessionId, refreshed);
           return;
         } catch (retryError) {
           if (controller.signal.aborted || (isAppError(retryError) && retryError.kind === 'aborted')) {
             return;
           }
-          dispatch({ type: 'saveDbFailed', error: toAppError(retryError), now: Date.now() });
+          saveSettled = true;
+          dispatch({
+            type: 'saveDbFailed',
+            error: toAppError(retryError),
+            fileRevision: startFileRev,
+            editRevision: expectedEditRevision,
+            now: Date.now(),
+          });
           return;
         }
       }
-      if (latest.fileRevision === startFileRev && latest.editRevision === expectedEditRevision) {
-        dispatch({ type: 'saveDbFailed', error: toAppError(error), now: Date.now() });
+      saveSettled = true;
+      dispatch({
+        type: 'saveDbFailed',
+        error: toAppError(error),
+        fileRevision: startFileRev,
+        editRevision: expectedEditRevision,
+        now: Date.now(),
+      });
+    } finally {
+      if (!saveSettled && saveSeq.current === mySaveSeq && !controller.signal.aborted) {
+        dispatch({ type: 'cancelSaveDb', now: Date.now() });
       }
     }
   };
@@ -640,6 +662,7 @@ export default function DatabaseTab() {
       onChange={handleSettingsChange}
       isExpanded={settingsOpen}
       onExpandedChange={setSettingsOpen}
+      disabled={state.savingDb}
     />
   );
 

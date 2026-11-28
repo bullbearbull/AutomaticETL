@@ -9,6 +9,7 @@ export interface PurposeSelectorProps {
   value: Purpose;
   onChange: (value: Purpose) => void;
   compact?: boolean;
+  disabled?: boolean;
 }
 
 /**
@@ -16,7 +17,12 @@ export interface PurposeSelectorProps {
  * `원본 보관용`). When `원본 보관용` (`archive`) is selected, links the inline
  * guidance to the radio group and announces it politely via a persistent live region.
  */
-export function PurposeSelector({ value, onChange, compact = false }: PurposeSelectorProps) {
+export function PurposeSelector({
+  value,
+  onChange,
+  compact = false,
+  disabled = false,
+}: PurposeSelectorProps) {
   const archiveNoticeId = useId();
   const isArchive = value === 'archive';
 
@@ -24,6 +30,7 @@ export function PurposeSelector({ value, onChange, compact = false }: PurposeSel
     <div className={styles.wrapper}>
       <RadioGroup
         value={value}
+        isDisabled={disabled}
         aria-describedby={isArchive ? archiveNoticeId : undefined}
         onChange={(next) => {
           if (next === 'oltp' || next === 'analytics' || next === 'archive') onChange(next);

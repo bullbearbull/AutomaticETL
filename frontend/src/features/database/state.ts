@@ -4,6 +4,7 @@ import { statusText } from './copy.ts';
 import {
   hasInvalidTargetColumnNames,
   pruneOverridesForTables,
+  tablesOwnedByFile,
   type ColumnOverrideDraft,
 } from './overrides.ts';
 import { unmaskedPiiColumns } from './pii.ts';
@@ -108,7 +109,14 @@ export type DatabaseAction =
       editRevision: number;
       now: number;
     }
-  | { type: 'saveDbFailed'; error: AppError; now: number }
+  | {
+      type: 'saveDbFailed';
+      error: AppError;
+      fileRevision?: number;
+      editRevision?: number;
+      now: number;
+    }
+  | { type: 'cancelSaveDb'; now: number }
   | { type: 'markExported'; fileRevision: number; editRevision: number }
   | { type: 'markBundleExpired' };
 
@@ -177,18 +185,9 @@ export function databaseReducer(state: DatabaseState, action: DatabaseAction): D
           editRevision: state.editRevision + 1,
         };
       }
-      const removedTables = new Set<string>();
-      if (removed && state.analysis) {
-        for (const t of state.analysis.tables) {
-          if (
-            t.source.sourcePath === removed.name ||
-            t.source.displayName === removed.name ||
-            t.source.displayName.startsWith(`${removed.name} `)
-          ) {
-            removedTables.add(t.source.tableName);
-          }
-        }
-      }
+      const removedTables = removed
+        ? tablesOwnedByFile(state.analysis, removed.name)
+        : new Set<string>();
       return {
         ...state,
         files: remaining,
@@ -315,10 +314,23 @@ export function databaseReducer(state: DatabaseState, action: DatabaseAction): D
         endedAt: action.now,
       };
     case 'saveDbFailed':
+      if (
+        (action.fileRevision !== undefined && action.fileRevision !== state.fileRevision) ||
+        (action.editRevision !== undefined && action.editRevision !== state.editRevision)
+      ) {
+        return { ...state, savingDb: false, endedAt: action.now };
+      }
       return {
         ...state,
         savingDb: false,
         noticeError: action.error,
+        endedAt: action.now,
+      };
+    case 'cancelSaveDb':
+      if (!state.savingDb) return state;
+      return {
+        ...state,
+        savingDb: false,
         endedAt: action.now,
       };
     case 'markExported':

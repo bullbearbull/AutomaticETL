@@ -41,6 +41,17 @@
   border-color: var(--color-text);
 }
 
+.select:disabled,
+.input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.select:disabled:hover,
+.input:disabled:hover {
+  border-color: var(--color-border-input);
+}
+
 .description {
   color: var(--color-text-secondary);
   font-size: var(--font-size-tiny);
@@ -91,6 +102,15 @@
 
 .toggle[data-hovered] .box {
   border-color: var(--color-text);
+}
+
+.toggle[data-disabled] {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.toggle[data-disabled][data-hovered] .box {
+  border-color: var(--color-border-input);
 }
 
 .toggleLabel {

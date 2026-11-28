@@ -59,8 +59,9 @@ function formatLocalTime(iso: string): string {
 /**
  * Center column (`결과`) for the DB tab:
  * - Loading & error states (with non-blocking dismissible notice on existing analysis)
- * - Inline editable schema table (`표 구조`) keyed by `targetColumn` with read-only
- *   surrogate & decomposed string-slot rows
+ * - Inline editable schema table (`표 구조`): editable rows are keyed by table +
+ *   `sourceColumn` to preserve input focus across revalidation, while read-only
+ *   surrogate & decomposed string-slot rows are keyed by table + `targetColumn`
  * - Relations (`표 연결`), save order + folded SQL/report (`저장 순서·정리`), and save summary (`저장 결과`)
  */
 export function ResultPanel({
@@ -287,7 +288,7 @@ export function ResultPanel({
                         : resultCopy.readOnlyDecomposedNote;
 
                     return (
-                      <tr key={targetCol}>
+                      <tr key={`ro:${currentTable.source.tableName}:${targetCol}`}>
                         <td>
                           <div className={styles.colCell}>
                             <span className={styles.sourceColName}>{displaySource}</span>
@@ -342,7 +343,7 @@ export function ResultPanel({
                     draft.masking ?? currentPlan?.columnMasking[col] ?? 'none';
 
                   return (
-                    <tr key={targetCol}>
+                    <tr key={`ed:${currentTable.source.tableName}:${col}`}>
                       <td>
                         <div className={styles.colCell}>
                           <span className={styles.sourceColName}>{col}</span>

@@ -195,6 +195,85 @@ test('renders surrogate PK and decomposed string slot rows as read-only with def
   await expect(result.getByRole('textbox', { name: 'item_code의 DB 열 이름' })).toHaveCount(1);
 });
 
+test('keeps focus in column name input across debounced revalidation and disables settings while saving DB', async ({
+  page,
+}) => {
+  const panel = await openDatabaseTab(page);
+  await pickDatabaseFiles(panel, page, [CUSTOMERS_CSV]);
+
+  const result = panel.getByRole('region', { name: workspaceCopy.result, exact: true });
+  const gradeInput = result.getByRole('textbox', { name: 'grade의 DB 열 이름' });
+  await expect(gradeInput).toBeVisible({ timeout: 20_000 });
+
+  // Type slowly enough for the 400ms debounced revalidation to fire and return, then ensure focus stays in input.
+  const firstRevalRes = page.waitForResponse(
+    (res) =>
+      res.url().endsWith('/api/analyze-tables') &&
+      res.request().method() === 'POST' &&
+      (res.request().postData() ?? '').includes('"target_column":"customer_t"'),
+  );
+  await gradeInput.click();
+  await gradeInput.press('ControlOrMeta+a');
+  await gradeInput.pressSequentially('customer_t');
+  expect((await firstRevalRes).status()).toBe(200);
+  await expect(gradeInput).toBeFocused();
+  await expect(gradeInput).toHaveValue('customer_t');
+
+  const secondRevalRes = page.waitForResponse(
+    (res) =>
+      res.url().endsWith('/api/analyze-tables') &&
+      res.request().method() === 'POST' &&
+      (res.request().postData() ?? '').includes('"target_column":"customer_tier"'),
+  );
+  await page.keyboard.type('ier');
+  await page.keyboard.press('Enter');
+  expect((await secondRevalRes).status()).toBe(200);
+  await expect(gradeInput).toHaveValue('customer_tier');
+
+  // Switch purpose to archive and expand 세부 설정 so settings controls are visible before saving.
+  const archiveRevalRes = page.waitForResponse(
+    (res) =>
+      res.url().endsWith('/api/analyze-tables') &&
+      res.request().method() === 'POST' &&
+      (res.request().postData() ?? '').includes('"purpose":"archive"'),
+  );
+  await panel.getByText('원본 보관용', { exact: true }).click();
+  expect((await archiveRevalRes).status()).toBe(200);
+  await panel.getByRole('button', { name: settingsCopy.heading }).click();
+
+  const engineSelect = panel.getByLabel(settingsCopy.dbEngine.label);
+  const notesInput = panel.getByLabel(settingsCopy.notes.label);
+  const archiveRadio = panel.getByRole('radio', { name: /원본 보관용/ });
+
+  let releaseLoad!: () => void;
+  const loadHeld = new Promise<void>((resolve) => {
+    releaseLoad = resolve;
+  });
+  let loadIntercepted = false;
+  await page.route('**/api/etl/load-db', async (route) => {
+    loadIntercepted = true;
+    await loadHeld;
+    await route.continue();
+  });
+
+  const downloadPromise = page.waitForEvent('download');
+  await panel.getByRole('button', { name: exportCopy.saveDb }).click();
+  await expect.poll(() => loadIntercepted).toBe(true);
+
+  await expect(panel.getByRole('button', { name: exportCopy.savingDb })).toBeDisabled();
+  await expect(archiveRadio).toBeDisabled();
+  await expect(engineSelect).toBeDisabled();
+  await expect(notesInput).toBeDisabled();
+
+  releaseLoad();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe('autoetl_data.sqlite');
+  await expect(result.getByText(resultCopy.saved.heading)).toBeVisible({ timeout: 20_000 });
+  await expect(engineSelect).toBeEnabled();
+  await expect(notesInput).toBeEnabled();
+  await expect(panel.getByRole('button', { name: exportCopy.saveDb })).toBeEnabled();
+});
+
 test('blocks saving while replacement analysis fails or is in progress, and supports save-as-is', async ({
   page,
 }, testInfo) => {

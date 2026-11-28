@@ -238,3 +238,80 @@ test('analyzeSucceeded ignores responses from superseded fileRevision and failed
   assert.equal(stepFor(state), 2);
   assert.equal(statusFor(state).tone, 'error');
 });
+
+test('savingDb always clears when revisions drift during save or save fails/cancels', () => {
+  let base = databaseReducer(initialDatabaseState, {
+    type: 'mergeFiles',
+    items: [{ id: 'f1', file: fakeFile('customers.csv'), name: 'customers.csv', size: 100 }],
+  });
+  base = databaseReducer(base, {
+    type: 'analyzeSucceeded',
+    result: sampleAnalyze(),
+    fileRevision: base.fileRevision,
+    now: 50,
+  });
+
+  const outcome = normalizeLoadDbResponse({
+    download_token: 'tok-drift',
+    download_filename: 'autoetl_data.sqlite',
+    load_result: {
+      batch_id: 'b3',
+      loaded_at: '2026-11-28T01:00:00Z',
+      db_engine: 'sqlite',
+      status: 'succeeded',
+      tables: [],
+      total_rows_read: 2,
+      total_rows_loaded: 2,
+      total_rows_quarantined: 0,
+    },
+  });
+
+  // Drift before saveDbSucceeded: savingDb must clear to false without publishing stale outcome.
+  let state = databaseReducer(base, { type: 'startSaveDb', now: 100 });
+  const startEditRev = state.editRevision;
+  assert.equal(state.savingDb, true);
+  state = databaseReducer(state, { type: 'setSettings', patch: { notes: 'changed' } });
+  state = databaseReducer(state, {
+    type: 'saveDbSucceeded',
+    outcome,
+    fileRevision: state.fileRevision,
+    editRevision: startEditRev,
+    now: 200,
+  });
+  assert.equal(state.savingDb, false);
+  assert.equal(state.loadOutcome, null);
+  assert.equal(stepFor(state), 2);
+
+  // Drift before saveDbFailed: savingDb must clear without surfacing a stale noticeError.
+  const err = new AppError({ kind: 'server', what: 'fail', why: 'why', how: 'how' });
+  state = databaseReducer(base, { type: 'startSaveDb', now: 300 });
+  const failEditRev = state.editRevision;
+  state = databaseReducer(state, { type: 'setSettings', patch: { notes: 'again' } });
+  state = databaseReducer(state, {
+    type: 'saveDbFailed',
+    error: err,
+    fileRevision: state.fileRevision,
+    editRevision: failEditRev,
+    now: 400,
+  });
+  assert.equal(state.savingDb, false);
+  assert.equal(state.noticeError, null);
+
+  // cancelSaveDb clears savingDb cleanly.
+  state = databaseReducer(base, { type: 'startSaveDb', now: 500 });
+  assert.equal(state.savingDb, true);
+  state = databaseReducer(state, { type: 'cancelSaveDb', now: 600 });
+  assert.equal(state.savingDb, false);
+
+  // Matching revision failure clears savingDb and sets noticeError.
+  state = databaseReducer(base, { type: 'startSaveDb', now: 700 });
+  state = databaseReducer(state, {
+    type: 'saveDbFailed',
+    error: err,
+    fileRevision: state.fileRevision,
+    editRevision: state.editRevision,
+    now: 800,
+  });
+  assert.equal(state.savingDb, false);
+  assert.equal(state.noticeError, err);
+});

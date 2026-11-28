@@ -1,5 +1,5 @@
 import { useId } from 'react';
-import { Checkbox, Text } from 'react-aria-components';
+import { Checkbox } from 'react-aria-components';
 import { Details, Icon } from '../../components/index.ts';
 import type { DbEngine, OrphanPolicy } from './api.ts';
 import { settingsCopy } from './copy.ts';
@@ -11,13 +11,20 @@ export interface SettingsPanelProps {
   onChange: (patch: Partial<DatabaseSettings>) => void;
   isExpanded: boolean;
   onExpandedChange: (isExpanded: boolean) => void;
+  disabled?: boolean;
 }
 
 /**
  * Folded advanced settings for the DB tab (`세부 설정`). All defaults match
  * the backend engine defaults (`sqlite`, `quarantine`, `decomposeStrings=true`).
  */
-export function SettingsPanel({ settings, onChange, isExpanded, onExpandedChange }: SettingsPanelProps) {
+export function SettingsPanel({
+  settings,
+  onChange,
+  isExpanded,
+  onExpandedChange,
+  disabled = false,
+}: SettingsPanelProps) {
   const engineId = useId();
   const orphanId = useId();
   const notesId = useId();
@@ -37,6 +44,7 @@ export function SettingsPanel({ settings, onChange, isExpanded, onExpandedChange
           <select
             id={engineId}
             value={settings.dbEngine}
+            disabled={disabled}
             onChange={(e) => onChange({ dbEngine: e.target.value as DbEngine })}
             className={styles.select}
           >
@@ -55,6 +63,7 @@ export function SettingsPanel({ settings, onChange, isExpanded, onExpandedChange
           <select
             id={orphanId}
             value={settings.orphanPolicy}
+            disabled={disabled}
             onChange={(e) => onChange({ orphanPolicy: e.target.value as OrphanPolicy })}
             className={styles.select}
           >
@@ -69,18 +78,21 @@ export function SettingsPanel({ settings, onChange, isExpanded, onExpandedChange
         <div className={styles.checks}>
           <ToggleOption
             checked={settings.decomposeStrings}
+            disabled={disabled}
             onChange={(val) => onChange({ decomposeStrings: val })}
             label={settingsCopy.decomposeStrings.label}
             description={settingsCopy.decomposeStrings.description}
           />
           <ToggleOption
             checked={settings.includeAuditColumns}
+            disabled={disabled}
             onChange={(val) => onChange({ includeAuditColumns: val })}
             label={settingsCopy.includeAuditColumns.label}
             description={settingsCopy.includeAuditColumns.description}
           />
           <ToggleOption
             checked={settings.includeManagementTables}
+            disabled={disabled}
             onChange={(val) => onChange({ includeManagementTables: val })}
             label={settingsCopy.includeManagementTables.label}
             description={settingsCopy.includeManagementTables.description}
@@ -95,6 +107,7 @@ export function SettingsPanel({ settings, onChange, isExpanded, onExpandedChange
             id={notesId}
             type="text"
             value={settings.notes}
+            disabled={disabled}
             onChange={(e) => onChange({ notes: e.target.value })}
             placeholder={settingsCopy.notes.placeholder}
             className={styles.input}
@@ -108,18 +121,27 @@ export function SettingsPanel({ settings, onChange, isExpanded, onExpandedChange
 
 function ToggleOption({
   checked,
+  disabled = false,
   onChange,
   label,
   description,
 }: {
   checked: boolean;
+  disabled?: boolean;
   onChange: (checked: boolean) => void;
   label: string;
   description: string;
 }) {
+  const descriptionId = useId();
   return (
     <div className={styles.toggleField}>
-      <Checkbox isSelected={checked} onChange={onChange} className={styles.toggle}>
+      <Checkbox
+        isSelected={checked}
+        isDisabled={disabled}
+        aria-describedby={descriptionId}
+        onChange={onChange}
+        className={styles.toggle}
+      >
         {({ isSelected }) => (
           <>
             <span className={styles.box} aria-hidden="true">
@@ -129,9 +151,9 @@ function ToggleOption({
           </>
         )}
       </Checkbox>
-      <Text slot="description" className={styles.toggleDescription}>
+      <span id={descriptionId} className={styles.toggleDescription}>
         {description}
-      </Text>
+      </span>
     </div>
   );
 }
