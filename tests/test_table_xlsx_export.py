@@ -382,10 +382,15 @@ def test_bundle_without_tables_writes_no_workbook(tmp_path: Path) -> None:
             "</w:body></w:document>",
         )
 
+    # 같은 출력 폴더에 이전 문서의 표 파일이 남아 있던 경우.
+    stale = tmp_path / "out" / TABLES_XLSX_NAME
+    stale.parent.mkdir()
+    stale.write_bytes(b"old")
+
     _doc, manifest = parse_and_export(path, tmp_path / "out")
 
     assert manifest.tables_xlsx is None
-    assert not (tmp_path / "out" / TABLES_XLSX_NAME).exists()
+    assert not stale.exists()
 
 
 def test_exported_workbook_reads_back_with_the_xlsx_parser(tmp_path: Path) -> None:

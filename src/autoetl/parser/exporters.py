@@ -610,9 +610,13 @@ def export_parse_bundle(
 
     tables_xlsx: Path | None = None
     xlsx_skipped: tuple[str, ...] = ()
+    xlsx_path = out_dir / TABLES_XLSX_NAME
     if doc.tables:
-        tables_xlsx = out_dir / TABLES_XLSX_NAME
-        xlsx_skipped = export_tables_xlsx(doc.tables, tables_xlsx)
+        tables_xlsx = xlsx_path
+        xlsx_skipped = export_tables_xlsx(doc.tables, xlsx_path)
+    else:
+        # 같은 폴더에 다시 내보낼 때, 이전 문서의 표 파일이 남아 이번 결과처럼 보이지 않게 한다.
+        xlsx_path.unlink(missing_ok=True)
 
     crop_paths = tuple(Path(v.crop_path) for v in doc.visual_regions if v.crop_path is not None)
 
