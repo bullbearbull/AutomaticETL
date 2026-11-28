@@ -26,6 +26,7 @@ from autoetl.parser.legacy.cfb import (
 _ENDOFCHAIN = 0xFFFFFFFE
 _FREESECT = 0xFFFFFFFF
 _FATSECT = 0xFFFFFFFD
+_DIFSECT = 0xFFFFFFFC
 _NOSTREAM = 0xFFFFFFFF
 _SECTOR_SIZE = 512
 _MINI_SECTOR_SIZE = 64
@@ -366,6 +367,10 @@ def test_cfb_difat_extension_chain(tmp_path: Path) -> None:
     raw.extend(struct.pack(f"<{len(entries)}I", *entries))
     struct.pack_into("<I", raw, 68, new_sec)
     struct.pack_into("<I", raw, 72, 1)
+    # 헤더 DIFAT 슬롯을 비워 FAT 섹터가 확장 DIFAT 체인으로만 발견되게 한다
+    struct.pack_into("<I", raw, 76, _FREESECT)
+    # 추가한 DIFAT 섹터를 FAT에 DIFSECT로 표시한다
+    struct.pack_into("<I", raw, 512 + fat_sec * 512 + new_sec * 4, _DIFSECT)
     path.write_bytes(bytes(raw))
     with CfbFile(path) as cfb:
         assert cfb.read_stream("S") == b"x" * 5000
@@ -569,15 +574,21 @@ def test_blips_dedup_max_images_and_small_skip() -> None:
     png = _png()
     rec = _wrap_officeart_png_blip(png)
     assert len(extract_officeart_blips(rec + rec)) == 1  # 해시 중복 제거
-    assert len(extract_officeart_blips(rec + rec, max_images=1)) == 1
+    # 서로 다른 PNG 두 개로 max_images 제한 자체를 검증한다(중복 제거로는 항상 1개)
+    other = _wrap_officeart_png_blip(_png(40, 28))
+    assert len(extract_officeart_blips(rec + other)) == 2
+    assert len(extract_officeart_blips(rec + other, max_images=1)) == 1
     small = _blip_record(0xF01E, 0x6E0, _png(4, 4))
     assert extract_officeart_blips(small) == []  # 8px 미만 제외
 
 
 def test_blips_container_descent_and_record_skip() -> None:
-    inner = _wrap_officeart_png_blip(_png())
+    # JPEG은 PNG 시그니처 폴백 스캔으로 구제될 수 없어 레코드 경로만 검증한다
+    inner = _blip_record(0xF01D, 0x460, _fake_jpeg())
     container = struct.pack("<HHI", 0x000F, 0xF000, len(inner)) + inner
-    assert len(extract_officeart_blips(container)) == 1
+    blips = extract_officeart_blips(container)
+    assert len(blips) == 1
+    assert blips[0].extension == ".jpg"
     # 비컨테이너 OfficeArt 레코드는 건너뜀
     skip = struct.pack("<HHI", 0x0000, 0xF001, 4) + b"abcd"
     assert len(extract_officeart_blips(skip + inner)) == 1
