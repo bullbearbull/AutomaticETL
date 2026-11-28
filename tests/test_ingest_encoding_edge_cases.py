@@ -70,6 +70,16 @@ def test_delimiter_ignores_record_cut_at_the_sample_boundary(tmp_path: Path) -> 
     assert spec.row_count == 3
 
 
+def test_delimiter_keeps_complete_last_record_when_sample_is_full(tmp_path: Path) -> None:
+    source = tmp_path / "notes.csv"
+    source.write_text("a;b;c;d,x,y\n1,2,3\n" + ("\n" * 48), encoding="utf-8", newline="")
+
+    spec = probe_source(source)
+    assert spec.delimiter == ","
+    assert spec.header == ["a;b;c;d", "x", "y"]
+    assert spec.row_count == 1
+
+
 def test_probe_rejects_oversized_cell_that_another_delimiter_would_split(
     tmp_path: Path,
 ) -> None:
