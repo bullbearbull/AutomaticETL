@@ -295,15 +295,17 @@ def test_registry_empty_message_and_custom_registration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """빈 레지스트리의 '(없음)' 안내와 커스텀 어댑터 등록·조회를 검증한다."""
+    original = dict(pipeline_mod._ADAPTER_REGISTRY)
     monkeypatch.setattr(pipeline_mod, "_ADAPTER_REGISTRY", {})
     with pytest.raises(ParserInputError, match="없음"):
         get_adapter_for_path(Path("a.pdf"))
 
     # 원본 레지스트리 복사본에 등록해 다른 테스트에 영향을 주지 않는다.
-    monkeypatch.setattr(pipeline_mod, "_ADAPTER_REGISTRY", dict(pipeline_mod._ADAPTER_REGISTRY))
+    monkeypatch.setattr(pipeline_mod, "_ADAPTER_REGISTRY", dict(original))
     fake = _FakeFormatAdapter(_doc([]))
     register_adapter(fake)
     assert ".fake" in supported_extensions()
+    assert ".pdf" in supported_extensions()
     assert get_adapter_for_path(Path("sample.FAKE")) is fake
 
 

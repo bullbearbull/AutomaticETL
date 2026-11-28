@@ -497,11 +497,30 @@ def test_openai_empty_model_and_external_block() -> None:
 
 def test_openai_api_key_and_trust_zone(monkeypatch: pytest.MonkeyPatch) -> None:
     """환경변수 API 키 공백 제거·Bearer 헤더, 키 없으면 빈 헤더."""
+    captured: dict[str, Any] = {}
+    resp = {"choices": [{"message": {"content": "가짜 인식 텍스트"}}]}
+
+    def _fake(
+        url: str,
+        *,
+        zone: TrustZone,
+        payload: Any = None,
+        headers: Any = None,
+        timeout_sec: float = 90.0,
+    ) -> dict[str, Any]:
+        captured["headers"] = headers
+        return resp
+
+    monkeypatch.setattr(vision_mod, "_open_json_request", _fake)
     monkeypatch.setenv("FAKE_VLM_KEY", "  fake-key-123  ")
     adapter = OpenAICompatibleVlmAdapter(model="m", api_key_env="FAKE_VLM_KEY")
     assert adapter.trust_zone is TrustZone.LOOPBACK
-    assert adapter._auth_headers() == {"Authorization": "Bearer fake-key-123"}
-    assert OpenAICompatibleVlmAdapter(model="m")._auth_headers() == {}
+    assert adapter.parse_region(_request()).succeeded is True
+    assert captured["headers"] == {"Authorization": "Bearer fake-key-123"}
+
+    no_key = OpenAICompatibleVlmAdapter(model="m")
+    assert no_key.parse_region(_request()).succeeded is True
+    assert "Authorization" not in captured["headers"]
 
 
 def test_openai_missing_image() -> None:
