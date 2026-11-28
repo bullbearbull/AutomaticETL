@@ -397,15 +397,41 @@ def render_routing_report_markdown(plan: RoutingPlan) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+# 스프레드시트(엑셀·Numbers 등)가 칸 값을 수식으로 읽기 시작하는 첫 글자.
+_SPREADSHEET_FORMULA_STARTS = ("=", "+", "-", "@", "\t", "\r")
+# 위 글자로 시작해도 그냥 숫자인 값(-1,234 · +5% · -3.5 · -.5)은 숫자로 남긴다.
+# 예외는 일부러 좁게 둔다. 지수 표기(-1e5)는 예외에 넣지 않아 앞에 '가 붙는다.
+_PLAIN_NUMBER_RE = re.compile(
+    r"[+-]?(?:(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?|\.[0-9]+)%?"
+)
+
+
+def spreadsheet_safe_cell(value: str) -> str:
+    """표 칸 값이 스프레드시트에서 수식으로 실행되지 않도록 앞에 ``'``를 붙인다.
+
+    ``=``, ``+``, ``-``, ``@``, 탭, CR로 시작하는 값에만 붙인다. ``-1,234``·``+5%`` 같은
+    숫자와 빈칸 표시로 쓰는 ``-`` 하나는 그대로 둔다. 화면의 표 복사
+    (``frontend/src/lib/tableClipboard.ts``의 ``spreadsheetSafe``)도 같은 규칙을 쓴다.
+    """
+    if not value.startswith(_SPREADSHEET_FORMULA_STARTS):
+        return value
+    if value == "-" or _PLAIN_NUMBER_RE.fullmatch(value):
+        return value
+    return "'" + value
+
+
 def export_table_csv(table: ExtractedTable, out_path: Path) -> None:
-    """추출된 표 하나를 BOM이 포함된 UTF-8 CSV로 저장한다."""
+    """추출된 표 하나를 BOM이 포함된 UTF-8 CSV로 저장한다.
+
+    칸 값은 ``spreadsheet_safe_cell``을 거쳐 스프레드시트에서 수식으로 실행되지 않게 한다.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.writer(fh)
         if table.headers:
-            writer.writerow(table.headers)
+            writer.writerow([spreadsheet_safe_cell(cell) for cell in table.headers])
         for row in table.rows:
-            writer.writerow(row)
+            writer.writerow([spreadsheet_safe_cell(cell) for cell in row])
 
 
 def export_table_json(table: ExtractedTable, out_path: Path) -> None:

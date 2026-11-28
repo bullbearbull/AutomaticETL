@@ -1,0 +1,31 @@
+{
+  "description": "표 칸 값이 스프레드시트에서 수식으로 실행되지 않게 막는 규칙의 공용 예시. Python spreadsheet_safe_cell과 화면의 spreadsheetSafe가 함께 쓴다.",
+  "cases": [
+    { "input": "=1+1", "expected": "'=1+1" },
+    { "input": "=SUM(A1:A2)", "expected": "'=SUM(A1:A2)" },
+    { "input": "+1+1", "expected": "'+1+1" },
+    { "input": "-2+3", "expected": "'-2+3" },
+    { "input": "@SUM(A1:A2)", "expected": "'@SUM(A1:A2)" },
+    { "input": "\t=1+1", "expected": "'\t=1+1" },
+    { "input": "\r=1+1", "expected": "'\r=1+1" },
+    { "input": "=", "expected": "'=" },
+    { "input": "+", "expected": "'+" },
+    { "input": "--", "expected": "'--" },
+    { "input": "- 항목", "expected": "'- 항목" },
+    { "input": "-1,23", "expected": "'-1,23" },
+    { "input": "-1e5", "expected": "'-1e5" },
+    { "input": "-", "expected": "-" },
+    { "input": "-1,234", "expected": "-1,234" },
+    { "input": "-1,234.56", "expected": "-1,234.56" },
+    { "input": "+5%", "expected": "+5%" },
+    { "input": "-3.5", "expected": "-3.5" },
+    { "input": "-.5", "expected": "-.5" },
+    { "input": "+0", "expected": "+0" },
+    { "input": "1,234", "expected": "1,234" },
+    { "input": "1+1", "expected": "1+1" },
+    { "input": "a=b", "expected": "a=b" },
+    { "input": "총무팀", "expected": "총무팀" },
+    { "input": "'=1+1", "expected": "'=1+1" },
+    { "input": "", "expected": "" }
+  ]
+}

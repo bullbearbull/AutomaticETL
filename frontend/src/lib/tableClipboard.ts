@@ -1,6 +1,8 @@
 /**
  * Table copy for Excel: tab-separated text plus an HTML <table>, so a paste
- * into Excel splits cells the way the table shows them.
+ * into Excel splits cells the way the table shows them. Text cells that a
+ * spreadsheet could run as a formula get a leading apostrophe on the way out
+ * (see `spreadsheetSafe`); the table on screen is not changed.
  */
 
 export type TableCell = string | number | boolean | null | undefined;
@@ -9,6 +11,31 @@ export type TableRows = readonly (readonly TableCell[])[];
 function cellText(cell: TableCell): string {
   if (cell === null || cell === undefined) return '';
   return String(cell);
+}
+
+/** First characters that make a spreadsheet read a cell as a formula. */
+const FORMULA_START = /^[=+\-@\t\r]/;
+/**
+ * A plain number such as -1,234, +5%, -3.5 or -.5 stays a number. The
+ * exception is kept narrow on purpose: exponent notation (-1e5) is not in it.
+ */
+const PLAIN_NUMBER = /^[+-]?(?:(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?|\.[0-9]+)%?$/;
+
+/**
+ * Puts an apostrophe in front of text that starts with =, +, -, @, a tab or a
+ * CR, so a spreadsheet keeps it as text instead of running it as a formula.
+ * Plain numbers and a lone "-" (often used for an empty cell) stay as they
+ * are. The CSV files the server writes use the same rule
+ * (`spreadsheet_safe_cell` in `src/autoetl/parser/exporters.py`).
+ */
+export function spreadsheetSafe(text: string): string {
+  if (!FORMULA_START.test(text) || text === '-' || PLAIN_NUMBER.test(text)) return text;
+  return `'${text}`;
+}
+
+/** Cell text for the clipboard. Only text cells can hold a formula. */
+function copyCellText(cell: TableCell): string {
+  return typeof cell === 'string' ? spreadsheetSafe(cell) : cellText(cell);
 }
 
 /**
@@ -21,7 +48,7 @@ export function rowsToTsv(rows: TableRows): string {
     .map((row) =>
       row
         .map((cell) => {
-          const text = cellText(cell).replace(/\r\n?/g, '\n');
+          const text = copyCellText(cell).replace(/\r\n?/g, '\n');
           return /[\t\n"]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
         })
         .join('\t'),
@@ -46,7 +73,7 @@ export function rowsToHtml(rows: TableRows, options: { headerRows?: number } = {
   const headerRows = Math.max(0, Math.min(options.headerRows ?? 0, rows.length));
   const renderRow = (row: readonly TableCell[], tag: 'th' | 'td') =>
     `<tr>${row
-      .map((cell) => `<${tag}>${escapeHtml(cellText(cell)).replace(/\r\n?|\n/g, '<br>')}</${tag}>`)
+      .map((cell) => `<${tag}>${escapeHtml(copyCellText(cell)).replace(/\r\n?|\n/g, '<br>')}</${tag}>`)
       .join('')}</tr>`;
   const head = rows.slice(0, headerRows).map((row) => renderRow(row, 'th')).join('');
   const body = rows.slice(headerRows).map((row) => renderRow(row, 'td')).join('');

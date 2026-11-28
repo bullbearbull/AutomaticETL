@@ -39,6 +39,7 @@ from autoetl.parser.exporters import (
     render_document_markdown,
     render_routing_report_markdown,
     render_table_markdown,
+    spreadsheet_safe_cell,
 )
 from autoetl.parser.layout_detector import create_layout_detector
 from autoetl.parser.pipeline import parse_and_export, parse_page_selection, supported_extensions
@@ -145,9 +146,9 @@ def _table_to_csv_text(headers: list[str], rows: list[list[str]]) -> str:
     buf = io.StringIO()
     writer = csv.writer(buf)
     if headers:
-        writer.writerow(headers)
+        writer.writerow([spreadsheet_safe_cell(h) for h in headers])
     for r in rows:
-        writer.writerow(r)
+        writer.writerow([spreadsheet_safe_cell(c) for c in r])
     return buf.getvalue()
 
 
