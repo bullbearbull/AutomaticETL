@@ -15,7 +15,10 @@ function cellText(cell: TableCell): string {
 
 /** First characters that make a spreadsheet read a cell as a formula. */
 const FORMULA_START = /^[=+\-@\t\r]/;
-/** A plain number such as -1,234, +5%, -3.5 or -.5 stays a number. */
+/**
+ * A plain number such as -1,234, +5%, -3.5 or -.5 stays a number. The
+ * exception is kept narrow on purpose: exponent notation (-1e5) is not in it.
+ */
 const PLAIN_NUMBER = /^[+-]?(?:(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?|\.[0-9]+)%?$/;
 
 /**
