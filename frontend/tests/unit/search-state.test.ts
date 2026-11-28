@@ -157,7 +157,7 @@ test('file changes mark old index stale, ignore late responses, and clear search
   });
   assert.equal(isIndexStale(state), true);
 
-  // Rebuild failure on current revision keeps reference index visible while blocking search.
+  // Rebuild failure on current revision keeps reference index visible while invalidating freshness so retry stays available.
   const err = new AppError({ kind: 'server', what: '실패', why: '원인', how: '방법' });
   state = searchReducer(state, {
     type: 'buildFailed',
@@ -165,8 +165,29 @@ test('file changes mark old index stale, ignore late responses, and clear search
     fileRevision: state.fileRevision,
     now: 90,
   });
+  assert.equal(isIndexStale(state), true);
   assert.equal(canSearch(state), false);
   assert.equal(statusFor(state).tone, 'error');
+
+  // Expired-index rebuild failure on already-indexed fileRevision also invalidates indexedFileRevision for retry.
+  let expiredState = searchReducer(initialSearchState, {
+    type: 'mergeFiles',
+    items: [{ id: 'f1', file: fakeFile('a.docx'), name: 'a.docx', size: 100 }],
+  });
+  expiredState = searchReducer(expiredState, {
+    type: 'buildSucceeded',
+    result: sampleBuild(),
+    fileRevision: expiredState.fileRevision,
+    now: 100,
+  });
+  expiredState = searchReducer(expiredState, {
+    type: 'buildFailed',
+    error: err,
+    fileRevision: expiredState.fileRevision,
+    now: 110,
+  });
+  assert.equal(isIndexStale(expiredState), true);
+  assert.equal(canSearch(expiredState), false);
 });
 
 test('cancelSearch and searchFailed always reset searching flag', () => {

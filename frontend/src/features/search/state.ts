@@ -206,6 +206,7 @@ export function searchReducer(state: SearchState, action: SearchAction): SearchS
         return {
           ...state,
           buildPhase: 'error',
+          indexedFileRevision: null,
           noticeError: action.error,
           endedAt: action.now,
         };

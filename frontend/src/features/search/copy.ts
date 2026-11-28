@@ -70,6 +70,7 @@ export const resultCopy = {
       ? `문서 ${docCount}개 · 목차 ${sectionCount}개 · 표 ${tableCount}개`
       : `문서 ${docCount}개 · 목차 ${sectionCount}개`,
   staleNotice: '넣은 문서가 바뀌어서 검색 준비를 다시 해야 해요.',
+  partialWarningsTitle: (count: number) => `문서 ${count}개는 읽지 못해 검색 대상에서 빠졌어요.`,
   searchForm: {
     label: '찾을 내용이나 단어',
     placeholder: '예: 보관 기간, 연차 사용 기준',
@@ -187,6 +188,11 @@ export const searchErrorCopy = {
     what: '표 조회 조건을 실행하지 못했어요',
     why: '입력한 조건 문법에 맞지 않거나 없는 열 이름을 썼을 수 있어요.',
     how: '열 이름을 확인하고 SELECT 문으로 다시 조회해 주세요.',
+  },
+  noDocumentsIndexed: {
+    what: '넣은 문서를 읽지 못했어요',
+    why: '문서 내용이 비어 있거나 읽는 중 오류가 났어요.',
+    how: '다른 문서를 넣어 보거나 아래 자세히에서 원인을 확인해 주세요.',
   },
 } as const;
 

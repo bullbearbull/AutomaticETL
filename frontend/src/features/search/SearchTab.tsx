@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react';
 import { StatusBar, StepIndicator, Workspace } from '../../components/index.ts';
-import { isAppError, toAppError } from '../../lib/errors.ts';
+import { AppError, isAppError, toAppError } from '../../lib/errors.ts';
 import { readFileAsBase64 } from '../../lib/files.ts';
 import {
   buildDocIndex,
@@ -11,6 +11,7 @@ import {
   type DocSectionContent,
   type DocTableQueryResult,
 } from './api.ts';
+import { searchErrorCopy } from './copy.ts';
 import { DocumentList } from './DocumentList.tsx';
 import { EvidencePanel } from './EvidencePanel.tsx';
 import { checkCombinedUploadSize, checkSearchFile } from './formats.ts';
@@ -150,6 +151,19 @@ export default function SearchTab() {
       );
       const built = await buildDocIndex({ files: encoded }, { signal: controller.signal });
       if (seq !== buildSeq.current || stateRef.current.fileRevision !== fileRevision) return null;
+      if (built.summary.documentsIndexed === 0 && built.documents.length === 0) {
+        dispatch({
+          type: 'buildFailed',
+          error: new AppError({
+            kind: 'unreadable',
+            ...searchErrorCopy.noDocumentsIndexed,
+            detail: built.summary.warnings.join('\n') || undefined,
+          }),
+          fileRevision,
+          now: Date.now(),
+        });
+        return null;
+      }
       dispatch({ type: 'buildSucceeded', result: built, fileRevision, now: Date.now() });
       return built;
     } catch (error) {
@@ -227,7 +241,11 @@ export default function SearchTab() {
     void buildIndexForFiles(remaining, nextFileRevision);
   };
 
-  const executeSearch = async (queryText: string, docIdOverride?: string) => {
+  const executeSearch = async (
+    queryText: string,
+    docIdOverride?: string,
+    options: { preserveTab?: boolean } = {},
+  ) => {
     const cur = stateRef.current;
     const trimmed = queryText.trim();
     if (!trimmed || !canSearch(cur) || !cur.index) return;
@@ -271,7 +289,7 @@ export default function SearchTab() {
         fileRevision: startFileRev,
         now: Date.now(),
       });
-      setActiveTab('results');
+      if (!options.preserveTab) setActiveTab('results');
     };
 
     try {
@@ -427,36 +445,48 @@ export default function SearchTab() {
     }
   };
 
-  const handleTabChange = (tab: SearchSubTabId) => {
-    setActiveTab(tab);
-    const cur = state.index;
-    if (!cur || isIndexStale(state)) return;
+  const syncActiveSubView = (tab: SearchSubTabId, docId: string, resetExisting: boolean) => {
+    const cur = stateRef.current;
+    if (!cur.index || isIndexStale(cur)) return;
 
     if (tab === 'outline') {
-      const sections = state.docFilterId
-        ? cur.sections.filter((s) => s.docId === state.docFilterId)
-        : cur.sections;
+      const sections = docId
+        ? cur.index.sections.filter((s) => s.docId === docId)
+        : cur.index.sections;
       const firstSec = sections[0];
-      if (firstSec && (!sectionContent || !sections.some((s) => s.sectionId === selectedSectionId))) {
+      if (
+        firstSec &&
+        (resetExisting || !sectionContent || !sections.some((s) => s.sectionId === selectedSectionId))
+      ) {
         void loadSection(firstSec.sectionId);
       }
     } else if (tab === 'tables') {
-      const tables = state.docFilterId
-        ? cur.tables.filter((t) => t.docId === state.docFilterId)
-        : cur.tables;
+      const tables = docId
+        ? cur.index.tables.filter((t) => t.docId === docId)
+        : cur.index.tables;
       const firstTbl = tables[0];
-      if (firstTbl && (!tableResult || !tables.some((t) => t.tableUid === selectedTableUid))) {
+      if (
+        firstTbl &&
+        (resetExisting || !tableResult || !tables.some((t) => t.tableUid === selectedTableUid))
+      ) {
         setTableSql(DEFAULT_TABLE_SQL);
         void runTableSql(firstTbl.tableUid, DEFAULT_TABLE_SQL);
       }
     }
   };
 
+  const handleTabChange = (tab: SearchSubTabId) => {
+    setActiveTab(tab);
+    syncActiveSubView(tab, stateRef.current.docFilterId, false);
+  };
+
   const handleDocFilterChange = (docId: string) => {
     dispatch({ type: 'setDocFilter', docId });
+    resetSubViews();
+    syncActiveSubView(activeTab, docId, true);
     const cur = stateRef.current;
     if (cur.searchResult && cur.query.trim() && canSearch(cur)) {
-      void executeSearch(cur.query, docId);
+      void executeSearch(cur.query, docId, { preserveTab: true });
     }
   };
 
@@ -547,6 +577,11 @@ export default function SearchTab() {
               tableResult={tableResult}
               loadingTable={loadingTable}
               onSelectTable={(tableUid) => {
+                setTableSql(DEFAULT_TABLE_SQL);
+                void runTableSql(tableUid, DEFAULT_TABLE_SQL);
+              }}
+              onOpenTable={(tableUid) => {
+                setActiveTab('tables');
                 setTableSql(DEFAULT_TABLE_SQL);
                 void runTableSql(tableUid, DEFAULT_TABLE_SQL);
               }}

@@ -54,6 +54,7 @@ export interface ResultPanelProps {
   tableResult: DocTableQueryResult | null;
   loadingTable: boolean;
   onSelectTable: (tableUid: string) => void;
+  onOpenTable: (tableUid: string) => void;
   onRunTableSql: (sql?: string) => void;
   onCopied: () => void;
   hasEvidencePrimaryAction: boolean;
@@ -96,6 +97,7 @@ export function ResultPanel({
   tableResult,
   loadingTable,
   onSelectTable,
+  onOpenTable,
   onRunTableSql,
   onCopied,
   hasEvidencePrimaryAction,
@@ -257,6 +259,24 @@ export function ResultPanel({
         </p>
       ) : null}
 
+      {index.summary.warnings.length > 0 ? (
+        <div role="status" className={styles.staleBanner}>
+          <Icon name="warning" className={styles.staleIcon} />
+          <div className={styles.warningsContent}>
+            <p className={styles.warningsTitle}>
+              {resultCopy.partialWarningsTitle(
+                index.summary.documentsSkipped || index.summary.warnings.length,
+              )}
+            </p>
+            <ul className={styles.warningsList}>
+              {index.summary.warnings.map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      ) : null}
+
       {noticeError ? (
         <ErrorNotice
           error={noticeError}
@@ -381,12 +401,7 @@ export function ResultPanel({
                               {tbl.headers.length > 0 ? ` · ${tbl.headers.slice(0, 5).join(', ')}` : ''}
                             </span>
                           </div>
-                          <Button
-                            onPress={() => {
-                              onSelectTable(tbl.tableUid);
-                              onTabChange('tables');
-                            }}
-                          >
+                          <Button onPress={() => onOpenTable(tbl.tableUid)}>
                             {resultCopy.results.openTable}
                           </Button>
                         </li>
@@ -463,12 +478,7 @@ export function ResultPanel({
                             <span className={styles.relatedMeta}>
                               {`${tbl.caption || tbl.tableId} (${tbl.rowCount}×${tbl.colCount})`}
                             </span>
-                            <Button
-                              onPress={() => {
-                                onSelectTable(tbl.tableUid);
-                                onTabChange('tables');
-                              }}
-                            >
+                            <Button onPress={() => onOpenTable(tbl.tableUid)}>
                               {resultCopy.results.openTable}
                             </Button>
                           </li>

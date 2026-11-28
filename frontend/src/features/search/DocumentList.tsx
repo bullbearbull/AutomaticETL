@@ -50,8 +50,10 @@ export function DocumentList({
   const dropRef = useRef<HTMLDivElement>(null);
   const { dropProps, isDropTarget } = useDrop({
     ref: dropRef,
+    isDisabled: disabled,
     getDropOperation: () => 'copy',
     onDrop: (event) => {
+      if (disabled) return;
       void filesFrom(event.items).then((dropped) => {
         if (dropped.length > 0) onFiles(dropped);
       });

@@ -158,11 +158,12 @@ test('auto-prepares multiple docs, highlights matches cleanly, folds low relevan
   await expect(panel.locator('[aria-current="step"]')).toContainText('내보내기');
   await expectNoAxeViolations(page);
 
-  // Switch to outline tab -> inspect section body via /api/docindex/section.
+  // Switch to outline tab -> inspect sections via /api/docindex/section (OS directory order independent).
   await result.getByRole('tab', { name: /목차/ }).click();
-  await expect(result.getByText('접속 기록과 접근 이력의 보관 기간은 최소 3년')).toBeHidden();
   await result.getByRole('button', { name: /제9조 접속 기록의 보관 기간/ }).click();
   await expect(result.getByText('접속 기록과 접근 이력의 보관 기간은 최소 3년')).toBeVisible({ timeout: 10_000 });
+  await result.getByRole('button', { name: /제1장 총칙/ }).click();
+  await expect(result.getByText('이 규정은 사내 직무 교육과 수료 기준에 관한 일반 원칙을 정한다.')).toBeVisible({ timeout: 10_000 });
 
   // Switch to tables tab -> run custom SQL via /api/docindex/table-sql.
   await result.getByRole('tab', { name: /문서 속 표/ }).click();
@@ -223,6 +224,13 @@ test('supports synonyms and document filter, blocks stale search on failed rebui
   await result.getByRole('button', { name: resultCopy.searchForm.submitButton }).click();
   await expect(result.getByText('제9조 접속 기록의 보관 기간').first()).toBeVisible({ timeout: 20_000 });
   await expect(result.getByText('제4조 교육 이수 기록의 보관 기간')).toHaveCount(0);
+
+  // Switching scope to EDUCATION_DOC while viewing outline refreshes the outline body instead of leaking SECURITY_DOC.
+  await result.getByRole('tab', { name: /목차/ }).click();
+  await expect(result.getByText('접속 기록과 접근 이력의 보관 기간은 최소 3년')).toBeVisible({ timeout: 10_000 });
+  await listRegion.getByRole('option', { name: /인사_및_교육규정\.docx/ }).click();
+  await expect(result.getByText('이 규정은 사내 직무 교육과 수료 기준에 관한 일반 원칙을 정한다.')).toBeVisible({ timeout: 10_000 });
+  await expect(result.getByText('접속 기록과 접근 이력의 보관 기간은 최소 3년')).toHaveCount(0);
 });
 
 test('rejects legacy .xls locally with actionable guidance and keeps axe clean on error', async ({
