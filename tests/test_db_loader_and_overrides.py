@@ -608,7 +608,7 @@ def test_sqlite_real_load_management_tables_masking_and_catalog(tmp_path: Path) 
         assert cust_row is not None
         assert cust_row[1] == "홍*동"
         assert cust_row[2] == "010-****-5678"
-        assert str(cust_row[3]).startswith("h_") and len(str(cust_row[3])) == 18
+        assert str(cust_row[3]).startswith("h_") and len(str(cust_row[3])) == 26
         assert cust_row[4] == "1988-**-**"
         assert cust_row[5] == 1  # '예' -> boolean 1
         assert cust_row[6] == result.batch_id
@@ -1442,8 +1442,8 @@ def test_mask_value_formats_and_management_ddl_dialects() -> None:
     )
     assert mask_value("홍길동", SensitiveType.NAME, MaskingPolicy.MASK) == "홍*동"
     assert mask_value("1988-05-12", SensitiveType.DATE_OF_BIRTH, MaskingPolicy.MASK) == "1988-**-**"
-    h1 = mask_value("secret", SensitiveType.EMAIL, MaskingPolicy.HASH)
-    h2 = mask_value("secret", SensitiveType.EMAIL, MaskingPolicy.HASH)
+    h1 = mask_value("secret", SensitiveType.EMAIL, MaskingPolicy.HASH, hash_key=bytes(32))
+    h2 = mask_value("secret", SensitiveType.EMAIL, MaskingPolicy.HASH, hash_key=bytes(32))
     assert h1 == h2 and h1.startswith("h_")
 
     for dialect in ("postgres", "sqlite", "duckdb"):

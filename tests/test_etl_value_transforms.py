@@ -72,9 +72,18 @@ def test_mask_value_redacts_each_sensitive_format(
 def test_none_preserves_raw_value_and_hash_uses_all_utf8_bytes() -> None:
     raw = " 가상@example.test "
     assert mask_value(raw, SensitiveType.EMAIL, MaskingPolicy.NONE) == raw
-    assert mask_value(raw, SensitiveType.EMAIL, MaskingPolicy.HASH) == "h_903f0d48bf18311f"
-    assert mask_value(raw, None, MaskingPolicy.HASH) == "h_903f0d48bf18311f"
-    assert mask_value(raw.strip(), SensitiveType.EMAIL, MaskingPolicy.HASH) == "h_d2232e0153d2d9c4"
+    assert (
+        mask_value(raw, SensitiveType.EMAIL, MaskingPolicy.HASH, hash_key=bytes(32))
+        == "h_a64de444fda5d4c6e16de755"
+    )
+    assert (
+        mask_value(raw, None, MaskingPolicy.HASH, hash_key=bytes(32))
+        == "h_a64de444fda5d4c6e16de755"
+    )
+    assert (
+        mask_value(raw.strip(), SensitiveType.EMAIL, MaskingPolicy.HASH, hash_key=bytes(32))
+        == "h_c88c6457d9b4992bd673bfc1"
+    )
 
 
 def test_load_stores_typed_dates_times_and_numbers_and_quarantines_invalid_date(
@@ -318,14 +327,14 @@ def test_auto_mask_and_explicit_policies_protect_loaded_and_quarantined_values(
         assert db.execute(
             "SELECT email, phone_number, test_note FROM contacts ORDER BY record_id"
         ).fetchall() == [
-            ("h_3258638147d90dfb", "202-***-0140", None),
-            ("h_44ef76bcf3022cd8", "202-***-0141", "fi******-2"),
+            ("h_d8477df6aed7f868f6d2185b", "202-***-0140", None),
+            ("h_c7d701d71ea4c58cdcd72b9a", "202-***-0141", "fi******-2"),
         ]
         ((payload,),) = db.execute("SELECT raw_row_json FROM _etl_quarantine_rows").fetchall()
     assert json.loads(payload) == {
         "record_id": "103",
         "sample_code": "A1",
-        "email": "h_8b86e7af0638b8b6",
+        "email": "h_7130d11c7492ff84f831a907",
         "phone_number": "202-***-0142",
         "test_note": "fi******-7",
     }

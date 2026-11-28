@@ -188,6 +188,74 @@ def _run_load(args: argparse.Namespace) -> int:
     return 1 if result.status == "failed" else 0
 
 
+def _run_key(args: argparse.Namespace) -> int:
+    from autoetl.security.masking_key import (
+        export_masking_key,
+        import_masking_key,
+        masking_key_path,
+        read_masking_key,
+    )
+
+    try:
+        if args.key_command == "status":
+            path = masking_key_path()
+            active_key = read_masking_key(path)
+            db_key_id = None
+            if args.db is not None:
+                from autoetl.core.db_loader import masking_key_id_for_database
+
+                db_key_id = masking_key_id_for_database(args.db)
+
+            print(f"마스킹 키 경로 {path}")
+            if active_key is None:
+                print("마스킹 키 없음")
+            else:
+                print("마스킹 키 있음")
+                print(f"key_id={active_key.key_id}")
+                print(f"created_at={active_key.created_at}")
+                if active_key.permission_warning:
+                    print(f"주의 {active_key.permission_warning}", file=sys.stderr)
+            if args.db is not None:
+                if db_key_id is None:
+                    print("DB 마스킹 키 ID 기록 없음")
+                elif active_key is None:
+                    print(f"DB key_id={db_key_id} (로컬 키 없음)")
+                elif active_key.key_id == db_key_id:
+                    print(f"DB key_id={db_key_id} (로컬 키와 일치)")
+                else:
+                    print(f"DB key_id={db_key_id} (로컬 키와 불일치)")
+            return 0
+
+        if args.key_command == "export":
+            exported = export_masking_key(args.file)
+            print(f"마스킹 키 내보내기 완료 {exported.path}")
+            print(
+                "주의 이 파일을 가진 사람은 해시로 원래 값을 추측할 수 있습니다. "
+                "키 파일을 안전한 장소에 보관하세요.",
+                file=sys.stderr,
+            )
+            if exported.permission_warning:
+                print(f"주의 {exported.permission_warning}", file=sys.stderr)
+            return 0
+
+        previous_key = read_masking_key() if args.replace else None
+        imported, changed = import_masking_key(args.file, replace=args.replace)
+        if changed:
+            print(f"마스킹 키 가져오기 완료 {imported.path} (key_id={imported.key_id})")
+            if previous_key is not None:
+                backup = previous_key.path.with_name(f"masking_key.{previous_key.key_id}.bak.json")
+                print(f"이전 키 백업 파일 {backup}")
+        else:
+            print(f"동일한 마스킹 키가 이미 설치되어 있습니다 (key_id={imported.key_id}).")
+        return 0
+    except InputError as exc:
+        print(f"마스킹 키 작업 실패. {exc}", file=sys.stderr)
+        return 1
+    except Exception:
+        print("마스킹 키 작업이 내부 오류로 끝났습니다.", file=sys.stderr)
+        return 1
+
+
 def _run_catalog(args: argparse.Namespace) -> int:
     import json
 
@@ -1181,6 +1249,18 @@ def main(argv: list[str] | None = None) -> int:
         help="카탈로그/롤백 결과를 JSON 형식으로 출력",
     )
 
+    key_cmd = subparsers.add_parser("key", help="로컬 ETL 마스킹 키 상태 조회 및 백업·이전")
+    key_subparsers = key_cmd.add_subparsers(dest="key_command", required=True)
+    key_status = key_subparsers.add_parser("status", help="로컬 키 파일과 키 ID 상태 조회")
+    key_status.add_argument("--db", type=Path, help="로컬 키 ID와 비교할 SQLite 또는 DuckDB 파일")
+    key_export = key_subparsers.add_parser("export", help="마스킹 키를 새 백업 파일로 복사")
+    key_export.add_argument("file", type=Path, help="백업 파일 경로")
+    key_import = key_subparsers.add_parser("import", help="백업 파일에서 마스킹 키 가져오기")
+    key_import.add_argument("file", type=Path, help="가져올 키 파일 경로")
+    key_import.add_argument(
+        "--replace", action="store_true", help="이전 키의 백업을 만든 뒤 다른 키로 교체"
+    )
+
     args = parser.parse_args(argv)
     if args.command == "analyze":
         return _run_analyze(args)
@@ -1188,6 +1268,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_load(args)
     if args.command == "catalog":
         return _run_catalog(args)
+    if args.command == "key":
+        return _run_key(args)
     if args.command == "parse":
         return _run_parse(args)
     if args.command == "index":

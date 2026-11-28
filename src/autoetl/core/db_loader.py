@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import math
 import re
@@ -72,6 +73,7 @@ from autoetl.core.relations_multi import MIN_INCLUSION_RATE, analyze_multi_table
 from autoetl.core.stages.s02_profile import DEFAULT_MISSING_MARKERS
 from autoetl.core.stages.s03_types import CURRENCY_DECIMAL_SHAPE
 from autoetl.core.stages.s07_sensitivity import detect_table_sensitivity
+from autoetl.security.masking_key import MaskingKey, get_or_create_masking_key, read_masking_key
 
 DEFAULT_MANAGEMENT_TABLES: tuple[str, ...] = (
     "_etl_load_batches",
@@ -79,6 +81,9 @@ DEFAULT_MANAGEMENT_TABLES: tuple[str, ...] = (
     "_etl_column_registry",
     "_etl_quarantine_rows",
 )
+_MASKING_KEY_TABLE = "_etl_masking_keys"
+_MASKING_SCHEME = "hmac-sha256-24"
+_MASKING_KEY_ID_RE = re.compile(r"k_[0-9a-f]{12}\Z")
 
 AUDIT_COLUMNS: tuple[str, ...] = (
     "_etl_batch_id",
@@ -138,13 +143,16 @@ def mask_value(
     val: str,
     stype: SensitiveType | None,
     policy: MaskingPolicy,
+    *,
+    hash_key: bytes | None = None,
 ) -> str:
-    """개인정보·민감 문자열을 정책(`none`/`mask`/`hash`)에 따라 결정론적으로 변환한다."""
+    """정책에 따라 민감 문자열을 변환한다. ``hash``에는 ``hash_key``가 필요하다."""
     if policy is MaskingPolicy.NONE:
         return val
     if policy is MaskingPolicy.HASH:
-        digest = hashlib.sha256(val.encode("utf-8")).hexdigest()[:16]
-        return f"h_{digest}"
+        if hash_key is None:
+            raise ValueError("hash 정책에는 비밀 키가 필요합니다.")
+        return "h_" + hmac.digest(hash_key, val.encode("utf-8"), "sha256").hex()[:24]
 
     s = val.strip()
     if not s:
@@ -358,7 +366,7 @@ def render_management_tables_ddl(dialect: str = "postgres") -> str:
 class _DbAdapter:
     """SQLite · DuckDB · 선택적 PostgreSQL(psycopg) 공통 경량 DB 어댑터."""
 
-    def __init__(self, target: str | Path, engine: str) -> None:
+    def __init__(self, target: str | Path, engine: str, *, read_only: bool = False) -> None:
         self.engine = _normalize_engine(engine)
         self.target_str = str(target)
         self.placeholder = "%s" if self.engine == "postgres" else "?"
@@ -367,16 +375,21 @@ class _DbAdapter:
 
         if self.engine == "sqlite":
             db_p = Path(target)
-            if self.target_str != ":memory:":
-                db_p.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(str(db_p), isolation_level=None)
+            if read_only:
+                conn = sqlite3.connect(
+                    f"{db_p.absolute().as_uri()}?mode=ro", uri=True, isolation_level=None
+                )
+            else:
+                if self.target_str != ":memory:":
+                    db_p.parent.mkdir(parents=True, exist_ok=True)
+                conn = sqlite3.connect(str(db_p), isolation_level=None)
             conn.execute("PRAGMA foreign_keys = ON")
             self._conn = conn
         elif self.engine == "duckdb":
             db_p = Path(target)
-            if self.target_str != ":memory:":
+            if not read_only and self.target_str != ":memory:":
                 db_p.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = duckdb.connect(str(db_p))
+            self._conn = duckdb.connect(str(db_p), read_only=read_only)
         else:
             try:
                 import psycopg  # type: ignore[import-not-found]
@@ -387,6 +400,8 @@ class _DbAdapter:
                     "추가 설치 없이 저장하려면 --engine sqlite 또는 duckdb를 선택하세요."
                 ) from exc
             self._conn = psycopg.connect(self.target_str, autocommit=False)
+            if read_only:
+                self._conn.read_only = True
 
     def begin(self) -> None:
         if self._in_tx:
@@ -659,6 +674,113 @@ class _DbAdapter:
             self._conn = None
 
 
+def _database_masking_key_id(adapter: _DbAdapter, *, reject_legacy: bool = False) -> str | None:
+    if adapter.table_exists(_MASKING_KEY_TABLE):
+        rows = adapter.fetchall('SELECT "key_id", "scheme" FROM "_etl_masking_keys" LIMIT 2')
+        if rows:
+            key_id, scheme = rows[0]
+            if (
+                len(rows) != 1
+                or not isinstance(key_id, str)
+                or _MASKING_KEY_ID_RE.fullmatch(key_id) is None
+                or scheme != _MASKING_SCHEME
+            ):
+                raise InputError("DB의 가리기 키 기록이 올바르지 않습니다.")
+            return key_id
+    if reject_legacy and adapter.table_exists("_etl_column_registry"):
+        legacy = adapter.fetchone(
+            'SELECT 1 FROM "_etl_column_registry" WHERE "masking_policy" = \'hash\' LIMIT 1'
+        )
+        if legacy is not None:
+            raise InputError(
+                "예전 방식으로 만든 해시가 DB에 있어 새 방식의 해시를 섞을 수 없습니다. "
+                "새 DB에 다시 적재해 주세요."
+            )
+    return None
+
+
+def masking_key_id_for_database(db_path: str | Path) -> str | None:
+    """기존 SQLite/DuckDB 파일의 키 이름표를 읽기 전용으로 확인한다."""
+    path = Path(db_path)
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(16)
+        engine = "sqlite" if header in {b"SQLite format 3\x00", b""} else "duckdb"
+        adapter = _DbAdapter(path, engine, read_only=True)
+        try:
+            return _database_masking_key_id(adapter)
+        finally:
+            adapter.close()
+    except FileNotFoundError as exc:
+        raise InputError("지정한 DB 파일을 찾을 수 없습니다.") from exc
+    except (OSError, sqlite3.Error, duckdb.Error) as exc:
+        raise InputError("지정한 DB 파일의 가리기 키 기록을 읽을 수 없습니다.") from exc
+
+
+def _require_matching_masking_key(database_id: str, local_id: str | None) -> None:
+    if database_id != local_id:
+        local = local_id or "없음"
+        # 이 컴퓨터에 다른 키가 이미 있으면 --replace 없이는 가져오기가 거부된다.
+        command = "autoetl key import <파일>" + (" --replace" if local_id else "")
+        raise InputError(
+            f"DB의 가리기 키는 {database_id}이고 이 컴퓨터의 키는 {local}입니다. "
+            f"백업한 키를 `{command}`로 가져온 뒤 다시 시도해 주세요."
+        )
+
+
+def _existing_masking_key_id(db_path: str | Path, engine: str, *, read_only: bool) -> str | None:
+    adapter = _DbAdapter(db_path, engine, read_only=read_only)
+    try:
+        return _database_masking_key_id(adapter, reject_legacy=True)
+    finally:
+        adapter.close()
+
+
+def _prepare_masking_key(db_path: str | Path, engine: str) -> tuple[MaskingKey, bool]:
+    database_id = None
+    if engine == "postgres" or (str(db_path) != ":memory:" and Path(db_path).exists()):
+        try:
+            database_id = _existing_masking_key_id(db_path, engine, read_only=True)
+        except (sqlite3.Error, duckdb.Error):
+            # 읽기 전용으로 열 수 없는 파일(복구할 롤백 저널이 남은 SQLite, 같은 프로세스가
+            # 이미 열어 둔 DuckDB, URI로 쓸 수 없는 경로)은 적재와 같은 일반 연결로 조회만 한다.
+            database_id = _existing_masking_key_id(db_path, engine, read_only=False)
+
+    if database_id is None:
+        return get_or_create_masking_key()
+    key = read_masking_key()
+    _require_matching_masking_key(database_id, key.key_id if key else None)
+    assert key is not None
+    return key, False
+
+
+def _register_masking_key(
+    adapter: _DbAdapter, key_id: str, batch_id: str, registered_at: str
+) -> None:
+    """적재 트랜잭션 안에서 기록을 재확인하고 첫 키를 고정한다."""
+    database_id = _database_masking_key_id(adapter, reject_legacy=True)
+    if database_id is not None:
+        _require_matching_masking_key(database_id, key_id)
+        return
+
+    adapter.execute(
+        'CREATE TABLE IF NOT EXISTS "_etl_masking_keys" ('
+        '"key_id" TEXT PRIMARY KEY, '
+        f'"scheme" TEXT NOT NULL UNIQUE CHECK ("scheme" = \'{_MASKING_SCHEME}\'), '
+        '"first_batch_id" TEXT NOT NULL, "registered_at" TEXT NOT NULL)'
+    )
+    p = adapter.placeholder
+    adapter.execute(
+        'INSERT INTO "_etl_masking_keys" ("key_id", "scheme", "first_batch_id", "registered_at") '
+        f'VALUES ({p}, {p}, {p}, {p}) ON CONFLICT ("scheme") DO NOTHING',
+        (key_id, _MASKING_SCHEME, batch_id, registered_at),
+    )
+    database_id = _database_masking_key_id(adapter)
+    if database_id is None:
+        raise InputError("DB의 가리기 키 등록을 확인할 수 없습니다.")
+    _require_matching_masking_key(database_id, key_id)
+
+
 def _dialect_col_type(
     col: TargetColumn,
     mapping: ColumnMapping,
@@ -843,6 +965,7 @@ def _transform_cell(
     sensitive_type: SensitiveType | None,
     engine: str,
     db_type_cast: str | None = None,
+    hash_key: bytes | None = None,
 ) -> tuple[bool, Any, str]:
     """단일 원본 셀을 결정론적으로 변환·마스킹한다. 반환: `(ok, value, error_detail)`."""
     if _is_missing_raw(raw):
@@ -869,7 +992,7 @@ def _transform_cell(
     if mapping.transform in {"pii_mask", "pii_hash"} or (
         mask_policy is not MaskingPolicy.NONE and col.physical_type is PhysicalType.STRING
     ):
-        masked = mask_value(s, sensitive_type, mask_policy)
+        masked = mask_value(s, sensitive_type, mask_policy, hash_key=hash_key)
         return True, masked, ""
 
     # 3. 변환식·물리 타입별 파싱
@@ -977,7 +1100,7 @@ def _transform_cell(
                 return False, None, "유한하지 않은 수치 값"
             val = fv_dec
     if mask_policy is not MaskingPolicy.NONE and isinstance(val, str):
-        val = mask_value(val, sensitive_type, mask_policy)
+        val = mask_value(val, sensitive_type, mask_policy, hash_key=hash_key)
     return True, val, ""
 
 
@@ -1008,6 +1131,7 @@ def _safe_quarantine_row_json(
     table_masking: Mapping[str, MaskingPolicy],
     pii_type_by_col: Mapping[str, SensitiveType],
     pii_level_by_col: Mapping[str, SensitivityLevel],
+    hash_key: bytes | None = None,
 ) -> str:
     """격리 보관함에 기록할 원본 행 JSON을 생성하되 PII·마스킹 대상 컬럼은 항상 보호한다."""
     payload: dict[str, Any] = {}
@@ -1020,7 +1144,7 @@ def _safe_quarantine_row_json(
         stype = pii_type_by_col.get(h)
         level = pii_level_by_col.get(h, SensitivityLevel.L0)
         if policy is not MaskingPolicy.NONE:
-            payload[h] = mask_value(s, stype, policy)
+            payload[h] = mask_value(s, stype, policy, hash_key=hash_key)
         elif level is not SensitivityLevel.L0:
             payload[h] = mask_value(s, stype, MaskingPolicy.MASK)
         else:
@@ -1490,6 +1614,7 @@ def _load_single_table(
     table_existed_before: bool = False,
     capture_rollback_snapshots: bool = True,
     skipped_key_masking: Mapping[str, MaskingPolicy] | None = None,
+    hash_key: bytes | None = None,
 ) -> tuple[
     int,
     int,
@@ -1638,6 +1763,7 @@ def _load_single_table(
                 sensitive_type=stype,
                 engine=adapter.engine,
                 db_type_cast=db_numeric_types.get(col.name),
+                hash_key=hash_key,
             )
             if not ok:
                 err_cat = "cast_error"
@@ -1720,6 +1846,7 @@ def _load_single_table(
                 table_masking=table_masking,
                 pii_type_by_col=pii_type_by_col,
                 pii_level_by_col=pii_level_by_col,
+                hash_key=hash_key,
             )
             quarantine_entries.append(
                 (
@@ -2003,13 +2130,39 @@ def load_tables(
             t.name: sum(1 for c in t.columns if c.is_primary_key) for t in selected_cand.tables
         }
 
-        adapter = _DbAdapter(db_path, norm_engine)
         load_warnings = list(masking_warnings)
+        # 건너뛴 키의 요청 정책도 셀 변환과 격리 행에 그대로 전달되므로,
+        # 오류 처리 정책과 관계없이 해시 요청이 하나라도 있으면 키를 준비한다.
+        needs_hash_key = any(
+            MaskingPolicy.HASH in policies.values()
+            for policies in (
+                *(tp.column_masking for tp in load_plan.table_plans),
+                *skipped_key_masking.values(),
+            )
+        )
+        masking_key = None
+        note_overrides: dict[str, str] = {}
+        if needs_hash_key:
+            masking_key, created = _prepare_masking_key(db_path, norm_engine)
+            if created:
+                backup_hint = "`autoetl key export <파일>`로 백업해 두세요."
+                created_warning = (
+                    f"새 가리기 비밀 키를 만들었습니다 ({masking_key.path}). {backup_hint}"
+                )
+                load_warnings.append(created_warning)
+                # DB는 밖으로 나갈 수 있으니, 저장하는 메모에는 이 컴퓨터의 경로를 넣지 않는다.
+                note_overrides[created_warning] = f"새 가리기 비밀 키를 만들었습니다. {backup_hint}"
+            if masking_key.permission_warning:
+                load_warnings.append(masking_key.permission_warning)
+
+        adapter = _DbAdapter(db_path, norm_engine)
         outcomes: list[TableLoadOutcome] = []
         mgmt_created: list[str] = []
 
         try:
             adapter.begin()
+            if masking_key is not None:
+                _register_masking_key(adapter, masking_key.key_id, batch_id, loaded_at)
 
             # 1. 디폴트 관리 테이블 생성 (+ 구버전 DB 스냅샷 컬럼 진화)
             if spec.include_management_tables:
@@ -2186,6 +2339,7 @@ def load_tables(
                     include_audit_columns=spec.include_audit_columns,
                     orphan_policy=spec.orphan_policy,
                     table_existed_before=existed,
+                    hash_key=masking_key.key if masking_key is not None else None,
                     capture_rollback_snapshots=(
                         spec.include_management_tables and spec.include_audit_columns
                     ),
@@ -2403,7 +2557,7 @@ def load_tables(
 
             if spec.include_management_tables:
                 p = adapter.placeholder
-                final_notes = notes or ("; ".join(load_warnings) if load_warnings else "")
+                final_notes = notes or "; ".join(note_overrides.get(w, w) for w in load_warnings)
                 adapter.execute(
                     f'UPDATE "_etl_load_batches" '
                     f'SET "status" = {p}, "total_rows_read" = {p}, '
@@ -2457,7 +2611,7 @@ def inspect_db_catalog(
     try:
         p = adapter.placeholder
         all_tables = adapter.list_user_tables()
-        mgmt_set = set(DEFAULT_MANAGEMENT_TABLES)
+        mgmt_set = {*DEFAULT_MANAGEMENT_TABLES, _MASKING_KEY_TABLE}
         business_tables: list[dict[str, Any]] = []
         for tbl in all_tables:
             if tbl in mgmt_set:
