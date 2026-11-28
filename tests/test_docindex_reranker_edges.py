@@ -264,14 +264,25 @@ def test_constructor_clamps_option_ranges(
     assert (rr._max_length, rr._batch_size, rr._max_windows) == expected
 
 
-def test_available_false_without_optional_dependencies(tmp_path: Path) -> None:
-    rr = OnnxCrossEncoderReranker(tmp_path / "absent.onnx")
+def test_available_false_without_optional_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = tmp_path / "absent.onnx"
+    model.write_bytes(b"stub")
+    tok_file = tmp_path / "tokenizer.json"
+    tok_file.write_text("{}", encoding="utf-8")
+    # 실제 설치 여부와 무관하게 미설치 상태를 시뮬레이션한다.
+    # 모델·토크나이저 파일은 있으므로 의존성 검사가 없으면 available이 True가 된다.
+    monkeypatch.setitem(sys.modules, "numpy", None)
+    monkeypatch.setitem(sys.modules, "onnxruntime", None)
+    monkeypatch.setitem(sys.modules, "tokenizers", None)
+    rr = OnnxCrossEncoderReranker(model)
     assert rr.available is False
     assert rr.name == "onnx:absent"
     # 세션만 주입되면 토크나이저 모듈이 없어 여전히 사용 불가
-    assert OnnxCrossEncoderReranker(tmp_path / "absent.onnx", session=object()).available is False
+    assert OnnxCrossEncoderReranker(model, session=object()).available is False
     # 토크나이저만 주입되면 ONNX 모듈이 없어 여전히 사용 불가
-    assert OnnxCrossEncoderReranker(tmp_path / "absent.onnx", tokenizer=object()).available is False
+    assert OnnxCrossEncoderReranker(model, tokenizer=object()).available is False
 
 
 def test_available_tracks_model_and_tokenizer_files(
@@ -294,8 +305,17 @@ def test_available_tracks_model_and_tokenizer_files(
     assert rr.available is False
 
 
-def test_score_pairs_requires_optional_dependencies(tmp_path: Path) -> None:
-    rr = OnnxCrossEncoderReranker(tmp_path / "m.onnx")
+def test_score_pairs_requires_optional_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = tmp_path / "m.onnx"
+    model.write_bytes(b"stub")
+    # 실제 설치 여부와 무관하게 미설치 상태를 시뮬레이션한다.
+    # 모델 파일은 있으므로 의존성 검사가 없으면 다음 단계로 진행해 실패한다.
+    monkeypatch.setitem(sys.modules, "numpy", None)
+    monkeypatch.setitem(sys.modules, "onnxruntime", None)
+    monkeypatch.setitem(sys.modules, "tokenizers", None)
+    rr = OnnxCrossEncoderReranker(model)
     with pytest.raises(ParserInputError, match="선택 의존성"):
         rr.score_pairs("질의", ["후보"])
 
@@ -308,7 +328,14 @@ def test_ensure_ready_missing_model_file(tmp_path: Path, monkeypatch: pytest.Mon
         rr.score_pairs("질의", ["후보"])
 
 
-def test_ensure_ready_missing_tokenizers_package(tmp_path: Path) -> None:
+def test_ensure_ready_missing_tokenizers_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tok_file = tmp_path / "tokenizer.json"
+    tok_file.write_text("{}", encoding="utf-8")
+    # 실제 설치 여부와 무관하게 미설치 상태를 시뮬레이션한다.
+    # 토크나이저 파일은 있으므로 모듈 검사가 없으면 다음 단계로 진행해 실패한다.
+    monkeypatch.setitem(sys.modules, "tokenizers", None)
     rr = OnnxCrossEncoderReranker(tmp_path / "m.onnx", session=_ContentSession())
     with pytest.raises(ParserInputError, match="tokenizers"):
         rr.score_pairs("질의", ["후보"])
