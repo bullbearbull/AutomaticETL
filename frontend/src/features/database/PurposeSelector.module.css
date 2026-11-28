@@ -1,0 +1,128 @@
+.wrapper {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.heading {
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+  font-weight: var(--font-weight-strong);
+}
+
+.options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.options.compact {
+  grid-template-columns: 1fr;
+}
+
+.option {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  min-width: 0;
+  min-height: var(--target-min);
+  padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--color-border-input);
+  border-radius: var(--radius-control);
+  background: var(--color-bg);
+  cursor: pointer;
+}
+
+.option[data-hovered] {
+  border-color: var(--color-text);
+}
+
+.option[data-selected] {
+  border-color: var(--color-text);
+  border-width: var(--border-width-strong);
+  background: var(--color-bg-subtle);
+}
+
+.option[data-disabled] {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.option[data-disabled][data-hovered] {
+  border-color: var(--color-border-input);
+}
+
+.indicator {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+  margin-top: 0.2em;
+  border: var(--border-width) solid var(--color-border-input);
+  border-radius: 50%;
+  background: var(--color-bg);
+  pointer-events: none;
+}
+
+.option[data-selected] .indicator {
+  border-color: var(--color-text);
+  border-width: var(--space-1);
+}
+
+.text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.label {
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+  font-weight: var(--font-weight-strong);
+}
+
+.hint {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-tiny);
+  line-height: var(--line-height-tiny);
+}
+
+.archiveStatus:empty {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  margin: -1px;
+  padding: 0;
+  border: 0;
+}
+
+.archiveNotice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--color-status-warning);
+  border-radius: var(--radius-control);
+  background: var(--color-status-warning-bg);
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+}
+
+.archiveIcon {
+  flex: none;
+  margin-top: 0.2em;
+  color: var(--color-status-warning);
+}
