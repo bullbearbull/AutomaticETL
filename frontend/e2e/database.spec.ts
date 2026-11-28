@@ -6,6 +6,8 @@ import {
   exportCopy,
   piiDialogCopy,
   purposeCopy,
+  resultCopy,
+  settingsCopy,
   startCopy,
   validationCopy,
 } from '../src/features/database/copy.ts';
@@ -36,6 +38,18 @@ const ORDERS_CSV = csvPayload(
     '1002,102,2026-11-02,24000\n',
 );
 
+const LOGS_PATTERN_CSV = csvPayload(
+  'logs.csv',
+  'item_code,category,note\n' +
+    'ORD-2026-SEOUL-001,A,x\n' +
+    'ORD-2026-SEOUL-001,A,x\n' +
+    'ORD-2026-BUSAN-002,B,y\n' +
+    'ORD-2026-DAEGU-003,A,z\n' +
+    'ORD-2026-INCHEON-004,B,w\n' +
+    'ORD-2025-SEOUL-005,A,x\n' +
+    'ORD-2025-BUSAN-006,B,y\n',
+);
+
 async function openDatabaseTab(page: Page): Promise<Locator> {
   await openApp(page);
   const tabList = page.getByRole('tablist', { name: appCopy.tabListLabel });
@@ -48,6 +62,12 @@ async function openDatabaseTab(page: Page): Promise<Locator> {
 async function pickDatabaseFiles(panel: Locator, page: Page, files: ReturnType<typeof csvPayload>[]) {
   const chooser = page.waitForEvent('filechooser');
   await panel.getByRole('button', { name: buttonCopy.pickFiles }).click();
+  await (await chooser).setFiles(files);
+}
+
+async function addMoreDatabaseFiles(panel: Locator, page: Page, files: ReturnType<typeof csvPayload>[]) {
+  const chooser = page.waitForEvent('filechooser');
+  await panel.getByRole('button', { name: buttonCopy.addFiles }).click();
   await (await chooser).setFiles(files);
 }
 
@@ -67,14 +87,10 @@ test('auto-analyzes CSVs, re-validates inline edits, and masks PII via ConfirmDi
 
   await pickDatabaseFiles(panel, page, [BRANCHES_CSV, CUSTOMERS_CSV, ORDERS_CSV]);
 
-  // Immediate analysis without a separate "표 구조 분석하기" or "변경 내용 반영" button.
   await expect(panel.getByRole('button', { name: exportCopy.saveDb })).toBeVisible({ timeout: 20_000 });
   await expect(panel.getByRole('button', { name: /변경 내용 반영/ })).toHaveCount(0);
-
-  // Step 2 active.
   await expect(panel.locator('[aria-current="step"]')).toContainText('확인·다듬기');
 
-  // Switch to customers table and verify PII evidence reasons + masked previews.
   const listRegion = panel.getByRole('region', { name: workspaceCopy.list, exact: true });
   await listRegion.getByRole('option', { name: /customers/i }).click();
 
@@ -83,11 +99,21 @@ test('auto-analyzes CSVs, re-validates inline edits, and masks PII via ConfirmDi
   await expect(evidenceRegion).toContainText('김*수');
   await expect(evidenceRegion).toContainText('010-****-5678');
 
-  // Invalid DB column name triggers accessible inline guidance; valid name auto-revalidates via session_id.
   const result = panel.getByRole('region', { name: workspaceCopy.result, exact: true });
   const gradeInput = result.getByRole('textbox', { name: 'grade의 DB 열 이름' });
   await gradeInput.fill('2bad');
   await expect(result.getByText(validationCopy.invalidIdentifier)).toBeVisible();
+
+  let revalCount = 0;
+  page.on('request', (req) => {
+    if (
+      req.url().endsWith('/api/analyze-tables') &&
+      req.method() === 'POST' &&
+      (req.postData() ?? '').includes('session_id')
+    ) {
+      revalCount += 1;
+    }
+  });
 
   const revalReq = page.waitForRequest(
     (req) =>
@@ -100,10 +126,13 @@ test('auto-analyzes CSVs, re-validates inline edits, and masks PII via ConfirmDi
   const req = await revalReq;
   expect(req.postData() ?? '').toContain('"target_column":"customer_tier"');
 
+  // Focusing elsewhere (blur after Enter) must not trigger a duplicate revalidation.
+  await gradeInput.blur();
   await expect(result.getByRole('textbox', { name: 'grade의 DB 열 이름' })).toHaveValue('customer_tier');
+  expect(revalCount).toBe(1);
   await expectNoAxeViolations(page);
 
-  // Save with unmasked PII -> ConfirmDialog opens, primary focus on [가리고 저장하기], Esc cancels.
+  // ConfirmDialog opens -> Esc cancels -> [가리고 저장하기] downloads masked SQLite.
   await panel.getByRole('button', { name: exportCopy.saveDb }).click();
   const dialog = page.getByRole('alertdialog');
   await expect(dialog).toBeVisible();
@@ -116,7 +145,6 @@ test('auto-analyzes CSVs, re-validates inline edits, and masks PII via ConfirmDi
   await expect(dialog).toHaveCount(0);
   await expect(panel.locator('[aria-current="step"]')).toContainText('확인·다듬기');
 
-  // Click [DB 파일로 저장하기] again and confirm [가리고 저장하기] -> downloads real SQLite file.
   await panel.getByRole('button', { name: exportCopy.saveDb }).click();
   const downloadPromise = page.waitForEvent('download');
   await page.getByRole('alertdialog').getByRole('button', { name: piiDialogCopy.primaryAction }).click();
@@ -128,26 +156,129 @@ test('auto-analyzes CSVs, re-validates inline edits, and masks PII via ConfirmDi
   const bytes = await readFile(sqlitePath);
   expect(bytes.subarray(0, 15).toString('ascii')).toBe('SQLite format 3');
 
-  // Inspect actual SQLite rows with Python sqlite3 to verify masking AND column rename persisted.
   const dumped = execFileSync(
     'python3',
     [
       '-c',
-      'import json, sqlite3, sys; c=sqlite3.connect(sys.argv[1]); cols=[d[0] for d in c.execute("SELECT customer_name, phone, customer_tier FROM customers ORDER BY customer_id").description or []]; rows=c.execute("SELECT customer_name, phone, customer_tier FROM customers ORDER BY customer_id").fetchall(); print(json.dumps(rows, ensure_ascii=False))',
+      'import json, sqlite3, sys; c=sqlite3.connect(sys.argv[1]); rows=c.execute("SELECT customer_name, phone, customer_tier FROM customers ORDER BY customer_id").fetchall(); print(json.dumps(rows, ensure_ascii=False))',
       sqlitePath,
     ],
     { encoding: 'utf-8' },
   );
-  const rows = JSON.parse(dumped) as string[][];
-  expect(rows).toEqual([
+  expect(JSON.parse(dumped)).toEqual([
     ['김*수', '010-****-5678', 'VIP'],
     ['이*연', '010-****-5432', '일반'],
   ]);
 
-  // Step 3 active and "저장 결과" view shows masked columns.
   await expect(panel.locator('[aria-current="step"]')).toContainText('내보내기');
   await expect(result).toContainText('customer_name');
   await expect(result).toContainText('phone');
+});
+
+test('renders surrogate PK and decomposed string slot rows as read-only with default decomposeStrings=true', async ({
+  page,
+}) => {
+  const panel = await openDatabaseTab(page);
+  await pickDatabaseFiles(panel, page, [LOGS_PATTERN_CSV]);
+
+  const result = panel.getByRole('region', { name: workspaceCopy.result, exact: true });
+  await expect(result.getByText(resultCopy.surrogateSourceLabel)).toBeVisible({ timeout: 20_000 });
+
+  // Surrogate key row shows [대표 키] badge and has no editable DB name textbox.
+  const surrogateRow = result.locator('tr', { hasText: resultCopy.surrogateSourceLabel });
+  await expect(surrogateRow).toContainText(resultCopy.badges.primaryKey);
+  await expect(surrogateRow).toContainText(resultCopy.readOnlySurrogateNote);
+  await expect(surrogateRow.getByRole('textbox')).toHaveCount(0);
+
+  // Decomposed slot rows (e.g. item_code에서 나눈 열) are read-only and do not collide with item_code input.
+  await expect(result.getByText(resultCopy.decomposedSourceLabel('item_code')).first()).toBeVisible();
+  await expect(result.getByRole('textbox', { name: 'item_code의 DB 열 이름' })).toHaveCount(1);
+});
+
+test('blocks saving while replacement analysis fails or is in progress, and supports save-as-is', async ({
+  page,
+}, testInfo) => {
+  const panel = await openDatabaseTab(page);
+  await pickDatabaseFiles(panel, page, [CUSTOMERS_CSV]);
+  const saveBtn = panel.getByRole('button', { name: exportCopy.saveDb });
+  await expect(saveBtn).toBeEnabled({ timeout: 20_000 });
+
+  // Fail the next analyze call when adding a second file -> wait for error alert, verify save stays disabled.
+  await page.route('**/api/analyze-tables', (route) => route.abort('failed'));
+  await addMoreDatabaseFiles(panel, page, [ORDERS_CSV]);
+  const result = panel.getByRole('region', { name: workspaceCopy.result, exact: true });
+  await expect(result.getByRole('alert')).toBeVisible({ timeout: 20_000 });
+  await expect(panel.getByText(exportCopy.staleNotice)).toBeVisible();
+  await expect(saveBtn).toBeDisabled();
+
+  // Recover by clicking [표 다시 살펴보기] after unrouting -> save becomes enabled again.
+  await page.unroute('**/api/analyze-tables');
+  await panel.getByRole('button', { name: exportCopy.reanalyze }).click();
+  await expect(saveBtn).toBeEnabled({ timeout: 20_000 });
+
+  // Confirm [그대로 저장하기] leaves values unmasked in SQLite.
+  await saveBtn.click();
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByRole('alertdialog').getByRole('button', { name: piiDialogCopy.secondaryAction }).click();
+  const download = await downloadPromise;
+  const sqlitePath = testInfo.outputPath('unmasked.sqlite');
+  await download.saveAs(sqlitePath);
+  const dumped = execFileSync(
+    'python3',
+    [
+      '-c',
+      'import json, sqlite3, sys; c=sqlite3.connect(sys.argv[1]); print(json.dumps(c.execute("SELECT customer_name FROM customers ORDER BY customer_id").fetchall(), ensure_ascii=False))',
+      sqlitePath,
+    ],
+    { encoding: 'utf-8' },
+  );
+  expect(JSON.parse(dumped)).toEqual([['김민수'], ['이서연']]);
+});
+
+test('shows reject_all failure warnings and recovers expired sessions transparently on save', async ({
+  page,
+}) => {
+  const panel = await openDatabaseTab(page);
+  // Duplicate order_id in customers prevents reverse FK; 19 matching rows + 1 orphan row triggers reject_all failure.
+  const customers = csvPayload(
+    'customers.csv',
+    'cust_no,order_id\n' +
+      '1,1001\n2,1001\n3,1002\n4,1002\n5,1003\n' +
+      '6,1003\n7,1004\n8,1004\n9,1005\n10,1005\n' +
+      '11,1001\n12,1002\n13,1003\n14,1004\n15,1005\n' +
+      '16,1001\n17,1002\n18,1003\n19,1004\n20,9999\n',
+  );
+  const orders = csvPayload(
+    'orders.csv',
+    'order_id,amount\n1001,100\n1002,200\n1003,300\n1004,400\n1005,500\n',
+  );
+  await pickDatabaseFiles(panel, page, [customers, orders]);
+  await expect(panel.getByRole('button', { name: exportCopy.saveDb })).toBeEnabled({ timeout: 20_000 });
+
+  // Switch orphan policy to reject_all.
+  await panel.getByRole('button', { name: settingsCopy.heading }).click();
+  await panel.getByLabel(settingsCopy.orphanPolicy.label).selectOption('reject_all');
+
+  // Force the next /api/etl/load-db to return 404 expired once to verify auto-recovery.
+  let intercepted = false;
+  await page.route('**/api/etl/load-db', async (route) => {
+    if (!intercepted) {
+      intercepted = true;
+      await route.fulfill({
+        status: 404,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: '분석 세션을 찾을 수 없다: expired' }),
+      });
+      return;
+    }
+    await route.continue();
+  });
+
+  await panel.getByRole('button', { name: exportCopy.saveDb }).click();
+  const result = panel.getByRole('region', { name: workspaceCopy.result, exact: true });
+  await expect(result.getByText(resultCopy.saved.failedTitle)).toBeVisible({ timeout: 20_000 });
+  await expect(result.getByText(resultCopy.saved.warningsHeading)).toBeVisible();
+  await expect(panel.locator('[aria-current="step"]')).toContainText('확인·다듬기');
 });
 
 test('archive purpose shows inline notice immediately and skips the PII confirmation dialog', async ({
@@ -155,7 +286,6 @@ test('archive purpose shows inline notice immediately and skips the PII confirma
 }) => {
   const panel = await openDatabaseTab(page);
 
-  // Selecting "원본 보관용" shows immediate inline warning on start screen.
   await panel.getByText('원본 보관용', { exact: true }).click();
   await expect(panel.getByRole('radio', { name: /원본 보관용/ })).toBeChecked();
   await expect(panel.getByText(purposeCopy.archiveNotice)).toBeVisible();
@@ -164,7 +294,6 @@ test('archive purpose shows inline notice immediately and skips the PII confirma
   await expect(panel.getByRole('button', { name: exportCopy.saveDb })).toBeVisible({ timeout: 20_000 });
   await expect(panel.getByText(purposeCopy.archiveNotice)).toBeVisible();
 
-  // Saving directly skips ConfirmDialog and starts DB download.
   const downloadPromise = page.waitForEvent('download');
   await panel.getByRole('button', { name: exportCopy.saveDb }).click();
   await expect(page.getByRole('alertdialog')).toHaveCount(0);

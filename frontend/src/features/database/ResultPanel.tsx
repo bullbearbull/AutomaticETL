@@ -4,6 +4,7 @@ import { Button, DataTable, Details, ErrorNotice, Icon, MarkdownView } from '../
 import type { AppError } from '../../lib/errors.ts';
 import { physicalTypeLabel, resultCopy, validationCopy, maskingCopy } from './copy.ts';
 import {
+  classifyTableMappings,
   countActiveOverrides,
   getOverrideDraft,
   isValidTargetColumnName,
@@ -42,6 +43,7 @@ export interface ResultPanelProps {
   onTabChange: (tab: ResultTabId) => void;
   loadOutcome: LoadDbResult | null;
   dbEngine: DbEngine;
+  savingDb?: boolean;
   onRedownloadDb: (outcome: LoadDbResult) => void;
   redownloadingDb: boolean;
 }
@@ -57,7 +59,8 @@ function formatLocalTime(iso: string): string {
 /**
  * Center column (`결과`) for the DB tab:
  * - Loading & error states (with non-blocking dismissible notice on existing analysis)
- * - Inline editable schema table (`표 구조`) with instant validation & auto re-verify
+ * - Inline editable schema table (`표 구조`) keyed by `targetColumn` with read-only
+ *   surrogate & decomposed string-slot rows
  * - Relations (`표 연결`), save order + folded SQL/report (`저장 순서·정리`), and save summary (`저장 결과`)
  */
 export function ResultPanel({
@@ -81,6 +84,7 @@ export function ResultPanel({
   onTabChange,
   loadOutcome,
   dbEngine,
+  savingDb = false,
   onRedownloadDb,
   redownloadingDb,
 }: ResultPanelProps) {
@@ -155,6 +159,7 @@ export function ResultPanel({
       .filter((item) => item.table === currentTable.source.tableName)
       .map((item) => [item.sourceColumn, item]),
   );
+  const classifiedRows = classifyTableMappings(currentPlan?.columnMappings ?? []);
 
   const combinedDdl = [
     analysis.loadPlan.ddlSql,
@@ -177,7 +182,7 @@ export function ResultPanel({
     ddlTimer.current = window.setTimeout(() => setDdlMessage(null), 5000);
   };
 
-  const activeOverrideCount = countActiveOverrides(overrides);
+  const activeOverrideCount = countActiveOverrides(overrides, analysis);
   const fkCount = analysis.relations.foreignKeys.length;
   const pkEntries = Object.values(analysis.relations.primaryKeys);
 
@@ -189,7 +194,12 @@ export function ResultPanel({
             {currentTable.source.displayName}
           </h2>
           {activeOverrideCount > 0 ? (
-            <Button variant="quiet" onPress={onResetOverrides} className={styles.resetBtn}>
+            <Button
+              variant="quiet"
+              isDisabled={savingDb}
+              onPress={onResetOverrides}
+              className={styles.resetBtn}
+            >
               {resultCopy.resetOverrides}
             </Button>
           ) : null}
@@ -211,19 +221,21 @@ export function ResultPanel({
         />
       ) : null}
 
-      {phase === 'revalidating' ? (
-        <p role="status" className={styles.revalidating}>
-          <Icon name="spinner" />
-          <span>{resultCopy.revalidatingNotice}</span>
-        </p>
-      ) : null}
+      <p role="status" className={styles.revalidating}>
+        {phase === 'revalidating' ? (
+          <>
+            <Icon name="spinner" />
+            <span>{resultCopy.revalidatingNotice}</span>
+          </>
+        ) : null}
+      </p>
 
       <Tabs
         selectedKey={effectiveTab}
         onSelectionChange={(key: Key) => onTabChange(String(key) as ResultTabId)}
         className={styles.tabs}
       >
-        <TabList aria-label={resultCopy.tabs.schema} className={styles.tabList}>
+        <TabList aria-label={resultCopy.tabs.listLabel} className={styles.tabList}>
           <Tab id="schema" className={styles.tab}>
             {resultCopy.tabs.schema}
           </Tab>
@@ -258,24 +270,79 @@ export function ResultPanel({
                 </tr>
               </thead>
               <tbody>
-                {(currentPlan?.columnMappings ?? []).map((mapping, idx) => {
+                {classifiedRows.map(({ mapping, kind }, idx) => {
                   const col = mapping.sourceColumn;
+                  const targetCol = mapping.targetColumn;
+                  const isPk = pkColumns.has(targetCol);
+                  const isConfirmedUnique = confirmedUnique.has(targetCol);
+
+                  if (kind === 'surrogate' || kind === 'decomposed') {
+                    const displaySource =
+                      kind === 'surrogate'
+                        ? resultCopy.surrogateSourceLabel
+                        : resultCopy.decomposedSourceLabel(col);
+                    const readOnlyNote =
+                      kind === 'surrogate'
+                        ? resultCopy.readOnlySurrogateNote
+                        : resultCopy.readOnlyDecomposedNote;
+
+                    return (
+                      <tr key={targetCol}>
+                        <td>
+                          <div className={styles.colCell}>
+                            <span className={styles.sourceColName}>{displaySource}</span>
+                            {isPk ? (
+                              <div className={styles.badgeRow}>
+                                <span className={styles.badgePk}>{resultCopy.badges.primaryKey}</span>
+                              </div>
+                            ) : null}
+                          </div>
+                        </td>
+                        <td>
+                          <code className={styles.readOnlyCode}>{targetCol}</code>
+                        </td>
+                        <td>
+                          <div className={styles.kindCell}>
+                            <span>
+                              {kind === 'surrogate'
+                                ? '정수'
+                                : physicalTypeLabel(mapping.typeCast, 'free_text')}
+                            </span>
+                          </div>
+                        </td>
+                        <td className={styles.checkCell}>
+                          <label className={styles.checkWrap}>
+                            <input
+                              type="checkbox"
+                              checked={isPk || isConfirmedUnique}
+                              disabled
+                              aria-label={resultCopy.uniqueInputLabel(targetCol)}
+                              className={styles.checkbox}
+                            />
+                          </label>
+                        </td>
+                        <td>
+                          <span className={styles.readOnlyNote}>{readOnlyNote}</span>
+                        </td>
+                      </tr>
+                    );
+                  }
+
                   const draft = getOverrideDraft(overrides, currentTable.source.tableName, col);
-                  const inputValue = draft.targetColumn !== undefined ? draft.targetColumn : mapping.targetColumn;
+                  const inputValue = draft.targetColumn !== undefined ? draft.targetColumn : targetCol;
                   const validName = isValidTargetColumnName(inputValue);
                   const errorId = `${nameHintBaseId}-${idx}`;
 
                   const profile = profileMap.get(col);
                   const cls = classMap.get(col);
                   const pii = piiMap.get(col);
-                  const isPk = pkColumns.has(col);
                   const effectiveUnique =
-                    isPk || (draft.unique !== undefined ? draft.unique : confirmedUnique.has(col));
+                    isPk || (draft.unique !== undefined ? draft.unique : isConfirmedUnique);
                   const effectiveMasking: MaskingPolicy =
                     draft.masking ?? currentPlan?.columnMasking[col] ?? 'none';
 
                   return (
-                    <tr key={col}>
+                    <tr key={targetCol}>
                       <td>
                         <div className={styles.colCell}>
                           <span className={styles.sourceColName}>{col}</span>
@@ -303,6 +370,7 @@ export function ResultPanel({
                           <input
                             type="text"
                             value={inputValue}
+                            disabled={savingDb}
                             aria-label={resultCopy.targetColumnInputLabel(col)}
                             aria-invalid={!validName || undefined}
                             aria-describedby={!validName ? errorId : undefined}
@@ -341,7 +409,7 @@ export function ResultPanel({
                           <input
                             type="checkbox"
                             checked={effectiveUnique}
-                            disabled={isPk}
+                            disabled={isPk || savingDb}
                             aria-label={resultCopy.uniqueInputLabel(col)}
                             onChange={(e) =>
                               onToggleUnique(currentTable.source.tableName, col, e.target.checked)
@@ -354,6 +422,7 @@ export function ResultPanel({
                       <td>
                         <select
                           value={effectiveMasking}
+                          disabled={savingDb}
                           aria-label={resultCopy.maskingInputLabel(col)}
                           onChange={(e) =>
                             onChangeMasking(
@@ -515,13 +584,13 @@ export function ResultPanel({
                   <DataTable
                     name={resultCopy.plan.scorecardHeading}
                     copyable={false}
-                    columns={['방식', '종합 점수', '무결성', '중복 감소', '모의 저장']}
+                    columns={[...resultCopy.plan.scorecardColumns]}
                     rows={analysis.loadPlan.scorecards.map((sc) => [
                       sc.candidateId,
                       `${Math.round(sc.weightedTotal * 10) / 10}`,
                       `${Math.round(sc.integrityScore * 10) / 10}`,
                       `${Math.round(sc.redundancyScore * 10) / 10}`,
-                      sc.trialLoadOk ? '통과' : '주의 필요',
+                      sc.trialLoadOk ? resultCopy.plan.trialPass : resultCopy.plan.trialWarn,
                     ])}
                   />
                 ) : null}
@@ -603,6 +672,17 @@ export function ResultPanel({
                 ) : null}
               </div>
 
+              {loadOutcome.loadResult.warnings.length > 0 ? (
+                <section className={styles.block}>
+                  <h3 className={styles.subHeading}>{resultCopy.saved.warningsHeading}</h3>
+                  <ul className={styles.rawList}>
+                    {loadOutcome.loadResult.warnings.map((w, i) => (
+                      <li key={i}>{w}</li>
+                    ))}
+                  </ul>
+                </section>
+              ) : null}
+
               {loadOutcome.loadResult.tables.length > 0 ? (
                 <DataTable
                   name={resultCopy.saved.tableHeading}
@@ -613,7 +693,9 @@ export function ResultPanel({
                     t.rowsRead,
                     t.rowsLoaded,
                     t.rowsQuarantined,
-                    t.maskedColumns.length > 0 ? t.maskedColumns.join(', ') : '없음',
+                    t.maskedColumns.length > 0
+                      ? t.maskedColumns.join(', ')
+                      : resultCopy.saved.noMaskedColumns,
                   ])}
                 />
               ) : null}

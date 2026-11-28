@@ -15,7 +15,7 @@ export interface SettingsPanelProps {
 
 /**
  * Folded advanced settings for the DB tab (`세부 설정`). All defaults match
- * the backend engine defaults (`sqlite`, `quarantine`, `decomposeStrings=false`).
+ * the backend engine defaults (`sqlite`, `quarantine`, `decomposeStrings=true`).
  */
 export function SettingsPanel({ settings, onChange, isExpanded, onExpandedChange }: SettingsPanelProps) {
   const engineId = useId();

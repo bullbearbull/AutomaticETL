@@ -364,8 +364,14 @@ function dbEngineFrom(value: unknown): DbEngine {
 }
 
 function loadStatusFrom(value: unknown): LoadDbResult['loadResult']['status'] {
-  if (value === 'partial' || value === 'failed' || value === 'skipped_duplicate') return value;
-  return 'succeeded';
+  if (value === 'succeeded' || value === 'partial' || value === 'failed' || value === 'skipped_duplicate') {
+    return value;
+  }
+  throw new AppError({
+    kind: 'server',
+    ...errorCopy.server,
+    detail: `알 수 없는 DB 저장 상태: ${String(value ?? '')}`,
+  });
 }
 
 export function normalizeAnalyzeResponse(raw: unknown): AnalyzeResult {
@@ -492,7 +498,7 @@ export function normalizeAnalyzeResponse(raw: unknown): AnalyzeResult {
   const tablePlans: TableLoadPlanInfo[] = arr(lp.table_plans).map((tpItem) => {
     const tp = rec(tpItem);
     const rawMasking = rec(tp.column_masking);
-    const columnMasking: Record<string, MaskingPolicy> = {};
+    const columnMasking = Object.create(null) as Record<string, MaskingPolicy>;
     for (const [col, policy] of Object.entries(rawMasking)) {
       columnMasking[col] = maskingFrom(policy);
     }

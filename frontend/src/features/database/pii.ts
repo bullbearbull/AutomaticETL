@@ -37,14 +37,14 @@ const SENSITIVE_TYPE_PREVIEWS: Record<string, string> = {
   name: '김*수',
   phone_number: '010-****-5678',
   email: 'mi***@example.com',
-  resident_registration_number: '900101-*******',
-  foreigner_registration_number: '900101-*******',
-  card_number: '1234-****-****-5678',
-  bank_account: '110-***-******',
+  resident_registration_number: '900101-1******',
+  foreigner_registration_number: '900101-5******',
+  card_number: '1234-****-****-3456',
+  bank_account: '110-***-***789',
   date_of_birth: '1990-**-**',
   address: '서울시 강남구 ***',
-  business_registration_number: '123-**-*****',
-  ip_address: '192.168.*.*',
+  business_registration_number: '123-**-***90',
+  ip_address: '192.168.1.***',
 };
 
 const HASH_PREVIEW_EXAMPLE = 'h_a1b2c3d4… (일방향 변환)';
@@ -69,7 +69,7 @@ function maskPreviewForTypes(types: readonly string[], columnName: string): stri
   if (lower.includes('name') || lower.includes('성명') || lower.includes('이름')) {
     return SENSITIVE_TYPE_PREVIEWS.name ?? '김*수';
   }
-  return '홍*동 / 010-****-1234';
+  return '일부 글자를 *로 가림';
 }
 
 function guessTypesFromColumnName(columnName: string): string[] {

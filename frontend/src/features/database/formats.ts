@@ -47,6 +47,7 @@ export function formatKindLabel(sourceKind: string): string {
     case 'tsv':
       return 'TSV';
     case 'xlsx':
+    case 'xlsx_sheet':
       return '엑셀';
     default:
       return sourceKind ? sourceKind.toUpperCase() : '표 파일';

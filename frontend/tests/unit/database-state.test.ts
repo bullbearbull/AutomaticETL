@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { normalizeAnalyzeResponse, normalizeLoadDbResponse } from '../../src/features/database/api.ts';
+import { setOverrideDraft } from '../../src/features/database/overrides.ts';
 import {
+  canSaveDatabase,
   databaseReducer,
+  DEFAULT_DATABASE_SETTINGS,
   initialDatabaseState,
+  isAnalysisStale,
   statusFor,
   stepFor,
 } from '../../src/features/database/state.ts';
@@ -25,6 +29,7 @@ function sampleAnalyze() {
           table_id: 't0',
           table_name: 'customers',
           display_name: 'customers.csv',
+          source_path: 'customers.csv',
           row_count: 2,
           column_count: 2,
         },
@@ -51,9 +56,14 @@ function sampleAnalyze() {
   });
 }
 
-test('step transitions cleanly from 1 to 2 to 3 and resets on clear/remove', () => {
+test('default settings enable decomposeStrings matching backend engine defaults', () => {
+  assert.equal(DEFAULT_DATABASE_SETTINGS.decomposeStrings, true);
+});
+
+test('step transitions require matching fileRevision and markExported after download', () => {
   let state = initialDatabaseState;
   assert.equal(stepFor(state), 1);
+  assert.equal(canSaveDatabase(state), false);
   assert.equal(statusFor(state).tone, 'idle');
   assert.equal(statusFor(state).message.includes('단계'), false);
 
@@ -63,12 +73,18 @@ test('step transitions cleanly from 1 to 2 to 3 and resets on clear/remove', () 
   });
   state = databaseReducer(state, { type: 'startAnalyze', mode: 'initial', now: 1000 });
   assert.equal(statusFor(state).tone, 'busy');
-  assert.equal(statusFor(state).message.includes('단계'), false);
+  assert.equal(canSaveDatabase(state), false);
 
-  state = databaseReducer(state, { type: 'analyzeSucceeded', result: sampleAnalyze(), now: 1500 });
+  state = databaseReducer(state, {
+    type: 'analyzeSucceeded',
+    result: sampleAnalyze(),
+    fileRevision: state.fileRevision,
+    now: 1500,
+  });
   assert.equal(stepFor(state), 2);
+  assert.equal(isAnalysisStale(state), false);
+  assert.equal(canSaveDatabase(state), true);
   assert.equal(state.selectedTable, 'customers');
-  // Unmasked PII column emits warning tone in status bar unless archive purpose is selected.
   assert.equal(statusFor(state).tone, 'warning');
 
   state = databaseReducer(state, { type: 'setSettings', patch: { purpose: 'archive' } });
@@ -88,14 +104,73 @@ test('step transitions cleanly from 1 to 2 to 3 and resets on clear/remove', () 
       total_rows_quarantined: 0,
     },
   });
-  state = databaseReducer(state, { type: 'saveDbSucceeded', outcome: loadOutcome, now: 2000 });
+  // saveDbSucceeded alone does not mark exported until download completes via markExported.
+  state = databaseReducer(state, {
+    type: 'saveDbSucceeded',
+    outcome: loadOutcome,
+    fileRevision: state.fileRevision,
+    editRevision: state.editRevision,
+    now: 2000,
+  });
+  assert.equal(stepFor(state), 2);
+
+  // Stale markExported from an older editRevision is ignored.
+  state = databaseReducer(state, {
+    type: 'markExported',
+    fileRevision: state.fileRevision,
+    editRevision: state.editRevision - 1,
+  });
+  assert.equal(stepFor(state), 2);
+
+  state = databaseReducer(state, {
+    type: 'markExported',
+    fileRevision: state.fileRevision,
+    editRevision: state.editRevision,
+  });
   assert.equal(stepFor(state), 3);
-  assert.equal(statusFor(state).tone, 'done');
 
   state = databaseReducer(state, { type: 'removeFile', id: 'f1' });
   assert.equal(stepFor(state), 1);
   assert.equal(state.analysis, null);
   assert.equal(state.settings.purpose, 'archive');
+});
+
+test('adding or removing a file marks previous analysis stale and blocks saving even on refresh failure', () => {
+  let state = databaseReducer(initialDatabaseState, {
+    type: 'mergeFiles',
+    items: [{ id: 'f1', file: fakeFile('customers.csv'), name: 'customers.csv', size: 100 }],
+  });
+  state = databaseReducer(state, {
+    type: 'analyzeSucceeded',
+    result: sampleAnalyze(),
+    fileRevision: state.fileRevision,
+    now: 100,
+  });
+  state = databaseReducer(state, {
+    type: 'setOverrides',
+    overrides: setOverrideDraft({}, 'customers', 'customer_name', { masking: 'mask' }),
+  });
+  assert.equal(canSaveDatabase(state), true);
+
+  // Add second file -> previous analysis is marked stale, save is blocked immediately.
+  state = databaseReducer(state, {
+    type: 'mergeFiles',
+    items: [{ id: 'f2', file: fakeFile('orders.csv'), name: 'orders.csv', size: 80 }],
+  });
+  assert.equal(isAnalysisStale(state), true);
+  assert.equal(canSaveDatabase(state), false);
+
+  // If refresh fails, old analysis stays visible for reference, but save stays disabled.
+  const err = new AppError({ kind: 'server', what: 'fail', why: 'why', how: 'how' });
+  state = databaseReducer(state, { type: 'analyzeFailed', error: err, now: 200 });
+  assert.equal(isAnalysisStale(state), true);
+  assert.equal(canSaveDatabase(state), false);
+  assert.equal(statusFor(state).tone, 'error');
+
+  // Remove the first file -> prunes drafts tied to customers.csv and keeps remaining file stale until re-analyzed.
+  state = databaseReducer(state, { type: 'removeFile', id: 'f1' });
+  assert.deepEqual(state.overrides, {});
+  assert.equal(canSaveDatabase(state), false);
 });
 
 test('replacing a file with the same name updates it in place instead of duplicating', () => {
@@ -115,19 +190,51 @@ test('replacing a file with the same name updates it in place instead of duplica
   assert.equal(state.files[1]?.name, 'b.csv');
 });
 
-test('analyzeFailed sets blocking error when no analysis exists, or noticeError when analysis exists', () => {
-  const err = new AppError({ kind: 'server', what: 'fail', why: 'why', how: 'how' });
-  const blocked = databaseReducer(initialDatabaseState, { type: 'analyzeFailed', error: err, now: 10 });
-  assert.equal(blocked.error, err);
-  assert.equal(blocked.noticeError, null);
-
-  const ready = databaseReducer(initialDatabaseState, {
+test('analyzeSucceeded ignores responses from superseded fileRevision and failed load sets error status', () => {
+  let state = databaseReducer(initialDatabaseState, {
+    type: 'mergeFiles',
+    items: [{ id: 'f1', file: fakeFile('a.csv'), name: 'a.csv', size: 10 }],
+  });
+  const oldRev = state.fileRevision;
+  state = databaseReducer(state, {
+    type: 'mergeFiles',
+    items: [{ id: 'f2', file: fakeFile('b.csv'), name: 'b.csv', size: 10 }],
+  });
+  state = databaseReducer(state, {
     type: 'analyzeSucceeded',
     result: sampleAnalyze(),
-    now: 20,
+    fileRevision: oldRev,
+    now: 50,
   });
-  const noticed = databaseReducer(ready, { type: 'analyzeFailed', error: err, now: 30 });
-  assert.equal(noticed.error, null);
-  assert.equal(noticed.noticeError, err);
-  assert.notEqual(noticed.analysis, null);
+  assert.equal(state.analysis, null);
+
+  state = databaseReducer(state, {
+    type: 'analyzeSucceeded',
+    result: sampleAnalyze(),
+    fileRevision: state.fileRevision,
+    now: 60,
+  });
+  const failedOutcome = normalizeLoadDbResponse({
+    download_filename: 'autoetl_data.sqlite',
+    load_result: {
+      batch_id: 'b2',
+      loaded_at: '2026-11-28T01:00:00Z',
+      db_engine: 'sqlite',
+      status: 'failed',
+      tables: [],
+      total_rows_read: 2,
+      total_rows_loaded: 0,
+      total_rows_quarantined: 1,
+      warnings: ['오류 행 발생으로 전체 중단됨'],
+    },
+  });
+  state = databaseReducer(state, {
+    type: 'saveDbSucceeded',
+    outcome: failedOutcome,
+    fileRevision: state.fileRevision,
+    editRevision: state.editRevision,
+    now: 70,
+  });
+  assert.equal(stepFor(state), 2);
+  assert.equal(statusFor(state).tone, 'error');
 });

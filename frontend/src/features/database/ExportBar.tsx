@@ -10,27 +10,37 @@ export interface ExportBarProps {
   analysis: AnalyzeResult;
   dbEngine: DbEngine;
   unmaskedCount: number;
+  canSave: boolean;
+  isStale: boolean;
+  isAnalyzing: boolean;
   savingDb: boolean;
   bundleExpired: boolean;
+  fileRevision: number;
+  editRevision: number;
   dbSaveFeedback: { text: string; ok: boolean; seq: number } | null;
   onSaveDb: () => void;
-  onZipExported: () => void;
+  onZipExported: (fileRevision: number, editRevision: number) => void;
   onBundleMissing: () => void;
   onReanalyze: () => void;
 }
 
 /**
  * Bottom export bar for the DB tab:
- * - Engine + unmasked PII summary
+ * - Engine + unmasked PII summary (or stale notice when files changed)
  * - Secondary [설계안 ZIP으로 저장하기] (from `analysis.bundleId`)
- * - Single primary [DB 파일로 저장하기] (triggers pre-save PII dialog or builds & downloads DB)
+ * - Single primary [DB 파일로 저장하기]
  */
 export function ExportBar({
   analysis,
   dbEngine,
   unmaskedCount,
+  canSave,
+  isStale,
+  isAnalyzing,
   savingDb,
   bundleExpired,
+  fileRevision,
+  editRevision,
   dbSaveFeedback,
   onSaveDb,
   onZipExported,
@@ -42,6 +52,8 @@ export function ExportBar({
   const timer = useRef<number | undefined>(undefined);
   const request = useRef<AbortController | null>(null);
   const messageLine = useRef<HTMLParagraphElement>(null);
+  const latestRevRef = useRef({ fileRevision, editRevision });
+  latestRevRef.current = { fileRevision, editRevision };
 
   useEffect(
     () => () => {
@@ -50,6 +62,13 @@ export function ExportBar({
     },
     [],
   );
+
+  // Cancel any in-flight ZIP download whenever files or edits change.
+  useEffect(() => {
+    request.current?.abort();
+    request.current = null;
+    setSavingZip(false);
+  }, [fileRevision, editRevision]);
 
   useEffect(() => {
     if (!dbSaveFeedback) return;
@@ -69,7 +88,9 @@ export function ExportBar({
   };
 
   const savePlanZip = async () => {
-    if (request.current || !analysis.bundleId) return;
+    if (request.current || !analysis.bundleId || !canSave) return;
+    const startFileRev = fileRevision;
+    const startEditRev = editRevision;
     const controller = new AbortController();
     request.current = controller;
     window.clearTimeout(timer.current);
@@ -80,12 +101,18 @@ export function ExportBar({
       'autoetl_plan_bundle.zip',
       controller.signal,
     );
-    request.current = null;
+    if (request.current === controller) request.current = null;
     setSavingZip(false);
+    if (
+      latestRevRef.current.fileRevision !== startFileRev ||
+      latestRevRef.current.editRevision !== startEditRev
+    ) {
+      return;
+    }
     switch (outcome.type) {
       case 'ok':
         saveBlobAsFile(outcome.blob, outcome.fileName);
-        onZipExported();
+        onZipExported(startFileRev, startEditRev);
         show(exportCopy.savedZip(outcome.fileName), true);
         return;
       case 'missing':
@@ -103,14 +130,20 @@ export function ExportBar({
   return (
     <div className={styles.bar}>
       <p className={styles.contents}>
-        {exportCopy.summary(dbEngine, analysis.tables.length, unmaskedCount)}
+        {isStale
+          ? exportCopy.staleNotice
+          : exportCopy.summary(dbEngine, analysis.tables.length, unmaskedCount)}
       </p>
       <div className={styles.actions}>
         {analysis.bundleId ? (
-          bundleExpired ? (
-            <Button onPress={onReanalyze}>표 다시 살펴보기</Button>
+          bundleExpired || (isStale && !isAnalyzing) ? (
+            <Button onPress={onReanalyze}>{exportCopy.reanalyze}</Button>
           ) : (
-            <Button isPending={savingZip} onPress={() => void savePlanZip()}>
+            <Button
+              isPending={savingZip}
+              isDisabled={!canSave || savingDb}
+              onPress={() => void savePlanZip()}
+            >
               {savingZip ? <Icon name="spinner" /> : null}
               {exportCopy.saveZip}
             </Button>
@@ -120,6 +153,7 @@ export function ExportBar({
         <Button
           variant="primary"
           isPending={savingDb}
+          isDisabled={!canSave}
           onPress={onSaveDb}
           className={styles.primarySave}
         >

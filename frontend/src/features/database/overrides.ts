@@ -1,4 +1,4 @@
-import type { AnalyzeResult, ColumnOverrideSpec, MaskingPolicy, SchemaOverrideSpec } from './api.ts';
+import type { AnalyzeResult, ColumnMappingInfo, ColumnOverrideSpec, MaskingPolicy, SchemaOverrideSpec } from './api.ts';
 import type { DatabaseSettings } from './state.ts';
 
 /**
@@ -14,6 +14,41 @@ export interface ColumnOverrideDraft {
   unique?: boolean | undefined;
   /** PII protection policy override, or undefined if untouched. */
   masking?: MaskingPolicy | undefined;
+}
+
+export type MappingRowKind = 'editable' | 'surrogate' | 'decomposed';
+
+export interface ClassifiedMapping {
+  mapping: ColumnMappingInfo;
+  kind: MappingRowKind;
+}
+
+/**
+ * Classifies each mapping row in `tablePlan.columnMappings` so that generated
+ * surrogate PK rows (`__surrogate__`) and decomposed string slot rows share
+ * deterministic UI identity by `targetColumn` and stay read-only instead of
+ * colliding on `sourceColumn`.
+ */
+export function classifyTableMappings(mappings: readonly ColumnMappingInfo[]): ClassifiedMapping[] {
+  const seenSourceColumns = new Set<string>();
+  return mappings.map((mapping) => {
+    if (
+      mapping.sourceColumn === '__surrogate__' ||
+      mapping.transform === 'generated_always_as_identity'
+    ) {
+      return { mapping, kind: 'surrogate' };
+    }
+    const isSlotTransform =
+      mapping.transform.startsWith('NULLIF(regexp_extract(') ||
+      mapping.transform.includes('regexp_extract(') ||
+      mapping.transform.includes('split_part(') ||
+      mapping.transform.includes('substr(');
+    if (seenSourceColumns.has(mapping.sourceColumn) || isSlotTransform) {
+      return { mapping, kind: 'decomposed' };
+    }
+    seenSourceColumns.add(mapping.sourceColumn);
+    return { mapping, kind: 'editable' };
+  });
 }
 
 export function overrideKey(table: string, sourceColumn: string): string {
@@ -35,11 +70,39 @@ export function isValidTargetColumnName(value: string): boolean {
   return IDENTIFIER_PATTERN.test(trimmed);
 }
 
-/** True when any edited DB column name violates the server identifier rule. */
-export function hasInvalidTargetColumnNames(drafts: Readonly<Record<string, ColumnOverrideDraft>>): boolean {
-  return Object.values(drafts).some(
-    (draft) => draft.targetColumn !== undefined && !isValidTargetColumnName(draft.targetColumn),
-  );
+function editableColumnSet(analysis: AnalyzeResult): Map<string, Set<string>> {
+  const map = new Map<string, Set<string>>();
+  for (const plan of analysis.loadPlan.tablePlans) {
+    const editable = new Set<string>();
+    for (const item of classifyTableMappings(plan.columnMappings)) {
+      if (item.kind === 'editable') editable.add(item.mapping.sourceColumn);
+    }
+    map.set(plan.sourceTable, editable);
+  }
+  return map;
+}
+
+/**
+ * True when any edited DB column name violates the server identifier rule.
+ * When `analysis` is passed, drafts belonging to removed tables/columns are ignored.
+ */
+export function hasInvalidTargetColumnNames(
+  drafts: Readonly<Record<string, ColumnOverrideDraft>>,
+  analysis: AnalyzeResult | null = null,
+): boolean {
+  const editableMap = analysis ? editableColumnSet(analysis) : null;
+  for (const [key, draft] of Object.entries(drafts)) {
+    if (draft.targetColumn === undefined || isValidTargetColumnName(draft.targetColumn)) continue;
+    if (editableMap) {
+      const sep = key.indexOf('\0');
+      if (sep <= 0) continue;
+      const table = key.slice(0, sep);
+      const col = key.slice(sep + 1);
+      if (!editableMap.get(table)?.has(col)) continue;
+    }
+    return true;
+  }
+  return false;
 }
 
 /** Returns a new draft map with the specified field updated; removes empty drafts. */
@@ -61,13 +124,28 @@ export function setOverrideDraft(
 }
 
 /** Counts how many columns have at least one user override set. */
-export function countActiveOverrides(drafts: Readonly<Record<string, ColumnOverrideDraft>>): number {
-  return Object.values(drafts).filter(
-    (draft) =>
+export function countActiveOverrides(
+  drafts: Readonly<Record<string, ColumnOverrideDraft>>,
+  analysis: AnalyzeResult | null = null,
+): number {
+  const editableMap = analysis ? editableColumnSet(analysis) : null;
+  let total = 0;
+  for (const [key, draft] of Object.entries(drafts)) {
+    const hasValue =
       (draft.targetColumn !== undefined && draft.targetColumn.trim() !== '') ||
       draft.unique !== undefined ||
-      draft.masking !== undefined,
-  ).length;
+      draft.masking !== undefined;
+    if (!hasValue) continue;
+    if (editableMap) {
+      const sep = key.indexOf('\0');
+      if (sep <= 0) continue;
+      const table = key.slice(0, sep);
+      const col = key.slice(sep + 1);
+      if (!editableMap.get(table)?.has(col)) continue;
+    }
+    total += 1;
+  }
+  return total;
 }
 
 /**
@@ -85,25 +163,32 @@ export function applyMaskToUnmaskedColumns(
   return next;
 }
 
+/** Removes drafts belonging to source tables no longer present in `removedTableNames`. */
+export function pruneOverridesForTables(
+  drafts: Readonly<Record<string, ColumnOverrideDraft>>,
+  removedTableNames: ReadonlySet<string>,
+): Record<string, ColumnOverrideDraft> {
+  if (removedTableNames.size === 0) return { ...drafts };
+  const next: Record<string, ColumnOverrideDraft> = {};
+  for (const [key, draft] of Object.entries(drafts)) {
+    const sep = key.indexOf('\0');
+    const table = sep > 0 ? key.slice(0, sep) : '';
+    if (!removedTableNames.has(table)) next[key] = draft;
+  }
+  return next;
+}
+
 /**
  * Builds the `SchemaOverrideSpec` payload sent to `/api/analyze-tables` and
- * `/api/etl/load-db`. Drops overrides that reference tables absent from the
- * current analysis or invalid column names (when analyzing partial drafts).
+ * `/api/etl/load-db`. Drops overrides referencing surrogate/decomposed columns,
+ * columns absent from the current analysis, or invalid target column names.
  */
 export function buildSchemaOverrideSpec(
   drafts: Readonly<Record<string, ColumnOverrideDraft>>,
   settings: Pick<DatabaseSettings, 'orphanPolicy' | 'includeAuditColumns' | 'includeManagementTables'>,
   analysis: AnalyzeResult | null,
 ): SchemaOverrideSpec {
-  const validColumnsByTable = new Map<string, Set<string>>();
-  if (analysis) {
-    for (const plan of analysis.loadPlan.tablePlans) {
-      validColumnsByTable.set(
-        plan.sourceTable,
-        new Set(plan.columnMappings.map((m) => m.sourceColumn)),
-      );
-    }
-  }
+  const validColumnsByTable = analysis ? editableColumnSet(analysis) : null;
 
   const columns: ColumnOverrideSpec[] = [];
   for (const [key, draft] of Object.entries(drafts)) {
@@ -112,7 +197,7 @@ export function buildSchemaOverrideSpec(
     const table = key.slice(0, sep);
     const sourceColumn = key.slice(sep + 1);
     if (!sourceColumn) continue;
-    if (analysis) {
+    if (validColumnsByTable) {
       const known = validColumnsByTable.get(table);
       if (!known || !known.has(sourceColumn)) continue;
     }

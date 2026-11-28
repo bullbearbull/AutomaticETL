@@ -1,7 +1,11 @@
 import type { AppError } from '../../lib/errors.ts';
 import type { AnalyzeResult, DbEngine, LoadDbResult, OrphanPolicy, Purpose } from './api.ts';
 import { statusText } from './copy.ts';
-import type { ColumnOverrideDraft } from './overrides.ts';
+import {
+  hasInvalidTargetColumnNames,
+  pruneOverridesForTables,
+  type ColumnOverrideDraft,
+} from './overrides.ts';
 import { unmaskedPiiColumns } from './pii.ts';
 
 /** Matches StatusBar `tone` and StepIndicator `current` without pulling JSX into unit tests. */
@@ -27,7 +31,7 @@ export interface DatabaseSettings {
 
 export const DEFAULT_DATABASE_SETTINGS: DatabaseSettings = {
   purpose: 'oltp',
-  decomposeStrings: false,
+  decomposeStrings: true,
   dbEngine: 'sqlite',
   orphanPolicy: 'quarantine',
   includeAuditColumns: true,
@@ -44,13 +48,19 @@ export interface DatabaseState {
   analysis: AnalyzeResult | null;
   selectedTable: string | null;
   phase: AnalyzePhase;
+  /** Monotonic revision of the current `files` list; bumped whenever files change. */
+  fileRevision: number;
+  /** The `fileRevision` that produced `analysis`, or null if no analysis matches. */
+  analyzedFileRevision: number | null;
+  /** Monotonic revision bumped on file changes, override changes, or analysis-affecting settings. */
+  editRevision: number;
   /** Blocking error shown when no analysis result is available. */
   error: AppError | null;
   /** Non-blocking alert banner shown while keeping an existing analysis on screen. */
   noticeError: AppError | null;
   savingDb: boolean;
   loadOutcome: LoadDbResult | null;
-  /** True once a DB file or design ZIP has been saved during the current analysis. */
+  /** True only after a DB download or ZIP download succeeded for the current revision. */
   exported: boolean;
   bundleExpired: boolean;
   startedAt: number | null;
@@ -64,6 +74,9 @@ export const initialDatabaseState: DatabaseState = {
   analysis: null,
   selectedTable: null,
   phase: 'idle',
+  fileRevision: 0,
+  analyzedFileRevision: null,
+  editRevision: 0,
   error: null,
   noticeError: null,
   savingDb: false,
@@ -85,12 +98,18 @@ export type DatabaseAction =
   | { type: 'resetOverrides' }
   | { type: 'selectTable'; tableName: string }
   | { type: 'startAnalyze'; mode: 'initial' | 'revalidate'; now: number }
-  | { type: 'analyzeSucceeded'; result: AnalyzeResult; now: number }
+  | { type: 'analyzeSucceeded'; result: AnalyzeResult; fileRevision: number; now: number }
   | { type: 'analyzeFailed'; error: AppError; now: number }
   | { type: 'startSaveDb'; now: number }
-  | { type: 'saveDbSucceeded'; outcome: LoadDbResult; now: number }
+  | {
+      type: 'saveDbSucceeded';
+      outcome: LoadDbResult;
+      fileRevision: number;
+      editRevision: number;
+      now: number;
+    }
   | { type: 'saveDbFailed'; error: AppError; now: number }
-  | { type: 'markExported' }
+  | { type: 'markExported'; fileRevision: number; editRevision: number }
   | { type: 'markBundleExpired' };
 
 function mergeFileLists(
@@ -113,12 +132,34 @@ function resolveSelectedTable(previous: string | null, analysis: AnalyzeResult):
   return analysis.tables[0]?.source.tableName ?? null;
 }
 
+/** True when `analysis` is absent or came from an older `fileRevision` than `files`. */
+export function isAnalysisStale(state: DatabaseState): boolean {
+  return state.analysis === null || state.analyzedFileRevision !== state.fileRevision;
+}
+
+/**
+ * True only when `analysis` matches the current `files`, analysis/revalidation
+ * is settled (`phase === 'ready'`), no save is in flight, and no active DB
+ * column name has a syntax error.
+ */
+export function canSaveDatabase(state: DatabaseState): boolean {
+  return (
+    state.analysis !== null &&
+    !isAnalysisStale(state) &&
+    state.phase === 'ready' &&
+    !state.savingDb &&
+    !hasInvalidTargetColumnNames(state.overrides, state.analysis)
+  );
+}
+
 export function databaseReducer(state: DatabaseState, action: DatabaseAction): DatabaseState {
   switch (action.type) {
     case 'mergeFiles':
       return {
         ...state,
         files: mergeFileLists(state.files, action.items),
+        fileRevision: state.fileRevision + 1,
+        editRevision: state.editRevision + 1,
         error: null,
         noticeError: null,
         loadOutcome: null,
@@ -126,16 +167,34 @@ export function databaseReducer(state: DatabaseState, action: DatabaseAction): D
         bundleExpired: false,
       };
     case 'removeFile': {
+      const removed = state.files.find((f) => f.id === action.id);
       const remaining = state.files.filter((f) => f.id !== action.id);
       if (remaining.length === 0) {
         return {
           ...initialDatabaseState,
           settings: state.settings,
+          fileRevision: state.fileRevision + 1,
+          editRevision: state.editRevision + 1,
         };
+      }
+      const removedTables = new Set<string>();
+      if (removed && state.analysis) {
+        for (const t of state.analysis.tables) {
+          if (
+            t.source.sourcePath === removed.name ||
+            t.source.displayName === removed.name ||
+            t.source.displayName.startsWith(`${removed.name} `)
+          ) {
+            removedTables.add(t.source.tableName);
+          }
+        }
       }
       return {
         ...state,
         files: remaining,
+        overrides: pruneOverridesForTables(state.overrides, removedTables),
+        fileRevision: state.fileRevision + 1,
+        editRevision: state.editRevision + 1,
         error: null,
         noticeError: null,
         loadOutcome: null,
@@ -147,6 +206,8 @@ export function databaseReducer(state: DatabaseState, action: DatabaseAction): D
       return {
         ...initialDatabaseState,
         settings: state.settings,
+        fileRevision: state.fileRevision + 1,
+        editRevision: state.editRevision + 1,
       };
     case 'setValidationError':
       return state.analysis
@@ -164,13 +225,20 @@ export function databaseReducer(state: DatabaseState, action: DatabaseAction): D
       return {
         ...state,
         settings: { ...state.settings, ...action.patch },
-        ...(affectsAnalysis ? { loadOutcome: null, exported: false } : {}),
+        ...(affectsAnalysis || action.patch.dbEngine !== undefined || action.patch.notes !== undefined
+          ? {
+              editRevision: state.editRevision + 1,
+              loadOutcome: null,
+              exported: false,
+            }
+          : {}),
       };
     }
     case 'setOverrides':
       return {
         ...state,
         overrides: action.overrides,
+        editRevision: state.editRevision + 1,
         noticeError: null,
         loadOutcome: null,
         exported: false,
@@ -179,6 +247,7 @@ export function databaseReducer(state: DatabaseState, action: DatabaseAction): D
       return {
         ...state,
         overrides: {},
+        editRevision: state.editRevision + 1,
         noticeError: null,
         loadOutcome: null,
         exported: false,
@@ -196,9 +265,14 @@ export function databaseReducer(state: DatabaseState, action: DatabaseAction): D
         endedAt: null,
       };
     case 'analyzeSucceeded':
+      // Discard results belonging to a superseded file set.
+      if (action.fileRevision !== state.fileRevision) {
+        return state;
+      }
       return {
         ...state,
         analysis: action.result,
+        analyzedFileRevision: action.fileRevision,
         selectedTable: resolveSelectedTable(state.selectedTable, action.result),
         phase: 'ready',
         error: null,
@@ -208,9 +282,10 @@ export function databaseReducer(state: DatabaseState, action: DatabaseAction): D
       };
     case 'analyzeFailed':
       if (state.analysis) {
+        // Keep the previous analysis for reference while `analyzedFileRevision !== fileRevision` blocks saving if stale.
         return {
           ...state,
-          phase: 'ready',
+          phase: isAnalysisStale(state) ? 'error' : 'ready',
           noticeError: action.error,
           endedAt: action.now,
         };
@@ -230,11 +305,13 @@ export function databaseReducer(state: DatabaseState, action: DatabaseAction): D
         endedAt: null,
       };
     case 'saveDbSucceeded':
+      if (action.fileRevision !== state.fileRevision || action.editRevision !== state.editRevision) {
+        return { ...state, savingDb: false, endedAt: action.now };
+      }
       return {
         ...state,
         savingDb: false,
         loadOutcome: action.outcome,
-        exported: action.outcome.loadResult.status !== 'failed',
         endedAt: action.now,
       };
     case 'saveDbFailed':
@@ -245,6 +322,9 @@ export function databaseReducer(state: DatabaseState, action: DatabaseAction): D
         endedAt: action.now,
       };
     case 'markExported':
+      if (action.fileRevision !== state.fileRevision || action.editRevision !== state.editRevision) {
+        return state;
+      }
       return { ...state, exported: true };
     case 'markBundleExpired':
       return { ...state, bundleExpired: true };
@@ -255,7 +335,7 @@ export function databaseReducer(state: DatabaseState, action: DatabaseAction): D
 
 export function stepFor(state: DatabaseState): StepNumber {
   if (!state.analysis) return 1;
-  if (state.exported) return 3;
+  if (state.exported && !isAnalysisStale(state)) return 3;
   return 2;
 }
 
@@ -299,6 +379,14 @@ export function statusFor(state: DatabaseState): DatabaseStatusSummary {
       endedAt: state.endedAt,
     };
   }
+  if (state.analysis && isAnalysisStale(state)) {
+    return {
+      message: statusText.stale,
+      tone: state.noticeError ? 'error' : 'warning',
+      startedAt: state.startedAt,
+      endedAt: state.endedAt,
+    };
+  }
   if (state.noticeError) {
     return {
       message: statusText.error,
@@ -307,7 +395,15 @@ export function statusFor(state: DatabaseState): DatabaseStatusSummary {
       endedAt: state.endedAt,
     };
   }
-  if (state.loadOutcome && state.loadOutcome.loadResult.status !== 'failed') {
+  if (state.loadOutcome?.loadResult.status === 'failed') {
+    return {
+      message: statusText.error,
+      tone: 'error',
+      startedAt: state.startedAt,
+      endedAt: state.endedAt,
+    };
+  }
+  if (state.loadOutcome) {
     return {
       message: statusText.saved(
         state.loadOutcome.downloadFilename,

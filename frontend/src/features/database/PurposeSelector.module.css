@@ -88,6 +88,10 @@
   line-height: var(--line-height-tiny);
 }
 
+.archiveStatus:empty {
+  display: none;
+}
+
 .archiveNotice {
   display: flex;
   align-items: flex-start;

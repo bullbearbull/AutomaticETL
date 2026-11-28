@@ -101,11 +101,16 @@ export const resultCopy = {
   retryAnalyze: '다시 살펴보기',
   dismissNotice: '닫기',
   tabs: {
+    listLabel: '결과 보기',
     schema: '표 구조',
     relations: (fkCount: number) => (fkCount > 0 ? `표 연결 (${fkCount})` : '표 연결'),
     plan: '저장 순서·정리',
     saved: '저장 결과',
   },
+  surrogateSourceLabel: '자동으로 붙인 번호',
+  decomposedSourceLabel: (sourceCol: string) => `${sourceCol}에서 나눈 열`,
+  readOnlySurrogateNote: '자동 생성',
+  readOnlyDecomposedNote: '나눈 열',
   tableSummary: (sourceKindLabel: string, rows: number, cols: number, sheet: string | null) => {
     const parts = [sourceKindLabel];
     if (sheet) parts.push(`시트 "${sheet}"`);
@@ -165,6 +170,9 @@ export const resultCopy = {
     managementDdlHeading: '관리 표 생성 코드',
     erdHeading: '표 관계 그림 코드',
     scorecardHeading: '구성 방식 비교',
+    scorecardColumns: ['방식', '종합 점수', '무결성', '중복 감소', '모의 저장'] as const,
+    trialPass: '통과',
+    trialWarn: '주의 필요',
     reportHeading: '전체 분석 보고서',
   },
   saved: {
@@ -177,11 +185,13 @@ export const resultCopy = {
     partialNote: '일부 오류 행은 따로 모아 두고 나머지를 모두 저장했어요.',
     failedTitle: 'DB 파일을 만들지 못했어요',
     failedBody: '저장 설정이나 오류 행을 확인한 뒤 다시 시도해 주세요.',
+    warningsHeading: '저장 중 확인된 내용',
     redownload: 'DB 파일 다시 저장하기',
     meta: (engineLabel: string, localTime: string, filename: string) =>
       `${engineLabel} · ${localTime} · 파일 이름: ${filename}`,
     tableHeading: '표별 저장 내역',
     tableColumns: ['표 이름', '원본 파일', '읽은 행', '저장한 행', '따로 모은 행', '보호한 열'] as const,
+    noMaskedColumns: '없음',
     quarantineHeading: (count: number) => `따로 모은 오류 행 (${count}건)`,
     quarantineColumns: ['표 이름', '원본 줄', '열 이름', '원인', '내용'] as const,
   },
@@ -201,7 +211,7 @@ export const piiDialogCopy = {
   tableLine: (tableName: string, columns: readonly string[]) =>
     `${withParticle(tableName, '은/는')} ${columns.join(', ')} 열이에요.`,
   previewLine: (examples: string) => `가리면 ${examples}처럼 바뀌어 저장돼요.`,
-  noteArchiveTip: '다음부터 묻지 않고 그대로 두려면 저장 목적에서 "원본 보관용"을 고르면 돼요.',
+  noteArchiveTip: '열별 가리기 방식은 표 구조의 "저장할 때"에서 언제든 따로 정할 수 있어요.',
   primaryAction: '가리고 저장하기',
   secondaryAction: '그대로 저장하기',
 } as const;
@@ -213,10 +223,17 @@ export const evidenceCopy = {
     `다른 표(${tables.join(', ')})에 가려지지 않은 개인정보 열이 있어요.`,
   piiReasonLabel: '찾은 이유',
   piiPreviewLabel: '가렸을 때의 모습 (예시)',
-  piiReasonText: (columnName: string, typeLabels: string[], level: string | null, maskPattern: string | null) => {
-    const levelText = level ? ` (${levelLabel(level)})` : '';
-    const patternText = maskPattern ? `, 값 모양: ${maskPattern}` : '';
-    return `열 이름(${columnName})과 값 형태가 ${typeLabels.join('·')}${levelText}에 해당해요${patternText}.`;
+  piiReasonText: (
+    columnName: string,
+    typeLabels: string[],
+    level: string | null,
+    maskPattern: string | null,
+    recommendation?: string,
+  ) => {
+    const levelText = level ? ` · 등급: ${levelLabel(level)}` : '';
+    const patternText = maskPattern ? ` · 값 모양: ${maskPattern}` : '';
+    const base = `${columnName} 열 — 유형: ${typeLabels.join(', ')}${levelText}${patternText}`;
+    return recommendation ? `${base} (${recommendation})` : base;
   },
   piiPreviewValue: (policy: MaskingPolicy, maskExample: string, hashExample: string) => {
     if (policy === 'mask') return `가리기 적용 중 — ${maskExample}`;
@@ -243,6 +260,8 @@ export const exportCopy = {
   },
   saveZip: '설계안 ZIP으로 저장하기',
   saveDb: 'DB 파일로 저장하기',
+  reanalyze: '표 다시 살펴보기',
+  staleNotice: '파일 목록이 바뀌어 다시 분석이 필요해요. 분석이 끝난 뒤 저장할 수 있어요.',
   savingDb: 'DB 파일을 만들고 있어요…',
   savedDb: (filename: string) => `${withParticle(filename, '을/를')} 저장하기 시작했어요.`,
   savedZip: (filename: string) => `${withParticle(filename, '을/를')} 저장하기 시작했어요.`,
@@ -267,6 +286,7 @@ export const statusText = {
   },
   readyUnmaskedWarning: (tableCount: number, unmaskedCount: number) =>
     `표 ${tableCount}개를 확인했어요 · 가려지지 않은 개인정보 열이 ${unmaskedCount}개 있어요`,
+  stale: '파일 목록이 바뀌었어요. 다시 살펴본 뒤 저장해 주세요',
   saved: (filename: string, loadedRows: number) =>
     `${withParticle(filename, '을/를')} 만들었어요 (총 ${loadedRows.toLocaleString('ko-KR')}행 저장됨)`,
   error: '작업을 마치지 못했어요. 화면의 안내를 확인해 주세요',
@@ -290,13 +310,14 @@ export const databaseErrorCopy = {
   },
 } as const;
 
-function cardinalityLabel(raw: string): string {
+export function cardinalityLabel(raw: string): string {
   switch (raw) {
     case '1:1':
       return '일대일(1:1)';
     case '1:N':
-    case 'N:1':
       return '일대다(1:N)';
+    case 'N:1':
+      return '다대일(N:1)';
     case 'N:M':
       return '다대다(N:M)';
     default:
@@ -304,13 +325,13 @@ function cardinalityLabel(raw: string): string {
   }
 }
 
-function levelLabel(level: string): string {
+export function levelLabel(level: string): string {
   switch (level) {
-    case 'L1':
+    case 'L3':
       return '고위험 식별정보';
     case 'L2':
       return '개인정보';
-    case 'L3':
+    case 'L1':
       return '민감 참고정보';
     default:
       return level;

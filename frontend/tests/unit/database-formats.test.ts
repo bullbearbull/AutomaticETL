@@ -51,6 +51,6 @@ test('single and combined files over 50MB are rejected before reading', () => {
 test('formatKindLabel returns Korean labels', () => {
   assert.equal(formatKindLabel('csv'), 'CSV');
   assert.equal(formatKindLabel('tsv'), 'TSV');
-  assert.equal(formatKindLabel('xlsx_sheet'), 'XLSX_SHEET');
+  assert.equal(formatKindLabel('xlsx_sheet'), '엑셀');
   assert.equal(formatKindLabel('xlsx'), '엑셀');
 });

@@ -1,3 +1,4 @@
+import { useId } from 'react';
 import { Label, Radio, RadioGroup } from 'react-aria-components';
 import { Icon } from '../../components/index.ts';
 import type { Purpose } from './api.ts';
@@ -12,14 +13,18 @@ export interface PurposeSelectorProps {
 
 /**
  * Lets the user choose the DB design purpose (`일반 서비스용` / `통계·분석용` /
- * `원본 보관용`). When `원본 보관용` (`archive`) is selected, immediately explains
- * that pre-save PII confirmation will be skipped.
+ * `원본 보관용`). When `원본 보관용` (`archive`) is selected, links the inline
+ * guidance to the radio group and announces it politely via a persistent live region.
  */
 export function PurposeSelector({ value, onChange, compact = false }: PurposeSelectorProps) {
+  const archiveNoticeId = useId();
+  const isArchive = value === 'archive';
+
   return (
     <div className={styles.wrapper}>
       <RadioGroup
         value={value}
+        aria-describedby={isArchive ? archiveNoticeId : undefined}
         onChange={(next) => {
           if (next === 'oltp' || next === 'analytics' || next === 'archive') onChange(next);
         }}
@@ -39,12 +44,14 @@ export function PurposeSelector({ value, onChange, compact = false }: PurposeSel
         </div>
       </RadioGroup>
 
-      {value === 'archive' ? (
-        <p className={styles.archiveNotice}>
-          <Icon name="info" className={styles.archiveIcon} />
-          <span>{purposeCopy.archiveNotice}</span>
-        </p>
-      ) : null}
+      <div role="status" className={styles.archiveStatus}>
+        {isArchive ? (
+          <p id={archiveNoticeId} className={styles.archiveNotice}>
+            <Icon name="info" className={styles.archiveIcon} />
+            <span>{purposeCopy.archiveNotice}</span>
+          </p>
+        ) : null}
+      </div>
     </div>
   );
 }

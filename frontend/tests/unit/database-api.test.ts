@@ -6,6 +6,7 @@ import {
   normalizeAnalyzeResponse,
   normalizeLoadDbResponse,
 } from '../../src/features/database/api.ts';
+import { cardinalityLabel } from '../../src/features/database/copy.ts';
 import { AppError } from '../../src/lib/errors.ts';
 
 test('normalizeAnalyzeResponse parses valid analyze payload defensively', () => {
@@ -124,6 +125,8 @@ test('normalizeAnalyzeResponse parses valid analyze payload defensively', () => 
   assert.equal(parsed.tables.length, 1);
   assert.equal(parsed.tables[0]?.source.tableName, 'customers');
   assert.equal(parsed.loadPlan.tablePlans[0]?.sensitiveColumns[0], 'customer_name');
+  assert.equal(Object.getPrototypeOf(parsed.loadPlan.tablePlans[0]?.columnMasking), null);
+  assert.equal(parsed.loadPlan.tablePlans[0]?.columnMasking['constructor'], undefined);
   assert.equal(parsed.loadPlan.scorecards[0]?.trialLoadOk, true);
 });
 
@@ -182,6 +185,27 @@ test('normalizeLoadDbResponse handles load outcome and quarantine rows', () => {
   assert.equal(res.loadResult.status, 'partial');
   assert.equal(res.quarantine.length, 1);
   assert.equal(res.quarantine[0]?.sourceRowNumber, 3);
+});
+
+test('normalizeLoadDbResponse rejects missing or unknown load status and cardinalityLabel distinguishes N:1', () => {
+  assert.throws(
+    () =>
+      normalizeLoadDbResponse({
+        download_filename: 'autoetl_data.sqlite',
+        load_result: { batch_id: 'b1', db_engine: 'sqlite', status: 'mystery' },
+      }),
+    (err: unknown) => err instanceof AppError && err.kind === 'server',
+  );
+  assert.throws(
+    () =>
+      normalizeLoadDbResponse({
+        download_filename: 'autoetl_data.sqlite',
+        load_result: { batch_id: 'b1', db_engine: 'sqlite' },
+      }),
+    (err: unknown) => err instanceof AppError && err.kind === 'server',
+  );
+  assert.equal(cardinalityLabel('N:1'), '다대일(N:1)');
+  assert.equal(cardinalityLabel('1:N'), '일대다(1:N)');
 });
 
 test('downloadFileName and fetchDownloadFile parse Content-Disposition and handle statuses', async () => {

@@ -83,6 +83,7 @@ export function EvidencePanel({ analysis, selectedTable, overrides, error }: Evi
                           item.typeLabels,
                           item.level,
                           item.patternMask,
+                          item.recommendation,
                         )}
                       </dd>
                     </div>

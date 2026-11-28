@@ -12,6 +12,7 @@ import {
   fetchDownloadFile,
   loadDatabase,
   saveBlobAsFile,
+  type AnalyzeResult,
   type LoadDbResult,
   type MaskingPolicy,
 } from './api.ts';
@@ -35,8 +36,10 @@ import { ResultPanel, type ResultTabId } from './ResultPanel.tsx';
 import { SettingsPanel } from './SettingsPanel.tsx';
 import { StartScreen } from './StartScreen.tsx';
 import {
+  canSaveDatabase,
   databaseReducer,
   initialDatabaseState,
+  isAnalysisStale,
   statusFor,
   stepFor,
   type DatabaseFileItem,
@@ -56,6 +59,8 @@ const REVALIDATE_DEBOUNCE_MS = 400;
  * - Files are analyzed as soon as dropped/picked (`POST /api/analyze-tables`).
  * - Inline edits to DB column name, unique constraint, or masking policy
  *   automatically re-validate via `session_id` without a separate Apply button.
+ * - Save buttons stay disabled until `analysis` matches the current file list,
+ *   and late save/download responses for superseded revisions are ignored.
  * - `[DB 파일로 저장하기]` opens a `ConfirmDialog` before saving if any PII
  *   column is still `"none"` (unless purpose is `"archive"`), then builds and
  *   downloads the DB file in one step.
@@ -77,6 +82,7 @@ export default function DatabaseTab() {
   const redownloadController = useRef<AbortController | null>(null);
   const debounceTimer = useRef<number | undefined>(undefined);
   const analyzeSeq = useRef(0);
+  const pendingNameEditRef = useRef(false);
 
   const rootRef = useRef<HTMLDivElement>(null);
   const statusRef = useRef<HTMLDivElement>(null);
@@ -89,6 +95,9 @@ export default function DatabaseTab() {
   stateRef.current = state;
 
   const status = statusFor(state);
+  const stale = isAnalysisStale(state);
+  const canSave = canSaveDatabase(state);
+
   const unmaskedPii = useMemo(
     () => unmaskedPiiColumns(state.analysis, state.overrides),
     [state.analysis, state.overrides],
@@ -142,10 +151,12 @@ export default function DatabaseTab() {
     settings: DatabaseSettings,
     overrides: Readonly<Record<string, ColumnOverrideDraft>>,
     mode: 'initial' | 'revalidate',
-    previousAnalysis = stateRef.current.analysis,
+    fileRevision: number,
+    previousAnalysis: AnalyzeResult | null = stateRef.current.analysis,
   ) => {
     if (items.length === 0) return;
     window.clearTimeout(debounceTimer.current);
+    pendingNameEditRef.current = false;
     analyzeController.current?.abort();
     const controller = new AbortController();
     analyzeController.current = controller;
@@ -176,11 +187,11 @@ export default function DatabaseTab() {
         },
         { signal: controller.signal },
       );
-      if (seq !== analyzeSeq.current) return;
-      dispatch({ type: 'analyzeSucceeded', result, now: Date.now() });
+      if (seq !== analyzeSeq.current || stateRef.current.fileRevision !== fileRevision) return;
+      dispatch({ type: 'analyzeSucceeded', result, fileRevision, now: Date.now() });
     } catch (error) {
       if (controller.signal.aborted || (isAppError(error) && error.kind === 'aborted')) return;
-      if (seq !== analyzeSeq.current) return;
+      if (seq !== analyzeSeq.current || stateRef.current.fileRevision !== fileRevision) return;
       dispatch({ type: 'analyzeFailed', error: toAppError(error), now: Date.now() });
     }
   };
@@ -190,10 +201,12 @@ export default function DatabaseTab() {
     settings: DatabaseSettings,
   ) => {
     const cur = stateRef.current;
-    if (!cur.analysis) return;
-    if (hasInvalidTargetColumnNames(overrides)) return;
+    if (!cur.analysis || isAnalysisStale(cur)) return;
+    if (hasInvalidTargetColumnNames(overrides, cur.analysis)) return;
 
+    const startFileRev = cur.fileRevision;
     window.clearTimeout(debounceTimer.current);
+    pendingNameEditRef.current = false;
     analyzeController.current?.abort();
     const controller = new AbortController();
     analyzeController.current = controller;
@@ -214,16 +227,28 @@ export default function DatabaseTab() {
         },
         { signal: controller.signal },
       );
-      if (seq !== analyzeSeq.current) return;
-      dispatch({ type: 'analyzeSucceeded', result, now: Date.now() });
+      if (seq !== analyzeSeq.current || stateRef.current.fileRevision !== startFileRev) return;
+      dispatch({ type: 'analyzeSucceeded', result, fileRevision: startFileRev, now: Date.now() });
     } catch (error) {
       if (controller.signal.aborted || (isAppError(error) && error.kind === 'aborted')) return;
-      if (isAppError(error) && error.kind === 'expired' && cur.files.length > 0) {
-        // Server restarted or evicted LRU session: transparently re-upload in-memory files once.
-        void runUploadAnalyze(cur.files, settings, overrides, 'revalidate', cur.analysis);
+      const latest = stateRef.current;
+      if (
+        isAppError(error) &&
+        error.kind === 'expired' &&
+        latest.files.length > 0 &&
+        latest.fileRevision === startFileRev
+      ) {
+        void runUploadAnalyze(
+          latest.files,
+          latest.settings,
+          latest.overrides,
+          'revalidate',
+          startFileRev,
+          latest.analysis,
+        );
         return;
       }
-      if (seq !== analyzeSeq.current) return;
+      if (seq !== analyzeSeq.current || latest.fileRevision !== startFileRev) return;
       dispatch({ type: 'analyzeFailed', error: toAppError(error), now: Date.now() });
     }
   };
@@ -239,7 +264,7 @@ export default function DatabaseTab() {
   };
 
   const addFiles = (incoming: File[], focus?: FocusTarget) => {
-    if (incoming.length === 0) return;
+    if (incoming.length === 0 || stateRef.current.savingDb) return;
 
     for (const file of incoming) {
       const fileError = checkDatabaseFile(file);
@@ -270,15 +295,26 @@ export default function DatabaseTab() {
     }
 
     if (focus && !stateRef.current.analysis) pendingFocus.current = focus;
+    const nextFileRevision = stateRef.current.fileRevision + 1;
     dispatch({ type: 'mergeFiles', items: newItems });
     if (activeTab === 'saved') setActiveTab('schema');
-    void runUploadAnalyze(combined, stateRef.current.settings, stateRef.current.overrides, 'initial');
+    void runUploadAnalyze(
+      combined,
+      stateRef.current.settings,
+      stateRef.current.overrides,
+      'initial',
+      nextFileRevision,
+    );
   };
 
   const removeFile = (id: string) => {
+    if (stateRef.current.savingDb) return;
+    const removed = stateRef.current.files.find((f) => f.id === id);
     const remaining = stateRef.current.files.filter((f) => f.id !== id);
+    const nextFileRevision = stateRef.current.fileRevision + 1;
     if (remaining.length === 0) {
       window.clearTimeout(debounceTimer.current);
+      pendingNameEditRef.current = false;
       analyzeController.current?.abort();
       saveController.current?.abort();
       pendingFocus.current = 'start';
@@ -286,70 +322,120 @@ export default function DatabaseTab() {
       dispatch({ type: 'removeFile', id });
       return;
     }
+
+    // Prune drafts tied to tables owned by the removed file so they never leak to remaining tables.
+    let nextOverrides = stateRef.current.overrides;
+    if (removed && stateRef.current.analysis) {
+      const removedTables = new Set<string>();
+      for (const t of stateRef.current.analysis.tables) {
+        if (
+          t.source.sourcePath === removed.name ||
+          t.source.displayName === removed.name ||
+          t.source.displayName.startsWith(`${removed.name} `)
+        ) {
+          removedTables.add(t.source.tableName);
+        }
+      }
+      if (removedTables.size > 0) {
+        nextOverrides = Object.fromEntries(
+          Object.entries(nextOverrides).filter(([key]) => !removedTables.has(key.split('\0')[0] ?? '')),
+        );
+      }
+    }
+
     dispatch({ type: 'removeFile', id });
+    if (activeTab === 'saved') setActiveTab('schema');
     void runUploadAnalyze(
       remaining,
       stateRef.current.settings,
-      stateRef.current.overrides,
+      nextOverrides,
       'revalidate',
+      nextFileRevision,
     );
   };
 
   const handleSettingsChange = (patch: Partial<DatabaseSettings>) => {
-    const nextSettings = { ...stateRef.current.settings, ...patch };
+    const cur = stateRef.current;
+    const nextSettings = { ...cur.settings, ...patch };
     dispatch({ type: 'setSettings', patch });
+
     const affectsAnalysis =
       patch.purpose !== undefined ||
       patch.decomposeStrings !== undefined ||
       patch.orphanPolicy !== undefined ||
       patch.includeAuditColumns !== undefined ||
       patch.includeManagementTables !== undefined;
-    if (affectsAnalysis && stateRef.current.analysis) {
-      void runSessionRevalidate(stateRef.current.overrides, nextSettings);
+    if (!affectsAnalysis || cur.files.length === 0) return;
+
+    if (cur.phase === 'analyzing' || isAnalysisStale(cur)) {
+      // An initial/replacement upload analysis is still running or failed: re-upload with new settings.
+      void runUploadAnalyze(
+        cur.files,
+        nextSettings,
+        cur.overrides,
+        cur.analysis ? 'revalidate' : 'initial',
+        cur.fileRevision,
+        cur.analysis,
+      );
+    } else if (cur.analysis) {
+      void runSessionRevalidate(cur.overrides, nextSettings);
     }
   };
 
   const handleUpdateColumnName = (table: string, sourceColumn: string, targetColumn: string) => {
-    const nextOverrides = setOverrideDraft(stateRef.current.overrides, table, sourceColumn, {
+    const cur = stateRef.current;
+    if (cur.savingDb) return;
+    pendingNameEditRef.current = true;
+    const nextOverrides = setOverrideDraft(cur.overrides, table, sourceColumn, {
       targetColumn,
     });
     dispatch({ type: 'setOverrides', overrides: nextOverrides });
-    if (!hasInvalidTargetColumnNames(nextOverrides)) {
-      scheduleRevalidate(nextOverrides, stateRef.current.settings);
+    if (!hasInvalidTargetColumnNames(nextOverrides, cur.analysis)) {
+      scheduleRevalidate(nextOverrides, cur.settings);
     }
   };
 
   const handleCommitColumnName = () => {
-    if (!stateRef.current.analysis) return;
-    if (!hasInvalidTargetColumnNames(stateRef.current.overrides)) {
+    const cur = stateRef.current;
+    if (cur.savingDb || !cur.analysis || !pendingNameEditRef.current) return;
+    if (!hasInvalidTargetColumnNames(cur.overrides, cur.analysis)) {
       window.clearTimeout(debounceTimer.current);
-      void runSessionRevalidate(stateRef.current.overrides, stateRef.current.settings);
+      void runSessionRevalidate(cur.overrides, cur.settings);
     }
   };
 
   const handleToggleUnique = (table: string, sourceColumn: string, unique: boolean) => {
-    const nextOverrides = setOverrideDraft(stateRef.current.overrides, table, sourceColumn, {
+    const cur = stateRef.current;
+    if (cur.savingDb) return;
+    const nextOverrides = setOverrideDraft(cur.overrides, table, sourceColumn, {
       unique,
     });
     dispatch({ type: 'setOverrides', overrides: nextOverrides });
-    void runSessionRevalidate(nextOverrides, stateRef.current.settings);
+    void runSessionRevalidate(nextOverrides, cur.settings);
   };
 
   const handleChangeMasking = (table: string, sourceColumn: string, masking: MaskingPolicy) => {
-    const nextOverrides = setOverrideDraft(stateRef.current.overrides, table, sourceColumn, {
+    const cur = stateRef.current;
+    if (cur.savingDb) return;
+    const nextOverrides = setOverrideDraft(cur.overrides, table, sourceColumn, {
       masking,
     });
     dispatch({ type: 'setOverrides', overrides: nextOverrides });
-    void runSessionRevalidate(nextOverrides, stateRef.current.settings);
+    void runSessionRevalidate(nextOverrides, cur.settings);
   };
 
   const handleResetOverrides = () => {
+    const cur = stateRef.current;
+    if (cur.savingDb) return;
+    pendingNameEditRef.current = false;
     dispatch({ type: 'resetOverrides' });
-    void runSessionRevalidate({}, stateRef.current.settings);
+    void runSessionRevalidate({}, cur.settings);
   };
 
   const downloadOutcomeFile = async (outcome: LoadDbResult) => {
     if (!outcome.downloadToken) return;
+    const startFileRev = stateRef.current.fileRevision;
+    const startEditRev = stateRef.current.editRevision;
     redownloadController.current?.abort();
     const controller = new AbortController();
     redownloadController.current = controller;
@@ -360,9 +446,11 @@ export default function DatabaseTab() {
       controller.signal,
     );
     setRedownloadingDb(false);
+    const latest = stateRef.current;
+    if (latest.fileRevision !== startFileRev || latest.editRevision !== startEditRev) return;
     if (dl.type === 'ok') {
       saveBlobAsFile(dl.blob, dl.fileName);
-      dispatch({ type: 'markExported' });
+      dispatch({ type: 'markExported', fileRevision: startFileRev, editRevision: startEditRev });
       pushFeedback(exportCopy.savedDb(dl.fileName), true);
     } else if (dl.type === 'missing') {
       pushFeedback(exportCopy.dbDownloadMissing, false);
@@ -374,10 +462,13 @@ export default function DatabaseTab() {
   const executeSaveDb = async (
     overridesToUse: Readonly<Record<string, ColumnOverrideDraft>>,
     shouldReanalyzeAfter: boolean,
+    expectedEditRevision: number = stateRef.current.editRevision,
   ) => {
     const cur = stateRef.current;
-    if (!cur.analysis || cur.savingDb) return;
+    if (!cur.analysis || isAnalysisStale(cur) || cur.savingDb) return;
+    if (hasInvalidTargetColumnNames(overridesToUse, cur.analysis)) return;
 
+    const startFileRev = cur.fileRevision;
     window.clearTimeout(debounceTimer.current);
     saveController.current?.abort();
     const controller = new AbortController();
@@ -399,7 +490,22 @@ export default function DatabaseTab() {
         },
         { signal: controller.signal },
       );
-      dispatch({ type: 'saveDbSucceeded', outcome, now: Date.now() });
+
+      const afterLoad = stateRef.current;
+      if (
+        afterLoad.fileRevision !== startFileRev ||
+        afterLoad.editRevision !== expectedEditRevision
+      ) {
+        return;
+      }
+
+      dispatch({
+        type: 'saveDbSucceeded',
+        outcome,
+        fileRevision: startFileRev,
+        editRevision: expectedEditRevision,
+        now: Date.now(),
+      });
       setActiveTab('saved');
 
       if (outcome.loadResult.status !== 'failed' && outcome.downloadToken) {
@@ -408,8 +514,20 @@ export default function DatabaseTab() {
           outcome.downloadFilename,
           controller.signal,
         );
+        const afterDl = stateRef.current;
+        if (
+          afterDl.fileRevision !== startFileRev ||
+          afterDl.editRevision !== expectedEditRevision
+        ) {
+          return;
+        }
         if (dl.type === 'ok') {
           saveBlobAsFile(dl.blob, dl.fileName);
+          dispatch({
+            type: 'markExported',
+            fileRevision: startFileRev,
+            editRevision: expectedEditRevision,
+          });
           pushFeedback(exportCopy.savedDb(dl.fileName), true);
         } else if (dl.type === 'missing') {
           pushFeedback(exportCopy.dbDownloadMissing, false);
@@ -427,11 +545,18 @@ export default function DatabaseTab() {
       await runSaveWithSession(cur.analysis.sessionId);
     } catch (error) {
       if (controller.signal.aborted || (isAppError(error) && error.kind === 'aborted')) return;
-      if (isAppError(error) && error.kind === 'expired' && cur.files.length > 0) {
-        // Re-create session seamlessly if evicted on server, then retry load-db once.
+      const latest = stateRef.current;
+      if (
+        isAppError(error) &&
+        error.kind === 'expired' &&
+        latest.files.length > 0 &&
+        latest.fileRevision === startFileRev &&
+        latest.editRevision === expectedEditRevision
+      ) {
+        const seq = ++analyzeSeq.current;
         try {
           const encodedFiles = await Promise.all(
-            cur.files.map(async (item) => ({
+            latest.files.map(async (item) => ({
               filename: item.name,
               content_base64: await readFileAsBase64(item.file, { signal: controller.signal }),
             })),
@@ -440,48 +565,73 @@ export default function DatabaseTab() {
             {
               files: encodedFiles,
               options: {
-                purpose: cur.settings.purpose,
-                decompose_strings: cur.settings.decomposeStrings,
+                purpose: latest.settings.purpose,
+                decompose_strings: latest.settings.decomposeStrings,
               },
-              overrides: buildSchemaOverrideSpec(overridesToUse, cur.settings, cur.analysis),
+              overrides: buildSchemaOverrideSpec(overridesToUse, latest.settings, latest.analysis),
             },
             { signal: controller.signal },
           );
-          dispatch({ type: 'analyzeSucceeded', result: refreshed, now: Date.now() });
+          const curAfterRefresh = stateRef.current;
+          if (
+            controller.signal.aborted ||
+            seq !== analyzeSeq.current ||
+            curAfterRefresh.fileRevision !== startFileRev
+          ) {
+            return;
+          }
+          dispatch({
+            type: 'analyzeSucceeded',
+            result: refreshed,
+            fileRevision: startFileRev,
+            now: Date.now(),
+          });
+          if (curAfterRefresh.editRevision !== expectedEditRevision) return;
           await runSaveWithSession(refreshed.sessionId, refreshed);
           return;
         } catch (retryError) {
-          if (controller.signal.aborted) return;
+          if (controller.signal.aborted || (isAppError(retryError) && retryError.kind === 'aborted')) {
+            return;
+          }
           dispatch({ type: 'saveDbFailed', error: toAppError(retryError), now: Date.now() });
           return;
         }
       }
-      dispatch({ type: 'saveDbFailed', error: toAppError(error), now: Date.now() });
+      if (latest.fileRevision === startFileRev && latest.editRevision === expectedEditRevision) {
+        dispatch({ type: 'saveDbFailed', error: toAppError(error), now: Date.now() });
+      }
     }
   };
 
   const handleRequestSaveDb = () => {
-    if (!state.analysis) return;
-    if (hasInvalidTargetColumnNames(state.overrides)) {
+    const cur = stateRef.current;
+    if (!cur.analysis) return;
+    if (hasInvalidTargetColumnNames(cur.overrides, cur.analysis)) {
       pushFeedback(validationCopy.fixIdentifiersFirst, false);
       setActiveTab('schema');
       return;
     }
+    if (!canSaveDatabase(cur)) return;
     if (unmaskedForPrompt.length > 0) {
       setPiiDialogOpen(true);
       return;
     }
-    void executeSaveDb(state.overrides, false);
+    void executeSaveDb(cur.overrides, false, cur.editRevision);
   };
 
   const handleConfirmMaskAndSave = () => {
-    const maskedDrafts = applyMaskToUnmaskedColumns(state.overrides, unmaskedForPrompt);
+    const cur = stateRef.current;
+    if (!cur.analysis || isAnalysisStale(cur)) return;
+    const maskedDrafts = applyMaskToUnmaskedColumns(cur.overrides, unmaskedForPrompt);
+    const nextEditRevision = cur.editRevision + 1;
     dispatch({ type: 'setOverrides', overrides: maskedDrafts });
-    void executeSaveDb(maskedDrafts, true);
+    void executeSaveDb(maskedDrafts, true, nextEditRevision);
   };
 
   const handleConfirmSaveAsIs = () => {
-    void executeSaveDb(state.overrides, false);
+    const cur = stateRef.current;
+    if (!canSaveDatabase(cur)) return;
+    void executeSaveDb(cur.overrides, false, cur.editRevision);
   };
 
   const settingsPanel = (
@@ -540,7 +690,8 @@ export default function DatabaseTab() {
                   state.files,
                   state.settings,
                   state.overrides,
-                  'initial',
+                  state.analysis ? 'revalidate' : 'initial',
+                  state.fileRevision,
                 )
               }
               overrides={state.overrides}
@@ -553,6 +704,7 @@ export default function DatabaseTab() {
               onTabChange={setActiveTab}
               loadOutcome={state.loadOutcome}
               dbEngine={state.settings.dbEngine}
+              savingDb={state.savingDb}
               onRedownloadDb={(outcome) => void downloadOutcomeFile(outcome)}
               redownloadingDb={redownloadingDb}
             />
@@ -573,11 +725,18 @@ export default function DatabaseTab() {
                 analysis={state.analysis}
                 dbEngine={state.settings.dbEngine}
                 unmaskedCount={unmaskedPii.length}
+                canSave={canSave}
+                isStale={stale}
+                isAnalyzing={state.phase === 'analyzing'}
                 savingDb={state.savingDb}
                 bundleExpired={state.bundleExpired}
+                fileRevision={state.fileRevision}
+                editRevision={state.editRevision}
                 dbSaveFeedback={dbFeedback}
                 onSaveDb={handleRequestSaveDb}
-                onZipExported={() => dispatch({ type: 'markExported' })}
+                onZipExported={(fileRev, editRev) =>
+                  dispatch({ type: 'markExported', fileRevision: fileRev, editRevision: editRev })
+                }
                 onBundleMissing={() => dispatch({ type: 'markBundleExpired' })}
                 onReanalyze={() =>
                   void runUploadAnalyze(
@@ -585,6 +744,7 @@ export default function DatabaseTab() {
                     state.settings,
                     state.overrides,
                     'revalidate',
+                    state.fileRevision,
                   )
                 }
               />
