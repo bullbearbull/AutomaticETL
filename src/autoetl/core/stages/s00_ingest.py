@@ -364,26 +364,57 @@ def _csv_input_error(path: Path, line_num: int | None, exc: csv.Error) -> InputE
     )
 
 
+_SAMPLE_END_MARKER = "autoetl-sample-end"
+"""줄 수 한도에서 끊긴 표본 뒤에 붙이는 표식. 구분자 후보와 따옴표가 없다."""
+
+
+def _sample_field_counts(sample: list[str], delimiter: str, *, may_be_cut: bool) -> list[int]:
+    """표본을 한 구분자 후보로 읽어 레코드별 필드 수를 센다(빈 레코드 제외).
+
+    may_be_cut이면 표본이 줄 수 한도에서 끊긴 것이라, 마지막 레코드가 인용된
+    줄바꿈 안에서 잘렸을 수 있다. 표본 뒤에 표식 한 줄을 붙여 읽으면, 온전한
+    레코드 뒤에서는 표식이 제 레코드로 나오고 잘린 레코드는 표식을 삼킨다.
+    잘린 레코드는 세지 않는다(그것 하나뿐이면 남긴다).
+
+    틀린 후보는 인용된 줄바꿈 뒤의 칸까지 한 칸으로 합쳐 csv 필드 한도를 넘길 수
+    있다. 그런 후보는 줄 단위로 다시 센다. 줄 하나도 읽지 못하면 csv.Error를
+    그대로 올린다.
+    """
+    try:
+        lines = [*sample, _SAMPLE_END_MARKER] if may_be_cut else sample
+        rows = [row for row in csv.reader(lines, delimiter=delimiter) if row]
+        if may_be_cut:
+            last = rows.pop()
+            if last != [_SAMPLE_END_MARKER] and not rows:
+                rows.append(last)
+        return [len(row) for row in rows]
+    except csv.Error:
+        return [
+            len(row) for line in sample for row in csv.reader([line], delimiter=delimiter) if row
+        ]
+
+
 def _choose_delimiter(load_path: Path, path: Path) -> str:
     """표본의 필드 수 일관성으로 구분자 후보를 고른다.
 
-    표본은 '줄' 단위로 자르기 때문에 인용 안의 줄바꿈이 끊겨 보인다. 그래서
-    한 번도 2칸 이상을 만들지 못하는 후보(모든 줄이 1칸)는 점수를 깎아,
-    인용 줄바꿈 때문에 일관성이 흔들린 진짜 구분자가 지지 않게 한다.
+    표본은 물리 줄 단위로 제한하되 CSV 레코드 단위로 읽어 인용된 줄바꿈을
+    보존한다. 빈 레코드는 행 수를 셀 때와 마찬가지로 제외한다. 표본이 줄 수
+    한도에서 끊겨 마지막 레코드가 잘렸으면 그 레코드는 세지 않는다.
     """
     with _open_text(load_path) as source:
         sample = list(itertools.islice(source, DELIMITER_SAMPLE_LINES))
     if not sample:
         return DELIMITER_CANDIDATES[0]
+    sample_is_full = len(sample) == DELIMITER_SAMPLE_LINES
     best: tuple[int, float, int, int] | None = None
     chosen = DELIMITER_CANDIDATES[0]
     for priority, delimiter in enumerate(DELIMITER_CANDIDATES):
-        counts: list[int] = []
         try:
-            for line in sample:
-                counts.append(len(next(csv.reader([line], delimiter=delimiter))))
+            counts = _sample_field_counts(sample, delimiter, may_be_cut=sample_is_full)
         except csv.Error as exc:
             raise _csv_input_error(path, None, exc) from exc
+        if not counts:
+            continue
         modal_count, hits = Counter(counts).most_common(1)[0]
         score = (1 if modal_count > 1 else 0, hits / len(counts), modal_count, -priority)
         if best is None or score > best:
