@@ -369,6 +369,24 @@ def test_heuristic_detector_booktabs_rules_merge_into_table() -> None:
     assert "booktabs" in tables[0].reason
 
 
+def test_heuristic_detector_booktabs_merge_stops_on_gap_and_x_mismatch() -> None:
+    w, h = 160, 200
+    # 가로선 사이 간격이 booktabs 허용치를 넘으면 병합을 중단한다.
+    wide_gap = bytearray([255] * (w * h))
+    _draw_gray(wide_gap, w, 20, 100, 140, 101, 10)
+    _draw_gray(wide_gap, w, 20, 130, 140, 131, 10)
+    assert (
+        HeuristicRasterLayoutDetector().detect(_inp(_gray_png(w, h, bytes(wide_gap)), w, h)) == []
+    )
+
+    # 후속 행의 x 범위가 가로선과 겹치지 않으면 병합을 중단한다.
+    mismatch = bytearray([255] * (w * h))
+    _draw_gray(mismatch, w, 20, 100, 140, 101, 10)
+    _draw_gray(mismatch, w, 0, 104, 10, 107, 10)
+    boxes = HeuristicRasterLayoutDetector().detect(_inp(_gray_png(w, h, bytes(mismatch)), w, h))
+    assert [b.raw_label for b in boxes] == ["text"]
+
+
 def test_heuristic_detector_sparse_block_below_density_and_no_overlap_lines() -> None:
     w, h = 160, 200
     # 희소 잉크 블록: 밀도 < 1.5%로 탈락(중앙값 폴백도 함께 통과).
@@ -414,10 +432,14 @@ def test_build_downsampled_masks_gray_alpha_and_subsampling() -> None:
     # step >= 4일 때 2단계 서브샘플링 경로.
     gray = bytearray([255] * (160 * 200))
     gray[199 * 160 + 159] = 0
+    # 같은 셀의 앞선 샘플 행에서 이미 잉크가 발견되면 이후 행은 건너뛴다.
+    gray[0] = 0
+    gray[2 * 160] = 0
     decoded_g = DecodedImage(width=160, height=200, channels=1, pixels=bytes(gray))
     ink2, _color2, gw2, gh2, step2 = _build_downsampled_masks(decoded_g, max_dim=40)
     assert step2 == 5 and (gw2, gh2) == (32, 40)
     assert ink2[39][31] == 1
+    assert ink2[0][0] == 1
 
 
 def test_split_vertical_columns_gutter_cases() -> None:
@@ -495,6 +517,22 @@ def test_load_companion_label_list_txt_json_errors_and_yml_break(tmp_path: Path)
     (tmp_path / "inference.yml").unlink()
     (tmp_path / "config.json").unlink()
     (tmp_path / "labels.txt").write_text("\n\n", encoding="utf-8")
+    assert _load_companion_label_list(model) is None
+
+
+def test_load_companion_label_list_read_errors_fall_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = tmp_path / "m.onnx"
+    model.write_bytes(b"fake")
+    (tmp_path / "config.json").write_text('{"label_list": ["a"]}', encoding="utf-8")
+    (tmp_path / "inference.yml").write_text("label_list:\n  - b\n", encoding="utf-8")
+    (tmp_path / "labels.txt").write_text("c\n", encoding="utf-8")
+
+    def unreadable(self: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
     assert _load_companion_label_list(model) is None
 
 
@@ -666,7 +704,7 @@ def test_onnx_parse_outputs_shapes_orders_and_degenerate_rows(tmp_path: Path) ->
 
     # [1, N, 6] 래핑 + 별도 order 텐서 + 짧은 행 스킵.
     wrapped = [
-        [[0, 0.9, 100.0, 100.0, 500.0, 200.0], [1, 0.8, 100.0, 300.0, 500.0, 600.0], [1, 2]],
+        [[[0, 0.9, 100.0, 100.0, 500.0, 200.0], [1, 0.8, 100.0, 300.0, 500.0, 600.0], [1, 2]]],
         [],
         [[1, 0, 0]],
     ]
@@ -691,7 +729,7 @@ def test_onnx_parse_outputs_shapes_orders_and_degenerate_rows(tmp_path: Path) ->
 
     # 형태 B: (boxes, scores, labels) + 각 텐서의 [1, N] 배치 래핑 해제.
     batch_wrapped = [
-        [[100.0, 100.0, 500.0, 200.0], [100.0, 300.0, 500.0, 600.0]],
+        [[[100.0, 100.0, 500.0, 200.0], [100.0, 300.0, 500.0, 600.0]]],
         [[0.9, 0.8]],
         [[0, 1]],
     ]
