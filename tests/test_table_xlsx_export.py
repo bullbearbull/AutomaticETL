@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import base64
+import decimal
 import io
 import json
 import re
@@ -190,6 +191,31 @@ def test_xlsx_keeps_number_like_text_that_would_lose_digits(tmp_path: Path) -> N
         ("text", "1-2", "General"),
         ("text", "2024-01-05", "General"),
     ]
+
+
+def test_xlsx_numbers_stay_inside_excel_format_and_value_limits(tmp_path: Path) -> None:
+    """소수 자리가 30개를 넘으면 글자로 두고, 부르는 쪽 Decimal 정밀도에 값이 흔들리지 않는다."""
+    out = tmp_path / TABLES_XLSX_NAME
+    tiny_ok = "0." + "0" * 29 + "1"
+    tiny_too_long = "0." + "0" * 30 + "1"
+    underflow = "0." + "0" * 323 + "1"
+    values = [tiny_ok, tiny_too_long, underflow, "1234567", "123456789012345", "12.5%"]
+
+    with decimal.localcontext() as ctx:
+        ctx.prec = 6
+        export_tables_xlsx([_sample_table(["값"], [[v] for v in values])], out)
+    cells = _read_workbook(out)["p001_t01"]
+
+    got = [(cells[f"A{i}"].kind, cells[f"A{i}"].value) for i in range(2, 8)]
+    assert got == [
+        ("number", tiny_ok),
+        ("text", tiny_too_long),
+        ("text", underflow),
+        ("number", "1234567"),
+        ("number", "123456789012345"),
+        ("number", "0.125"),
+    ]
+    assert cells["A2"].num_fmt == "0." + "0" * 30
 
 
 def test_xlsx_headers_are_always_text(tmp_path: Path) -> None:

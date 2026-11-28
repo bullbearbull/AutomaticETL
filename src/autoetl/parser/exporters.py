@@ -7,7 +7,7 @@ import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Context, Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -455,6 +455,11 @@ def export_table_csv(table: ExtractedTable, out_path: Path) -> None:
 TABLES_XLSX_NAME = "tables.xlsx"
 # 엑셀은 숫자를 15자리까지만 정확히 담는다. 더 긴 값은 글자로 둔다.
 _XLSX_MAX_NUMBER_DIGITS = 15
+# 엑셀의 셀 서식 화면이 받는 소수 자리는 30개까지다. 더 긴 소수는 글자로 둔다.
+# 이 한도 덕분에 숫자 칸의 값은 엑셀이 담는 크기 범위(약 1E-308~1E+308) 안에 든다.
+_XLSX_MAX_DECIMAL_PLACES = 30
+# 부르는 쪽의 Decimal 정밀도 설정에 값이 반올림되지 않도록 변환 전용 컨텍스트를 쓴다.
+_XLSX_NUMBER_CONTEXT = Context(prec=60)
 
 
 def is_bundle_tables_workbook(path: Path) -> bool:
@@ -487,15 +492,17 @@ def _xlsx_number_cell(value: str) -> XlsxNumber | None:
         return None
     if len((int_digits + frac_part).lstrip("0")) > _XLSX_MAX_NUMBER_DIGITS:
         return None
+    if len(frac_part) > _XLSX_MAX_DECIMAL_PLACES:
+        return None
     number = Decimal(f"{'-' if negative else ''}{int_digits or '0'}.{frac_part or '0'}")
     if percent:
-        number = number.scaleb(-2)
+        number = number.scaleb(-2, _XLSX_NUMBER_CONTEXT)
     format_code = "#,##0" if "," in int_part else "0"
     if frac_part:
         format_code += "." + "0" * len(frac_part)
     if percent:
         format_code += "%"
-    plain = "0" if number == 0 else format(number.normalize(), "f")
+    plain = "0" if number == 0 else format(number.normalize(_XLSX_NUMBER_CONTEXT), "f")
     return XlsxNumber(value=plain, format_code=format_code, display=value)
 
 
