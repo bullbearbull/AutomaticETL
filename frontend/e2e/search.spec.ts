@@ -349,6 +349,15 @@ test('real-engine scoring keeps full matches primary, hides 2-gram fragments, sh
   await expect(result.getByText('제3조 지출 증빙 관리').first()).toBeVisible();
   await expect(result.getByText('제5조 사내 동호회 활동비 지원')).toBeHidden();
 
+  // Query 1b (N1): compound query without spaces ("보관기간") still keeps spaced matches primary.
+  await searchInput.fill('보관기간');
+  await result.getByRole('button', { name: resultCopy.searchForm.submitButton }).click();
+  await expect(panel.getByText('"보관기간" 검색 완료')).toBeVisible({ timeout: 20_000 });
+  await expect(result.getByText('제4조 교육 이수 기록의 보관 기간').first()).toBeVisible();
+  await expect(result.getByText('제9조 접속 기록의 보관 기간').first()).toBeVisible();
+  await expect(result.getByText('제3조 지출 증빙 관리').first()).toBeVisible();
+  await expect(result.getByText('제5조 사내 동호회 활동비 지원')).toBeHidden();
+
   // Query 2: "비밀번호 승인" keeps full-word hits primary, folds 2-gram-only "번호", and cleans displayed terms.
   await searchInput.fill('비밀번호 승인');
   await result.getByRole('button', { name: resultCopy.searchForm.submitButton }).click();

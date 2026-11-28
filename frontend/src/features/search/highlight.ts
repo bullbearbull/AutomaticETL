@@ -255,7 +255,12 @@ export function analyzeHitMatch(
 ): HitMatchInfo {
   const queryWords = extractQueryWords(query);
   const haystack = `${hit.title} ${hit.sectionPath.join(' ')} ${hit.fullText}`.toLowerCase();
-  const matchedWordCount = queryWords.filter((w) => haystack.includes(w)).length;
+  const compactHaystack = [hit.title, ...hit.sectionPath, hit.fullText]
+    .map((part) => part.toLowerCase().replace(/\s+/g, ''))
+    .join('\0');
+  const matchedWordCount = queryWords.filter(
+    (w) => haystack.includes(w) || compactHaystack.includes(w),
+  ).length;
   const displayTerms = filterDisplayMatchedTerms(query, hit.matchedTerms);
 
   const isSubFragment = (term: string): boolean => {

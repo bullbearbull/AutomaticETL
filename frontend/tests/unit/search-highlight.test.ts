@@ -178,6 +178,100 @@ test('partitionHitsByRelevance handles real-engine score distributions and filte
   );
 });
 
+test('analyzeHitMatch and partitionHitsByRelevance handle compound queries without merging separate words or fields', () => {
+  const compoundHits = [
+    {
+      id: 'top',
+      title: '제4조 보관 기간',
+      sectionPath: ['제4조 보관 기간'],
+      fullText: '보관 기간은 5년이다.',
+      matchedTerms: ['보관', '기간'],
+      rerankScore: null,
+      finalScore: 0.568,
+    },
+    {
+      id: 'spaced-body',
+      title: '제3조 지출 증빙',
+      sectionPath: ['제3조 지출 증빙'],
+      fullText: '영수증 보관 기간은 3년으로 정한다.',
+      matchedTerms: ['보관', '기간'],
+      rerankScore: null,
+      finalScore: 0.377,
+    },
+    {
+      id: 'partial-only',
+      title: '제5조 영수증 증빙',
+      sectionPath: ['제5조 영수증 증빙'],
+      fullText: '증빙을 잠시 보관한다.',
+      matchedTerms: ['보관'],
+      rerankScore: null,
+      finalScore: 0.19,
+    },
+  ];
+  const compoundMatch = analyzeHitMatch(compoundHits[1]!, '보관기간');
+  assert.equal(compoundMatch.kind, 'all_words');
+  assert.equal(compoundMatch.matchedWordCount, 1);
+
+  const partitionedCompound = partitionHitsByRelevance(compoundHits, '보관기간');
+  assert.deepEqual(
+    partitionedCompound.primary.map((h) => h.id),
+    ['top', 'spaced-body'],
+  );
+  assert.deepEqual(
+    partitionedCompound.lowRelevance.map((h) => h.id),
+    ['partial-only'],
+  );
+
+  // Separated words like "비밀 문서 … 번호" still classify as fragment, not compound "비밀번호".
+  const separatedHit = {
+    id: 'sep',
+    title: '문서 관리',
+    sectionPath: ['문서 관리'],
+    fullText: '비밀 문서는 별도로 분류해 관리 번호를 붙인다.',
+    matchedTerms: ['비밀', '번호'],
+    rerankScore: null,
+    finalScore: 0.35,
+  };
+  assert.equal(analyzeHitMatch(separatedHit, '비밀번호').kind, 'fragment');
+
+  // Words separated by title/fullText boundary must never glue together either.
+  const crossFieldHit = {
+    id: 'cross',
+    title: '사내 비밀',
+    sectionPath: ['사내 비밀'],
+    fullText: '번호 안내 목록이다.',
+    matchedTerms: ['비밀', '번호'],
+    rerankScore: null,
+    finalScore: 0.35,
+  };
+  assert.equal(analyzeHitMatch(crossFieldHit, '비밀번호').kind, 'fragment');
+
+  const partitionedSep = partitionHitsByRelevance(
+    [
+      {
+        id: 'exact-pw',
+        title: '비밀번호 관리',
+        sectionPath: ['비밀번호 관리'],
+        fullText: '비밀번호는 주기적으로 바꾼다.',
+        matchedTerms: ['비밀번호'],
+        rerankScore: null,
+        finalScore: 0.85,
+      },
+      separatedHit,
+      crossFieldHit,
+    ],
+    '비밀번호',
+  );
+  assert.deepEqual(
+    partitionedSep.primary.map((h) => h.id),
+    ['exact-pw'],
+  );
+  assert.deepEqual(
+    partitionedSep.lowRelevance.map((h) => h.id),
+    ['sep', 'cross'],
+  );
+});
+
 test('formatCitationCopyText includes document name, page location, section title, and passage', () => {
   assert.equal(
     formatCitationCopyText({
