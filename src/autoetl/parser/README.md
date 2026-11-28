@@ -27,9 +27,14 @@
   - `OnnxDocLayoutDetector` — 선택 의존성 `onnxruntime`+`numpy` 기반 Apache-2.0 `PP-DocLayoutV2`/`V3`·`PP-DocLayout_plus-L`·`DocLayNet` ONNX 추론
   - `HttpLayoutDetector` — 로컬/사내 `POST /v1/layout/detect` 서비스 연동(`validate_vision_endpoint` TrustZone 보안 경계 적용)
 - `exporters.py` — 통합 Markdown(`document.md`), RAG 청크(`chunks.jsonl`), 구조·전략 리포트(`routing_report.md`/`.json`),
-  표 CSV/JSON(`tables/`), 통합 IR JSON(`parsed.json`) 내보내기.
+  표 CSV/JSON(`tables/`), 표 엑셀 파일(`tables.xlsx`), 통합 IR JSON(`parsed.json`) 내보내기.
   표 CSV는 `=`, `+`, `-`, `@`, 탭, CR로 시작하는 칸 앞에 `'`를 붙여 엑셀 같은 스프레드시트에서 수식으로 실행되지 않게 한다
   (`-1,234`·`+5%` 같은 숫자와 `-` 하나는 그대로). 표 JSON·`parsed.json`·Markdown에는 원래 값이 그대로 남는다.
+  `tables.xlsx`는 같은 표를 표마다 시트 하나로 모은 파일이다. 칸마다 글자·숫자 형식을 적으므로 수식처럼 보이는 칸도
+  `'` 없이 글자 칸으로 남고, CSV에서 숫자로 두는 값(`-1,234`·`5%`)은 숫자 칸이 된다. 다만 `00123`처럼 0으로 시작하거나
+  15자리를 넘는 값은 글자로 둔다. 엑셀 시트 한도를 넘는 표는 CSV를 보라는 안내 시트로 대신한다.
+  폴더를 훑는 `autoetl parse <폴더>`와 `autoetl analyze <폴더>`는 번들 속 `tables.xlsx`를 입력으로 다시 읽지 않는다.
+- `xlsx_writer.py` — 표준 라이브러리만 쓰는 `.xlsx` 라이터(`write_xlsx_workbook`). 수식 칸은 쓰지 않는다.
 - `vision.py` — 무의존성 OCR/VLM 어댑터 구현체:
   - `TesseractOcrAdapter` — 로컬 `tesseract` 바이너리(stdin→stdout TSV, 임시 파일 0건)
   - `OpenAICompatibleVlmAdapter` — Ollama(`/v1`)·llama-server·vLLM·LM Studio·OpenAI 호환 Vision API
@@ -79,7 +84,7 @@ uv run autoetl parse notice.hwp --plan-only
 uv run autoetl parse legacy.doc --plan-only
 uv run autoetl parse legacy.ppt --plan-only
 
-# 2. 단일 문서 전체 파싱 후 번들(parsed.json, document.md, chunks.jsonl, routing_report.*, tables/, crops/) 저장
+# 2. 단일 문서 전체 파싱 후 번들(parsed.json, document.md, chunks.jsonl, routing_report.*, tables/, tables.xlsx, crops/) 저장
 uv run autoetl parse workbook.xlsx --include-comments --out ./parsed_xlsx
 uv run autoetl parse notice.hwp --include-comments --out ./parsed_hwp
 uv run autoetl parse proposal.hwpx --include-comments --out ./parsed_hwpx

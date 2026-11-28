@@ -229,7 +229,7 @@ export const exportCopy = {
   contents: (parts: readonly string[]) => `ZIP 안: ${parts.join(' · ')}`,
   parts: {
     body: '본문',
-    tables: '표(CSV)',
+    tables: '표(CSV·엑셀)',
     images: '그림',
     chunks: 'AI용 문단',
     report: '처리 기록',

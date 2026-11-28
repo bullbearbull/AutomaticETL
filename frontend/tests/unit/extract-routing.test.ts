@@ -103,12 +103,12 @@ test('the ZIP line lists only what the ZIP holds', () => {
   const result = normalizeParseResponse(sampleRaw());
   assert.deepEqual(zipContents(result, { extractCrops: true, includeChunks: true }), [
     '본문',
-    '표(CSV)',
+    '표(CSV·엑셀)',
     '그림',
     'AI용 문단',
     '처리 기록',
   ]);
   const plain = { ...result, tables: [], visuals: [] };
   assert.deepEqual(zipContents(plain, { extractCrops: true, includeChunks: false }), ['본문', '처리 기록']);
-  assert.deepEqual(zipContents(result, { extractCrops: false, includeChunks: false }), ['본문', '표(CSV)', '처리 기록']);
+  assert.deepEqual(zipContents(result, { extractCrops: false, includeChunks: false }), ['본문', '표(CSV·엑셀)', '처리 기록']);
 });
