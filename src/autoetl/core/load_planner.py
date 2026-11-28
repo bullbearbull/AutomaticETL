@@ -262,6 +262,9 @@ class _BuiltCandidate:
     materialized_slot_count: int
     # target_table -> {source_column: MaskingPolicy}
     column_masking: dict[str, dict[str, MaskingPolicy]]
+    skipped_key_masking: dict[str, dict[str, MaskingPolicy]]
+    # target_table -> {source_column}: 엔진을 몰라 미적용으로 본 날짜·시각 키(SQLite에서는 가려짐)
+    sqlite_only_key_masking: dict[str, set[str]]
     # target_table -> [target_column, ...] explicitly confirmed UNIQUE by user
     confirmed_unique_cols: dict[str, list[str]]
 
@@ -314,6 +317,7 @@ def _build_candidate(
     omit_derivations: bool,
     analytics_mode: bool,
     overrides: SchemaOverrideSpec | None = None,
+    engine: str | None = None,
 ) -> _BuiltCandidate:
     """단일 후보 SchemaCandidate와 변환/원본 매핑 메타데이터를 결정론적으로 조립한다."""
     pk_map = relations.primary_keys
@@ -387,6 +391,8 @@ def _build_candidate(
     omitted_derivations: dict[str, list[str]] = {}
     partition_notes: dict[str, list[str]] = {}
     column_masking: dict[str, dict[str, MaskingPolicy]] = {}
+    skipped_key_masking: dict[str, dict[str, MaskingPolicy]] = {}
+    sqlite_only_key_masking: dict[str, set[str]] = {}
     confirmed_unique_cols: dict[str, list[str]] = {}
     materialized_slot_count = 0
 
@@ -469,11 +475,24 @@ def _build_candidate(
                 fk_spec = f"{p_table}({p_col_sql})"
 
             if ov is not None and ov.masking is not MaskingPolicy.NONE:
-                column_masking.setdefault(t_name, {})[col_name] = ov.masking
                 if not is_pk and direct_fk is None:
                     # 마스킹(예: 1988-**-**)·해시(h_...) 값은 문자열 타입으로 안전하게 저장
                     phys = PhysicalType.STRING
                     transform = f"pii_{ov.masking.value}"
+                # SQLite에 적재하는 날짜·시각은 기존 변환에서 문자열로 가려진다.
+                sqlite_masks_it = phys in {
+                    PhysicalType.DATE,
+                    PhysicalType.TIME,
+                    PhysicalType.TIMESTAMP,
+                    PhysicalType.TIMESTAMPTZ,
+                }
+                if phys is PhysicalType.STRING or (engine == "sqlite" and sqlite_masks_it):
+                    column_masking.setdefault(t_name, {})[col_name] = ov.masking
+                else:
+                    skipped_key_masking.setdefault(t_name, {})[col_name] = ov.masking
+                    if engine is None and sqlite_masks_it:
+                        # 엔진을 모르는 분석 단계: 적재 엔진에 따라 결과가 달라진다.
+                        sqlite_only_key_masking.setdefault(t_name, set()).add(col_name)
 
             if ov is not None and ov.unique is True:
                 uq_list = confirmed_unique_cols.setdefault(t_name, [])
@@ -491,8 +510,9 @@ def _build_candidate(
                 desc_parts.append(f"원본: {col_name}")
             if cls.string_pattern is not None:
                 desc_parts.append(f"패턴: {cls.string_pattern.template}")
-            if ov is not None and ov.masking is not MaskingPolicy.NONE:
-                desc_parts.append(f"개인정보보호: {ov.masking.value}")
+            applied_masking = column_masking.get(t_name, {}).get(col_name)
+            if applied_masking is not None:
+                desc_parts.append(f"개인정보보호: {applied_masking.value}")
 
             target_cols.append(
                 TargetColumn(
@@ -644,6 +664,8 @@ def _build_candidate(
         partition_notes=partition_notes,
         materialized_slot_count=materialized_slot_count,
         column_masking=column_masking,
+        skipped_key_masking=skipped_key_masking,
+        sqlite_only_key_masking=sqlite_only_key_masking,
         confirmed_unique_cols=confirmed_unique_cols,
     )
 
@@ -1715,6 +1737,9 @@ def _mermaid_type(phys: PhysicalType, resolved_type: exp.DataType | None = None)
     return mapping.get(phys, "TEXT")
 
 
+_SKIPPED_KEY_MASKING_WARNING = "키 열 가리기 미적용"
+
+
 def plan_multi_table_load(
     bundles: Sequence[TableProfileBundle],
     relations: MultiTableRelationAnalysis,
@@ -1725,6 +1750,27 @@ def plan_multi_table_load(
     overrides: SchemaOverrideSpec | None = None,
 ) -> MultiTableLoadPlan:
     """Milestone E4 통합 실행: PII 탐지 → 후보 합성 → DDL+DuckDB 시험 적재 채점 → 플랜·ERD."""
+    plan, _, _ = _plan_multi_table_load(
+        bundles,
+        relations,
+        purpose=purpose,
+        decompose_strings=decompose_strings,
+        mctx=mctx,
+        overrides=overrides,
+    )
+    return plan
+
+
+def _plan_multi_table_load(
+    bundles: Sequence[TableProfileBundle],
+    relations: MultiTableRelationAnalysis,
+    *,
+    purpose: Purpose,
+    decompose_strings: bool,
+    mctx: MultiTableContext | None,
+    overrides: SchemaOverrideSpec | None,
+    engine: str | None = None,
+) -> tuple[MultiTableLoadPlan, dict[str, dict[str, MaskingPolicy]], list[str]]:
     acyclic_fks, cycle_warnings = _select_acyclic_fks(relations)
     for fk in acyclic_fks:
         if fk.orphan_rows > 0:
@@ -1769,6 +1815,7 @@ def plan_multi_table_load(
         omit_derivations=False,
         analytics_mode=False,
         overrides=overrides,
+        engine=engine,
     )
     built_candidates.append(c1)
 
@@ -1788,6 +1835,7 @@ def plan_multi_table_load(
             omit_derivations=True,
             analytics_mode=False,
             overrides=overrides,
+            engine=engine,
         )
         built_candidates.append(c2)
 
@@ -1806,6 +1854,7 @@ def plan_multi_table_load(
             omit_derivations=False,
             analytics_mode=False,
             overrides=overrides,
+            engine=engine,
         )
         built_candidates.append(c2_raw)
 
@@ -1824,6 +1873,7 @@ def plan_multi_table_load(
         omit_derivations=False,
         analytics_mode=True,
         overrides=overrides,
+        engine=engine,
     )
     built_candidates.append(c3)
 
@@ -1866,7 +1916,7 @@ def plan_multi_table_load(
     )
     erd_mermaid = render_mermaid_erd(best_built.candidate, relations, col_types=best_col_types)
 
-    return MultiTableLoadPlan(
+    plan = MultiTableLoadPlan(
         purpose=purpose,
         selected_candidate_id=best_sc.candidate_id,
         candidates=[item[1].candidate for item in scored],
@@ -1879,6 +1929,25 @@ def plan_multi_table_load(
         erd_mermaid=erd_mermaid,
         cycle_warnings=cycle_warnings,
     )
+    skipped = best_built.skipped_key_masking
+    sqlite_only = best_built.sqlite_only_key_masking
+    masking_warnings = [
+        f"{_SKIPPED_KEY_MASKING_WARNING} {table!r}.{column!r}. "
+        + (
+            "키의 저장 타입이 날짜·시각 형식으로 유지되어, SQLite에 적재할 때만 가려지고 "
+            "그 밖의 엔진에서는 원래 값이 저장됩니다."
+            if column in sqlite_only.get(table, set())
+            else "키의 저장 타입이 문자열 외 형식으로 유지되어 원래 값이 저장됩니다."
+        )
+        for table, columns in skipped.items()
+        for column in columns
+    ]
+    # 분석 번들은 관계 메모에서 경고를 수집한다. 같은 관계를 다시 계획하면 갱신한다.
+    relations.notes[:] = [
+        *(note for note in relations.notes if not note.startswith(_SKIPPED_KEY_MASKING_WARNING)),
+        *masking_warnings,
+    ]
+    return plan, skipped, masking_warnings
 
 
 def render_analysis_report(bundle: MultiTableAnalysisBundle) -> str:
