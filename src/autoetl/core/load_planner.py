@@ -263,6 +263,8 @@ class _BuiltCandidate:
     # target_table -> {source_column: MaskingPolicy}
     column_masking: dict[str, dict[str, MaskingPolicy]]
     skipped_key_masking: dict[str, dict[str, MaskingPolicy]]
+    # target_table -> {source_column}: 엔진을 몰라 미적용으로 본 날짜·시각 키(SQLite에서는 가려짐)
+    sqlite_only_key_masking: dict[str, set[str]]
     # target_table -> [target_column, ...] explicitly confirmed UNIQUE by user
     confirmed_unique_cols: dict[str, list[str]]
 
@@ -390,6 +392,7 @@ def _build_candidate(
     partition_notes: dict[str, list[str]] = {}
     column_masking: dict[str, dict[str, MaskingPolicy]] = {}
     skipped_key_masking: dict[str, dict[str, MaskingPolicy]] = {}
+    sqlite_only_key_masking: dict[str, set[str]] = {}
     confirmed_unique_cols: dict[str, list[str]] = {}
     materialized_slot_count = 0
 
@@ -477,19 +480,19 @@ def _build_candidate(
                     phys = PhysicalType.STRING
                     transform = f"pii_{ov.masking.value}"
                 # SQLite에 적재하는 날짜·시각은 기존 변환에서 문자열로 가려진다.
-                if phys is PhysicalType.STRING or (
-                    engine == "sqlite"
-                    and phys
-                    in {
-                        PhysicalType.DATE,
-                        PhysicalType.TIME,
-                        PhysicalType.TIMESTAMP,
-                        PhysicalType.TIMESTAMPTZ,
-                    }
-                ):
+                sqlite_masks_it = phys in {
+                    PhysicalType.DATE,
+                    PhysicalType.TIME,
+                    PhysicalType.TIMESTAMP,
+                    PhysicalType.TIMESTAMPTZ,
+                }
+                if phys is PhysicalType.STRING or (engine == "sqlite" and sqlite_masks_it):
                     column_masking.setdefault(t_name, {})[col_name] = ov.masking
                 else:
                     skipped_key_masking.setdefault(t_name, {})[col_name] = ov.masking
+                    if engine is None and sqlite_masks_it:
+                        # 엔진을 모르는 분석 단계: 적재 엔진에 따라 결과가 달라진다.
+                        sqlite_only_key_masking.setdefault(t_name, set()).add(col_name)
 
             if ov is not None and ov.unique is True:
                 uq_list = confirmed_unique_cols.setdefault(t_name, [])
@@ -662,6 +665,7 @@ def _build_candidate(
         materialized_slot_count=materialized_slot_count,
         column_masking=column_masking,
         skipped_key_masking=skipped_key_masking,
+        sqlite_only_key_masking=sqlite_only_key_masking,
         confirmed_unique_cols=confirmed_unique_cols,
     )
 
@@ -1926,9 +1930,15 @@ def _plan_multi_table_load(
         cycle_warnings=cycle_warnings,
     )
     skipped = best_built.skipped_key_masking
+    sqlite_only = best_built.sqlite_only_key_masking
     masking_warnings = [
         f"{_SKIPPED_KEY_MASKING_WARNING} {table!r}.{column!r}. "
-        "키의 저장 타입이 문자열 외 형식으로 유지되어 원래 값이 저장됩니다."
+        + (
+            "키의 저장 타입이 날짜·시각 형식으로 유지되어, SQLite에 적재할 때만 가려지고 "
+            "그 밖의 엔진에서는 원래 값이 저장됩니다."
+            if column in sqlite_only.get(table, set())
+            else "키의 저장 타입이 문자열 외 형식으로 유지되어 원래 값이 저장됩니다."
+        )
         for table, columns in skipped.items()
         for column in columns
     ]

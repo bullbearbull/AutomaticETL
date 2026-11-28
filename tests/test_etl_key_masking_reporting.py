@@ -268,3 +268,22 @@ def test_date_key_reports_each_engines_existing_storage_behavior(
         assert rows == [(date.fromisoformat(value),) for value in values]
         _assert_key_warning(bundle.warnings, "dated", "dated_id")
         _assert_key_warning(result.warnings, "dated", "dated_id")
+
+
+def test_analysis_without_engine_says_date_key_masking_depends_on_engine() -> None:
+    values = ("2031-03-01", "2031-03-02", "2031-03-03")
+    source = NamedTableInput("dated", ("dated_id",), tuple((value,) for value in values))
+    overrides = SchemaOverrideSpec(
+        columns=[
+            ColumnOverride(table="dated", source_column="dated_id", masking=MaskingPolicy.HASH)
+        ]
+    )
+
+    bundle = analyze_tables(extra_tables=[source], overrides=overrides)
+
+    (warning,) = [entry for entry in bundle.warnings if "키 열 가리기 미적용" in entry]
+    assert "'dated'.'dated_id'" in warning
+    assert "SQLite에 적재할 때만 가려지고" in warning
+    assert "그 밖의 엔진에서는 원래 값이 저장됩니다" in warning
+    assert bundle.load_plan.table_plans[0].column_masking == {}
+    assert all(value not in warning for value in values)
