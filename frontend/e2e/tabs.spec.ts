@@ -1,5 +1,6 @@
 import type { Page } from '@playwright/test';
 import { appCopy, comingSoonCopy, tabIds, tabLabels, type TabId } from '../src/copy/common.ts';
+import { startCopy as databaseStartCopy } from '../src/features/database/copy.ts';
 import { startCopy } from '../src/features/extract/copy.ts';
 import { openApp } from './support/app.ts';
 import { expect, test } from './support/fixtures.ts';
@@ -22,6 +23,9 @@ async function expectSelected(page: Page, selected: TabId) {
   const startTitle = page.getByRole('heading', { name: startCopy.title });
   if (selected === 'extract') {
     await expect(panel.getByRole('heading', { name: startCopy.title })).toBeVisible();
+  } else if (selected === 'database') {
+    await expect(startTitle).toBeHidden();
+    await expect(panel.getByRole('heading', { name: databaseStartCopy.title })).toBeVisible();
   } else {
     await expect(startTitle).toBeHidden();
     await expect(panel.getByRole('heading', { name: tabLabels[selected] })).toBeVisible();
