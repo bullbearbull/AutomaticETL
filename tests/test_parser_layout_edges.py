@@ -209,7 +209,7 @@ def test_reading_order_empty_single_column_row_tie_and_partial_explicit() -> Non
 def test_reading_order_two_column_with_full_width_middle_band() -> None:
     left1 = _box("left1", ElementKind.PARAGRAPH, (50.0, 100.0, 450.0, 180.0))
     left2 = _box("left2", ElementKind.PARAGRAPH, (50.0, 400.0, 450.0, 480.0))
-    right1 = _box("right1", ElementKind.PARAGRAPH, (550.0, 100.0, 950.0, 180.0))
+    right1 = _box("right1", ElementKind.PARAGRAPH, (550.0, 50.0, 950.0, 130.0))
     right2 = _box("right2", ElementKind.PARAGRAPH, (550.0, 400.0, 950.0, 480.0))
     full = _box("full", ElementKind.TABLE, (50.0, 250.0, 950.0, 330.0))
     ordered = sort_layout_boxes_reading_order(
@@ -489,7 +489,7 @@ def test_onnx_constructor_presets_explicit_labels_and_bad_preset(tmp_path: Path)
     assert det2.labels == ("custom_a", "custom_b")
     with pytest.raises(ParserInputError, match="프리셋"):
         OnnxDocLayoutDetector(model_path=model, label_preset="no-such-preset")
-    # 동반 파일이 없으면 빈 labels.txt도 무시되고 프리셋이 쓰인다.
+    # labels.txt 가 비어 있으면(유효 라벨 0개) 무시하고 프리셋 기본값을 쓴다.
     (tmp_path / "labels.txt").write_text("\n\n", encoding="utf-8")
     det3 = OnnxDocLayoutDetector(model_path=model)
     assert det3.labels == PP_DOCLAYOUT_V2_LABELS
@@ -605,7 +605,7 @@ def test_onnx_parse_outputs_empty_and_form_a_unwrap(tmp_path: Path) -> None:
     det = _parse_det(tmp_path)
     assert det._parse_outputs([], orig_w=600, orig_h=840, target_w=800, target_h=800) == []
     # [1, N, 6] 배치 래핑 해제 + 행 길이 부족/비리스트 행 스킵.
-    outputs = [[[1, 0.9, 50.0, 300.0, 550.0, 500.0], [2, 0.8], "bad-row"]]
+    outputs = [[[[1, 0.9, 50.0, 300.0, 550.0, 500.0], [2, 0.8], "bad-row"]]]
     parsed = det._parse_outputs(outputs, orig_w=600, orig_h=840, target_w=800, target_h=800)
     assert len(parsed) == 1
     assert parsed[0].element_kind == ElementKind.TABLE
@@ -876,13 +876,13 @@ def test_http_detector_swapped_out_of_bounds_and_reading_order(
     # 모든 박스에 명시적 순서가 있으면 위치와 무관하게 존중된다.
     resp2 = {
         "boxes": [
-            {"label": "table", "bbox": [100, 200, 900, 500], "score": 0.9, "reading_order": 2},
-            {"label": "text", "bbox": [10, 10, 100, 100], "score": 0.9, "order": 1},
+            {"label": "table", "bbox": [100, 200, 900, 500], "score": 0.9, "reading_order": 1},
+            {"label": "text", "bbox": [10, 10, 100, 100], "score": 0.9, "order": 2},
         ]
     }
     _patch_open(monkeypatch, response=resp2)
     boxes2 = det.detect(_inp(png, 1000, 1000))
-    assert [b.raw_label for b in boxes2] == ["text", "table"]
+    assert [b.raw_label for b in boxes2] == ["table", "text"]
     assert [b.reading_order for b in boxes2] == [1, 2]
 
 

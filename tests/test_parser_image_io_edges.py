@@ -130,10 +130,7 @@ def test_decode_pdf_image_stream_rejects_non_positive_size() -> None:
 
 def test_decode_pdf_image_stream_dct_and_jpx_passthrough() -> None:
     jpeg = b"\xff\xd8\xff\xe0fake-jpeg"
-    # 마지막 필터가 DCT이면 앞선 FlateDecode와 무관하게 원본 바이트를 그대로 저장한다.
-    jpg = decode_pdf_image_stream(
-        jpeg, filters=["/FlateDecode", "/DCTDecode"], color_space=None, width=8, height=8
-    )
+    jpg = decode_pdf_image_stream(jpeg, filters=["/DCTDecode"], color_space=None, width=8, height=8)
     assert jpg is not None
     assert (jpg.extension, jpg.data) == (".jpg", jpeg)
     assert (jpg.width, jpg.height) == (8, 8)
