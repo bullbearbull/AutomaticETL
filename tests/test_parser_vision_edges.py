@@ -364,6 +364,32 @@ def test_tesseract_non_eng_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert res.metadata["ocr_lang_fallback"] == "true"
 
 
+def test_tesseract_fallback_to_eng_when_requested_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """요청 언어가 미설치이고 eng가 있으면 eng로 폴백한다."""
+    fake = _FakeTesseract(langs=["eng", "osd"], tsv=_tsv([("1", "1", "1", "90", "x")]))
+    monkeypatch.setattr(subprocess, "run", fake)
+    adapter = TesseractOcrAdapter(binary_path=_fake_binary(tmp_path), lang="kor")
+    res = adapter.parse_region(_request())
+    assert res.metadata["ocr_lang_used"] == "eng"
+    assert res.metadata["ocr_lang_fallback"] == "true"
+
+
+def test_tesseract_list_langs_failure_uses_requested_lang(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """설치 언어 조회가 실패하면 요청 언어를 폴백 없이 그대로 사용한다."""
+    tsv = _tsv([("1", "1", "1", "90", "Hello")])
+    fake = _FakeTesseract(langs=[], tsv=tsv, lang_raises=OSError("가짜 조회 실패"))
+    monkeypatch.setattr(subprocess, "run", fake)
+    adapter = TesseractOcrAdapter(binary_path=_fake_binary(tmp_path), lang="kor+eng")
+    res = adapter.parse_region(_request())
+    assert res.succeeded is True
+    assert res.metadata["ocr_lang_used"] == "kor+eng"
+    assert res.metadata["ocr_lang_fallback"] == "false"
+
+
 def test_tesseract_installed_languages_cache_and_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
