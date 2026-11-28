@@ -395,15 +395,17 @@ def test_resolve_blip_embed_id_direct_svg_and_absent() -> None:
 
 def test_iter_unwrapped_children_skips_del_and_unwraps_wrappers() -> None:
     parent = _el(
-        "<w:tr><w:tc><w:p><w:r><w:t>keep</w:t></w:r></w:p></w:tc>"
-        "<w:del><w:tc><w:p/></w:tc></w:del>"
-        "<w:sdt><w:sdtContent><w:tc><w:p/></w:tc></w:sdtContent></w:sdt>"
-        "<w:ins><w:tc><w:p/></w:tc></w:ins>"
-        "<w:customXml><w:tc><w:p/></w:tc></w:customXml>"
-        "<w:moveTo><w:tc><w:p/></w:tc></w:moveTo></w:tr>"
+        "<w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc>"
+        "<w:del><w:tc><w:p><w:r><w:t>X</w:t></w:r></w:p></w:tc></w:del>"
+        "<w:sdt><w:sdtContent><w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc>"
+        "</w:sdtContent></w:sdt>"
+        "<w:ins><w:tc><w:p><w:r><w:t>C</w:t></w:r></w:p></w:tc></w:ins>"
+        "<w:customXml><w:tc><w:p><w:r><w:t>D</w:t></w:r></w:p></w:tc></w:customXml>"
+        "<w:moveTo><w:tc><w:p><w:r><w:t>E</w:t></w:r></w:p></w:tc></w:moveTo></w:tr>"
     )
     tcs = _iter_unwrapped_children(parent, {"tc"})
-    assert len(tcs) == 5
+    # 삭제(del) 셀은 제외되고 moveTo 안 셀은 포함되며, 순서대로 다섯 셀이어야 한다
+    assert [_extract_plain_text_from_container(tc) for tc in tcs] == ["A", "B", "C", "D", "E"]
 
 
 # ---------------------------------------------------------------------------
@@ -738,7 +740,11 @@ def test_drawing_chart_chartex_smartart_and_external_skip(tmp_path: Path) -> Non
     items = _items(pkg)
     charts = [it for it in items if isinstance(it, RawPptxChart)]
     smartart = [it for it in items if isinstance(it, RawPptxSmartArt)]
-    assert len(charts) == 2  # 네이티브 + chartEx, 외부 차트는 제외
+    # 네이티브 + chartEx 파트가 정확히 하나씩 연결되어야 한다(외부 차트는 제외)
+    assert {c.chart_part for c in charts} == {
+        "word/charts/chart1.xml",
+        "word/charts/chartEx1.xml",
+    }
     assert len(smartart) == 1
     assert any("수집" in text for _depth, text in smartart[0].items)
 
@@ -967,7 +973,8 @@ def test_extract_pages_empty_body_yields_one_empty_page(tmp_path: Path) -> None:
 def test_unreferenced_notes_and_comments_attach_to_last_page(tmp_path: Path) -> None:
     pkg = _make_pkg(
         tmp_path,
-        "<w:p><w:r><w:t>본문</w:t></w:r></w:p>",
+        "<w:p><w:r><w:t>첫쪽</w:t></w:r></w:p>"
+        "<w:p><w:pPr><w:pageBreakBefore/></w:pPr><w:r><w:t>끝쪽</w:t></w:r></w:p>",
         doc_rels=(
             '<Relationship Id="rIdFn" '
             'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" '
@@ -996,7 +1003,12 @@ def test_unreferenced_notes_and_comments_attach_to_last_page(tmp_path: Path) -> 
         },
     )
     pages = extract_docx_pages(pkg)
-    last = pages[-1]
+    assert len(pages) == 2
+    first, last = pages[0], pages[-1]
+    # 미참조 각주·미주·주석은 마지막 페이지에만 붙고 첫 페이지에는 없어야 한다
+    assert first.footnotes == []
+    assert first.endnotes == []
+    assert first.comments == []
     assert last.footnotes == [("1", "각주내용")]
     assert last.endnotes == [("2", "미주내용")]
     assert [c.text for c in last.comments] == ["주석내용"]
@@ -1025,10 +1037,14 @@ def test_header_footer_internal_included_external_skipped(tmp_path: Path) -> Non
 
 
 def test_long_document_without_breaks_splits_virtual_pages(tmp_path: Path) -> None:
-    body = "".join(f"<w:p><w:r><w:t>{'가' * 200}</w:t></w:r></w:p>" for _ in range(100))
+    texts = [f"문단 {i:03d} " + "가" * 200 for i in range(100)]
+    body = "".join(f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>" for text in texts)
     pages = extract_docx_pages(_make_pkg(tmp_path, body))
     assert len(pages) >= 2
     assert all(page.items for page in pages)
+    # 가상 분할이 문단을 누락·중복 없이 입력 순서 그대로 보존해야 한다
+    collected = [p.text for page in pages for p in _paras(page.items)]
+    assert collected == texts
 
 
 def test_body_wrappers_ins_and_custom_xml_are_unwrapped(tmp_path: Path) -> None:
@@ -1048,7 +1064,10 @@ def test_continuous_section_updates_column_count(tmp_path: Path) -> None:
         "<w:p><w:r><w:t>본문</w:t></w:r></w:p>"
         f"<w:p><w:pPr><w:sectPr>{sect}</w:sectPr></w:pPr></w:p>"
         "<w:p><w:r><w:t>다음</w:t></w:r></w:p>"
-        f"<w:sectPr>{sect}</w:sectPr>",
+        # 최종 본문 섹션은 1단이라 문단 연속 섹션(3단)이 실제 적용되어야만 3단 페이지가 생긴다
+        '<w:sectPr><w:cols w:num="1"/></w:sectPr>',
     )
     pages = extract_docx_pages(pkg)
-    assert any(page.column_count == 3 for page in pages)
+    assert len(pages) == 2
+    assert pages[0].column_count == 3  # 문단 연속 섹션이 적용된 페이지
+    assert pages[1].column_count == 1  # 최종 본문 섹션 페이지
