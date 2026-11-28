@@ -315,6 +315,28 @@ def test_xlsx_writer_keeps_the_previous_file_when_writing_fails(
     assert [p.name for p in tmp_path.iterdir()] == ["book.xlsx"]
 
 
+def test_xlsx_writer_leaves_an_unrelated_tmp_file_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """출력 파일 옆에 사용자가 둔 `<이름>.tmp` 파일은 성공해도 실패해도 그대로 남는다."""
+    out = tmp_path / "book.xlsx"
+    bystander = tmp_path / "book.xlsx.tmp"
+    bystander.write_bytes(b"not ours")
+
+    write_xlsx_workbook(out, [XlsxSheet("s", [[XlsxText("값")]])])
+    assert bystander.read_bytes() == b"not ours"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["book.xlsx", "book.xlsx.tmp"]
+
+    def _fail(self: object) -> str:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("autoetl.parser.xlsx_writer._SharedStrings.to_xml", _fail)
+    with pytest.raises(OSError, match="disk full"):
+        write_xlsx_workbook(out, [XlsxSheet("s", [[XlsxText("새 값")]])])
+    assert bystander.read_bytes() == b"not ours"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["book.xlsx", "book.xlsx.tmp"]
+
+
 def test_export_tables_xlsx_replaces_oversized_table_with_notice(tmp_path: Path) -> None:
     out = tmp_path / TABLES_XLSX_NAME
     tables = [

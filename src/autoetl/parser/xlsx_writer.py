@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import unicodedata
 import zipfile
 from collections.abc import Sequence
@@ -373,9 +374,13 @@ def write_xlsx_workbook(out_path: Path, sheets: Sequence[XlsxSheet]) -> None:
     )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    # 임시 파일 이름은 호출마다 다르게 하고 새로 만들 때만 연다. 같은 자리에 쓰는 다른
+    # 실행이나 사용자가 둔 `<이름>.tmp` 파일을 건드리지 않기 위해서다.
+    tmp_path = out_path.with_name(f"{out_path.name}.{secrets.token_hex(8)}.tmp")
+    created = False
     try:
-        with zipfile.ZipFile(tmp_path, "w") as zf:
+        with zipfile.ZipFile(tmp_path, "x") as zf:
+            created = True
             zf.writestr(_zip_entry("[Content_Types].xml"), "".join(content_types))
             zf.writestr(_zip_entry("_rels/.rels"), root_rels)
             zf.writestr(_zip_entry("xl/workbook.xml"), "".join(workbook))
@@ -388,7 +393,8 @@ def write_xlsx_workbook(out_path: Path, sheets: Sequence[XlsxSheet]) -> None:
             zf.writestr(_zip_entry("xl/sharedStrings.xml"), strings.to_xml())
         os.replace(tmp_path, out_path)
     except BaseException:
-        tmp_path.unlink(missing_ok=True)
+        if created:
+            tmp_path.unlink(missing_ok=True)
         raise
 
 
