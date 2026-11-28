@@ -29,6 +29,8 @@ from autoetl.core.stages.s00_ingest import deduplicate_source_names
 SAMPLE_LIMIT = 500
 VALUE_MATCH_THRESHOLD = 0.60
 
+# Use Python's whitespace definition to exclude blank cells before applying LIMIT.
+_NON_WHITESPACE_SQL_PATTERN = r"[^[:space:]\p{Z}\x{1C}-\x{1F}\x{85}]"
 _RRN_RE = re.compile(r"^\d{6}-?[1-4]\d{6}$")
 _RRN_MASKED_RE = re.compile(r"^\d{6}-?[1-4]\*{6}$")
 _FRN_RE = re.compile(r"^\d{6}-?[5-8]\d{6}$")
@@ -288,8 +290,9 @@ def _fetch_column_sample(ctx: AnalysisContext, column_id: str) -> list[str]:
     qcol = quote_identifier(column_id)
     rows = ctx.connection.execute(
         f"SELECT {qcol} FROM {RAW_TABLE} "
-        f"WHERE {qcol} IS NOT NULL AND trim(CAST({qcol} AS VARCHAR)) <> '' "
-        f"LIMIT {SAMPLE_LIMIT}"
+        f"WHERE regexp_matches(CAST({qcol} AS VARCHAR), ?) "
+        f"LIMIT {SAMPLE_LIMIT}",
+        [_NON_WHITESPACE_SQL_PATTERN],
     ).fetchall()
     return [str(r[0]).strip() for r in rows if r[0] is not None]
 
