@@ -456,6 +456,11 @@ def _run_parse(args: argparse.Namespace) -> int:
                 if manifest.xlsx_skipped_table_ids:
                     skipped_ids = ", ".join(manifest.xlsx_skipped_table_ids)
                     print(f"  엑셀 시트 한도를 넘어 CSV로만 저장한 표: {skipped_ids}")
+            elif manifest.xlsx_blocked_by_source:
+                print(
+                    "- 추출 표 엑셀 파일: 만들지 않음 "
+                    f"(같은 자리의 입력 파일 {args.file}을 덮어쓰지 않았다)"
+                )
             if manifest.crop_paths:
                 crops_dir = manifest.out_dir / "crops"
                 print(f"- 시각 영역 크롭: {len(manifest.crop_paths)}개 ({crops_dir})")

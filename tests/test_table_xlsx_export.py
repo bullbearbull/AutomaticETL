@@ -29,6 +29,7 @@ from autoetl.parser import (
 )
 from autoetl.parser.exporters import (
     TABLES_XLSX_NAME,
+    export_parse_bundle,
     export_tables_xlsx,
     is_bundle_tables_workbook,
 )
@@ -391,6 +392,41 @@ def test_bundle_without_tables_writes_no_workbook(tmp_path: Path) -> None:
 
     assert manifest.tables_xlsx is None
     assert not stale.exists()
+
+
+def test_export_never_overwrites_or_removes_the_source_workbook(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """입력이 출력 폴더의 `tables.xlsx` 자신이면 그 파일을 그대로 두고 엑셀 내보내기만 건너뛴다."""
+    work = tmp_path / "work"
+    source = work / TABLES_XLSX_NAME
+    # 다시 내보낸 결과와 구별되도록 시트 이름과 칸 형식을 다르게 쓴다.
+    rows = [[XlsxText("구분"), XlsxText("금액")], [XlsxText("총무팀"), XlsxText("1,234")]]
+    write_xlsx_workbook(source, [XlsxSheet("원본", rows)])
+    original = source.read_bytes()
+
+    doc, manifest = parse_and_export(source, work)
+
+    assert len(doc.tables) == 1
+    assert manifest.tables_xlsx is None
+    assert manifest.xlsx_blocked_by_source
+    assert len(manifest.table_csv_paths) == 1
+    assert source.read_bytes() == original
+
+    assert main(["parse", str(source), "--out", str(work)]) == 0
+    printed = capsys.readouterr().out
+    assert "추출 표 엑셀 파일: 만들지 않음" in printed
+    assert source.read_bytes() == original
+
+    # 표가 없는 문서를 내보낼 때도 원본 자리의 파일은 지우지 않는다.
+    empty_doc = doc.model_copy(update={"tables": []})
+    blocked = export_parse_bundle(empty_doc, work, source_file=source)
+    assert blocked.xlsx_blocked_by_source
+    assert source.read_bytes() == original
+    # 원본이 다른 파일이면 보통대로 쓴다.
+    other = export_parse_bundle(doc, tmp_path / "elsewhere", source_file=source)
+    assert other.tables_xlsx == tmp_path / "elsewhere" / TABLES_XLSX_NAME
+    assert not other.xlsx_blocked_by_source
 
 
 def test_exported_workbook_reads_back_with_the_xlsx_parser(tmp_path: Path) -> None:

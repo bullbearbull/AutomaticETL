@@ -81,6 +81,7 @@ class ExportManifest:
     chunk_count: int = 0
     tables_xlsx: Path | None = None
     xlsx_skipped_table_ids: tuple[str, ...] = ()
+    xlsx_blocked_by_source: bool = False
 
 
 def _escape_md_cell(value: str) -> str:
@@ -464,6 +465,14 @@ def is_bundle_tables_workbook(path: Path) -> bool:
     return path.name == TABLES_XLSX_NAME and (path.parent / "parsed.json").is_file()
 
 
+def _is_same_file(a: Path, b: Path) -> bool:
+    """두 경로가 같은 파일을 가리키는지 본다(대소문자를 가리지 않는 파일 시스템, 링크 포함)."""
+    try:
+        return a.samefile(b)
+    except OSError:
+        return False
+
+
 def _xlsx_number_cell(value: str) -> XlsxNumber | None:
     """`-1,234`·`5%` 같은 값을 숫자 칸으로 바꾼다. 숫자로 두면 값이 달라지면 `None`."""
     if not _PLAIN_NUMBER_RE.fullmatch(value):
@@ -556,8 +565,14 @@ def export_parse_bundle(
     include_header_footer: bool = False,
     include_chunks: bool = True,
     chunk_options: ChunkOptions | None = None,
+    source_file: Path | None = None,
 ) -> ExportManifest:
-    """통합 IR JSON, Markdown, 청크(JSONL), 전략 리포트(JSON·MD), 표 CSV/JSON/XLSX를 저장한다."""
+    """통합 IR JSON, Markdown, 청크(JSONL), 전략 리포트(JSON·MD), 표 CSV/JSON/XLSX를 저장한다.
+
+    `source_file`은 `doc`을 읽어 온 원본 파일이다. 원본이 `out_dir` 바로 아래의
+    `tables.xlsx`이면 그 파일을 덮어쓰거나 지우지 않고 `tables.xlsx` 내보내기를 건너뛴다
+    (`ExportManifest.xlsx_blocked_by_source`).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     parsed_json = out_dir / "parsed.json"
@@ -611,7 +626,10 @@ def export_parse_bundle(
     tables_xlsx: Path | None = None
     xlsx_skipped: tuple[str, ...] = ()
     xlsx_path = out_dir / TABLES_XLSX_NAME
-    if doc.tables:
+    xlsx_blocked = source_file is not None and _is_same_file(xlsx_path, source_file)
+    if xlsx_blocked:
+        pass  # 내보낼 자리에 원본 파일이 있다. 덮어쓰지도 지우지도 않는다.
+    elif doc.tables:
         tables_xlsx = xlsx_path
         xlsx_skipped = export_tables_xlsx(doc.tables, xlsx_path)
     else:
@@ -633,4 +651,5 @@ def export_parse_bundle(
         chunk_count=chunk_count,
         tables_xlsx=tables_xlsx,
         xlsx_skipped_table_ids=xlsx_skipped,
+        xlsx_blocked_by_source=xlsx_blocked,
     )
