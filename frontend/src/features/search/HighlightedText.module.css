@@ -1,0 +1,8 @@
+.mark {
+  background: transparent;
+  color: inherit;
+  font-weight: var(--font-weight-strong);
+  text-decoration: underline;
+  text-decoration-thickness: var(--border-width-strong);
+  text-underline-offset: 0.15em;
+}
