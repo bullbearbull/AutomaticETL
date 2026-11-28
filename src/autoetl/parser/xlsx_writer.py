@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
 import zipfile
@@ -314,6 +315,8 @@ def write_xlsx_workbook(out_path: Path, sheets: Sequence[XlsxSheet]) -> None:
     """`sheets`를 시트로 담은 `.xlsx` 파일을 `out_path`에 쓴다.
 
     시트 한도를 넘는 시트가 있으면 파일을 만들기 전에 `XlsxLimitError`를 낸다.
+    같은 폴더의 임시 파일에 다 쓴 뒤 `out_path`로 바꾸므로, 쓰다가 실패해도 `out_path`에는
+    쓰다 만 파일이 남지 않고 이전 파일이 그대로 있다.
     """
     if not sheets:
         raise ValueError("엑셀 파일에는 시트가 하나 이상 있어야 한다.")
@@ -370,17 +373,23 @@ def write_xlsx_workbook(out_path: Path, sheets: Sequence[XlsxSheet]) -> None:
     )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(out_path, "w") as zf:
-        zf.writestr(_zip_entry("[Content_Types].xml"), "".join(content_types))
-        zf.writestr(_zip_entry("_rels/.rels"), root_rels)
-        zf.writestr(_zip_entry("xl/workbook.xml"), "".join(workbook))
-        zf.writestr(_zip_entry("xl/_rels/workbook.xml.rels"), "".join(workbook_rels))
-        for number, sheet in enumerate(sheets, start=1):
-            chunks = _sheet_xml_chunks(sheet.rows, styles, strings)
-            zf.writestr(_zip_entry(f"xl/worksheets/sheet{number}.xml"), "".join(chunks))
-        # 서식과 글 목록은 시트를 다 쓴 뒤에야 내용이 정해진다.
-        zf.writestr(_zip_entry("xl/styles.xml"), styles.to_xml())
-        zf.writestr(_zip_entry("xl/sharedStrings.xml"), strings.to_xml())
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    try:
+        with zipfile.ZipFile(tmp_path, "w") as zf:
+            zf.writestr(_zip_entry("[Content_Types].xml"), "".join(content_types))
+            zf.writestr(_zip_entry("_rels/.rels"), root_rels)
+            zf.writestr(_zip_entry("xl/workbook.xml"), "".join(workbook))
+            zf.writestr(_zip_entry("xl/_rels/workbook.xml.rels"), "".join(workbook_rels))
+            for number, sheet in enumerate(sheets, start=1):
+                chunks = _sheet_xml_chunks(sheet.rows, styles, strings)
+                zf.writestr(_zip_entry(f"xl/worksheets/sheet{number}.xml"), "".join(chunks))
+            # 서식과 글 목록은 시트를 다 쓴 뒤에야 내용이 정해진다.
+            zf.writestr(_zip_entry("xl/styles.xml"), styles.to_xml())
+            zf.writestr(_zip_entry("xl/sharedStrings.xml"), strings.to_xml())
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 __all__ = [

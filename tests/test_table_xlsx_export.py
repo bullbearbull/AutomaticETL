@@ -270,6 +270,25 @@ def test_xlsx_writer_is_deterministic_and_rejects_oversized_cells(tmp_path: Path
         write_xlsx_workbook(tmp_path / "d.xlsx", [])
 
 
+def test_xlsx_writer_keeps_the_previous_file_when_writing_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """쓰다가 실패하면 이전 파일이 그대로 남고, 쓰다 만 파일이나 임시 파일이 남지 않는다."""
+    out = tmp_path / "book.xlsx"
+    write_xlsx_workbook(out, [XlsxSheet("s", [[XlsxText("이전")]])])
+    before = out.read_bytes()
+
+    def _fail(self: object) -> str:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("autoetl.parser.xlsx_writer._SharedStrings.to_xml", _fail)
+    with pytest.raises(OSError, match="disk full"):
+        write_xlsx_workbook(out, [XlsxSheet("s", [[XlsxText("새 값")]])])
+
+    assert out.read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == ["book.xlsx"]
+
+
 def test_export_tables_xlsx_replaces_oversized_table_with_notice(tmp_path: Path) -> None:
     out = tmp_path / TABLES_XLSX_NAME
     tables = [
