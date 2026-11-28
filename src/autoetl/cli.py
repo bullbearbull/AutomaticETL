@@ -519,6 +519,16 @@ def _run_parse(args: argparse.Namespace) -> int:
             if manifest.table_csv_paths:
                 tables_dir = manifest.out_dir / "tables"
                 print(f"- 추출 표 CSV/JSON: {len(manifest.table_csv_paths)}개 ({tables_dir})")
+            if manifest.tables_xlsx is not None:
+                print(f"- 추출 표 엑셀 파일: {manifest.tables_xlsx} (표마다 시트 하나)")
+                if manifest.xlsx_skipped_table_ids:
+                    skipped_ids = ", ".join(manifest.xlsx_skipped_table_ids)
+                    print(f"  엑셀 시트 한도를 넘어 CSV로만 저장한 표: {skipped_ids}")
+            elif manifest.xlsx_blocked_by_source:
+                print(
+                    "- 추출 표 엑셀 파일: 만들지 않음 "
+                    f"(같은 자리의 입력 파일 {args.file}을 덮어쓰지 않았다)"
+                )
             if manifest.crop_paths:
                 crops_dir = manifest.out_dir / "crops"
                 print(f"- 시각 영역 크롭: {len(manifest.crop_paths)}개 ({crops_dir})")
@@ -791,7 +801,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "결과물 번들(parsed.json, document.md, chunks.jsonl, routing_report.*, "
-            "tables/, crops/) 또는 배치 결과 저장 폴더"
+            "tables/, tables.xlsx, crops/) 또는 배치 결과 저장 폴더"
         ),
     )
     parse.add_argument(

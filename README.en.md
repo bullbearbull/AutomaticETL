@@ -103,6 +103,7 @@ out/
 ├── routing_report.md   # per-page/sheet structural diagnosis and routing plan
 ├── routing_report.json
 ├── tables/             # extracted tables as .csv and .json
+├── tables.xlsx         # all extracted tables in one Excel file, one sheet per table
 └── crops/              # cropped figures, charts, diagrams, and scan regions
 ```
 
