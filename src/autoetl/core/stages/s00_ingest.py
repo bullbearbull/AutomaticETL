@@ -367,9 +367,8 @@ def _csv_input_error(path: Path, line_num: int | None, exc: csv.Error) -> InputE
 def _choose_delimiter(load_path: Path, path: Path) -> str:
     """표본의 필드 수 일관성으로 구분자 후보를 고른다.
 
-    표본은 '줄' 단위로 자르기 때문에 인용 안의 줄바꿈이 끊겨 보인다. 그래서
-    한 번도 2칸 이상을 만들지 못하는 후보(모든 줄이 1칸)는 점수를 깎아,
-    인용 줄바꿈 때문에 일관성이 흔들린 진짜 구분자가 지지 않게 한다.
+    표본은 물리 줄 단위로 제한하되 CSV 레코드 단위로 읽어 인용된 줄바꿈을
+    보존한다. 빈 레코드는 행 수를 셀 때와 마찬가지로 제외한다.
     """
     with _open_text(load_path) as source:
         sample = list(itertools.islice(source, DELIMITER_SAMPLE_LINES))
@@ -378,12 +377,12 @@ def _choose_delimiter(load_path: Path, path: Path) -> str:
     best: tuple[int, float, int, int] | None = None
     chosen = DELIMITER_CANDIDATES[0]
     for priority, delimiter in enumerate(DELIMITER_CANDIDATES):
-        counts: list[int] = []
         try:
-            for line in sample:
-                counts.append(len(next(csv.reader([line], delimiter=delimiter))))
+            counts = [len(row) for row in csv.reader(sample, delimiter=delimiter) if row]
         except csv.Error as exc:
             raise _csv_input_error(path, None, exc) from exc
+        if not counts:
+            continue
         modal_count, hits = Counter(counts).most_common(1)[0]
         score = (1 if modal_count > 1 else 0, hits / len(counts), modal_count, -priority)
         if best is None or score > best:

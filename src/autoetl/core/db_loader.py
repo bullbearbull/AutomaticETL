@@ -816,7 +816,7 @@ def _parse_temporal_time(raw: str) -> dt_time | None:
         return dt_time.fromisoformat(s)
     except ValueError:
         pass
-    for fmt in ("%H:%M:%S", "%H:%M"):
+    for fmt in ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M"):
         try:
             return datetime.strptime(s, fmt).time()
         except ValueError:
@@ -1021,7 +1021,7 @@ def _safe_quarantine_row_json(
         level = pii_level_by_col.get(h, SensitivityLevel.L0)
         if policy is not MaskingPolicy.NONE:
             payload[h] = mask_value(s, stype, policy)
-        elif level in {SensitivityLevel.L2, SensitivityLevel.L3}:
+        elif level is not SensitivityLevel.L0:
             payload[h] = mask_value(s, stype, MaskingPolicy.MASK)
         else:
             payload[h] = s
