@@ -1,5 +1,6 @@
 import { withParticle } from '../../lib/korean.ts';
 import type { RerankerKind } from './api.ts';
+import type { HitMatchInfo } from './highlight.ts';
 
 /**
  * Copy for the "문서 내용 검색" tab.
@@ -25,7 +26,7 @@ export const settingsCopy = {
   synonyms: {
     label: '같은 뜻 단어 함께 찾기',
     placeholder: '예: 휴가=연차, 보관=보존',
-    description: '쉼표로 묶음을 구분하고, 같은 뜻 단어는 = 또는 |로 이어 적어 주세요.',
+    description: '쉼표로 묶음을 구분하고, 기준 단어=비슷한 말 형식으로 적어 주세요. 비슷한 말이 여러 개면 |로 이어요 (예: 휴가=연차|월차).',
   },
   reranker: {
     label: '검색 방식',
@@ -71,6 +72,8 @@ export const resultCopy = {
       : `문서 ${docCount}개 · 목차 ${sectionCount}개`,
   staleNotice: '넣은 문서가 바뀌어서 검색 준비를 다시 해야 해요.',
   partialWarningsTitle: (count: number) => `문서 ${count}개는 읽지 못해 검색 대상에서 빠졌어요.`,
+  formatBuildWarning: (raw: string) =>
+    raw.replace(/인덱싱\s*건너뜀/g, '읽지 못해 건너뜀').replace(/인덱싱/g, '검색 준비'),
   searchForm: {
     label: '찾을 내용이나 단어',
     placeholder: '예: 보관 기간, 연차 사용 기준',
@@ -89,7 +92,7 @@ export const resultCopy = {
     promptTitle: '검색어를 입력해 필요한 내용을 찾아보세요',
     promptBody: '문서마다 목차 항목, 문서 이름, 쪽과 함께 검색어가 굵은 글자와 밑줄로 표시돼요.',
     summary: (count: number, elapsedMs: number, mode: string) => {
-      const timeText = elapsedMs >= 1000 ? `${(elapsedMs / 1000).toFixed(1)}초` : `${Math.round(elapsedMs)}ms`;
+      const timeText = elapsedMs < 100 ? '0.1초 미만' : `${(elapsedMs / 1000).toFixed(1)}초`;
       const modeLabel = mode === 'fts5+onnx_rerank' ? '정밀 검색' : '빠른 검색';
       return `${modeLabel}으로 ${count}곳을 찾았어요 · ${timeText}`;
     },
@@ -97,7 +100,21 @@ export const resultCopy = {
     emptyBody:
       '다른 단어로 다시 찾거나, 세부 설정의 "같은 뜻 단어 함께 찾기"를 추가해 보세요. 목차에서 직접 살펴볼 수도 있어요.',
     browseOutline: '목차에서 직접 보기',
-    relevance: (pct: number) => `관련도 ${pct}%`,
+    matchLabel: (info: HitMatchInfo, outlineBoost: number) => {
+      switch (info.kind) {
+        case 'all_words':
+          if (outlineBoost > 0) return '제목·본문 모두 일치';
+          return info.queryWordCount >= 2 ? '검색어 모두 일치' : '본문 일치';
+        case 'partial_words':
+          return `일부 단어 일치 (${info.matchedWordCount}/${info.queryWordCount})`;
+        case 'synonym':
+          return '비슷한 말 일치';
+        case 'fragment':
+          return '글자 일부 일치';
+        case 'semantic':
+          return '문맥 유사';
+      }
+    },
     embeddedTables: (count: number) => `포함된 표 ${count}개`,
     lowRelevanceToggle: (count: number) => `관련도가 낮은 결과 ${count}개 더 보기`,
     relatedTablesHeading: '관련 있어 보이는 문서 속 표',
@@ -122,9 +139,9 @@ export const resultCopy = {
     sqlLabel: '조회 조건 (SQL)',
     runSql: '조건으로 찾기',
     runningSql: '표를 조회하는 중이에요…',
-    rowCount: (total: number, truncated: boolean) =>
+    rowCount: (shown: number, total: number, truncated: boolean) =>
       truncated
-        ? `총 ${total.toLocaleString('ko-KR')}행 중 앞부분만 보여 줘요`
+        ? `총 ${total.toLocaleString('ko-KR')}행 중 앞 ${shown.toLocaleString('ko-KR')}행만 보여 줘요`
         : `총 ${total.toLocaleString('ko-KR')}행`,
   },
 } as const;
@@ -147,17 +164,26 @@ export const evidenceCopy = {
     section: '목차 항목',
     reason: '찾은 이유',
   },
-  reasonText: (pct: number, matchedTerms: readonly string[], outlineBoost: number, rerankScore: number | null) => {
+  reasonText: (matchInfo: HitMatchInfo, outlineBoost: number, rerankScore: number | null) => {
     const parts: string[] = [];
-    if (matchedTerms.length > 0) {
-      parts.push(`일치한 단어: ${matchedTerms.join(', ')}`);
+    if (matchInfo.kind === 'fragment' && matchInfo.displayTerms.length > 0) {
+      parts.push(`일부 글자 일치: ${matchInfo.displayTerms.join(', ')}`);
+    } else if (matchInfo.displayTerms.length > 0) {
+      parts.push(`일치한 단어: ${matchInfo.displayTerms.join(', ')}`);
     } else {
       parts.push('제목이나 문맥이 검색어와 비슷해요');
     }
     if (outlineBoost > 0) parts.push('목차 제목에도 겹치는 말이 있어요');
     if (rerankScore !== null) parts.push('정밀 검색 순위를 반영했어요');
-    parts.push(`관련도 ${pct}%`);
+    parts.push(resultCopy.results.matchLabel(matchInfo, outlineBoost));
     return parts.join(' · ');
+  },
+  techLabels: {
+    sectionId: '항목 번호',
+    scores: '종합 점수 / 단어 일치 점수',
+    rerankScore: '정밀 검색 점수',
+    mode: '검색 방식',
+    modeValue: (mode: string) => (mode === 'fts5+onnx_rerank' ? '정밀 검색' : '빠른 검색'),
   },
   passageHeading: '원문 (앞뒤 문장 포함)',
   showFullSection: '목차 항목 전체 보기',

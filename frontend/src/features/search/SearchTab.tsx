@@ -31,7 +31,7 @@ import styles from './SearchTab.module.css';
 
 type FocusTarget = 'result' | 'start';
 
-const DEFAULT_TABLE_SQL = 'SELECT * FROM tbl LIMIT 50';
+const DEFAULT_TABLE_SQL = 'SELECT * FROM tbl';
 
 /**
  * Entry of the "문서 내용 검색" tab (loaded lazily by App.tsx into
@@ -66,6 +66,11 @@ export default function SearchTab() {
   const searchController = useRef<AbortController | null>(null);
   const sectionController = useRef<AbortController | null>(null);
   const tableController = useRef<AbortController | null>(null);
+  const expiredRebuildRef = useRef<{
+    fileRevision: number;
+    expiredIndexId: string;
+    promise: Promise<DocIndexBuildResult | null>;
+  } | null>(null);
 
   const rootRef = useRef<HTMLDivElement>(null);
   const statusRef = useRef<HTMLDivElement>(null);
@@ -179,10 +184,39 @@ export default function SearchTab() {
     }
   };
 
-  const rebuildAfterExpired = async (startFileRev: number): Promise<DocIndexBuildResult | null> => {
+  const rebuildAfterExpired = (
+    startFileRev: number,
+    expiredIndexId: string,
+  ): Promise<DocIndexBuildResult | null> => {
     const latest = stateRef.current;
-    if (latest.files.length === 0 || latest.fileRevision !== startFileRev) return null;
-    return buildIndexForFiles(latest.files, startFileRev, { abortInFlightSubRequests: false });
+    if (latest.files.length === 0 || latest.fileRevision !== startFileRev) {
+      return Promise.resolve(null);
+    }
+    if (
+      latest.index &&
+      latest.indexedFileRevision === startFileRev &&
+      latest.index.indexId !== expiredIndexId &&
+      latest.buildPhase === 'ready'
+    ) {
+      return Promise.resolve(latest.index);
+    }
+    const active = expiredRebuildRef.current;
+    if (active && active.fileRevision === startFileRev && active.expiredIndexId === expiredIndexId) {
+      return active.promise;
+    }
+    const promise = buildIndexForFiles(latest.files, startFileRev, {
+      abortInFlightSubRequests: false,
+    }).finally(() => {
+      if (expiredRebuildRef.current?.promise === promise) {
+        expiredRebuildRef.current = null;
+      }
+    });
+    expiredRebuildRef.current = {
+      fileRevision: startFileRev,
+      expiredIndexId,
+      promise,
+    };
+    return promise;
   };
 
   const addFiles = (incoming: File[], focus?: FocusTarget) => {
@@ -217,6 +251,7 @@ export default function SearchTab() {
 
     if (focus && !stateRef.current.index) pendingFocus.current = focus;
     const nextFileRevision = stateRef.current.fileRevision + 1;
+    expiredRebuildRef.current = null;
     resetSubViews();
     setActiveTab('results');
     dispatch({ type: 'mergeFiles', items: newItems });
@@ -226,6 +261,7 @@ export default function SearchTab() {
   const removeFile = (id: string) => {
     const remaining = stateRef.current.files.filter((f) => f.id !== id);
     const nextFileRevision = stateRef.current.fileRevision + 1;
+    expiredRebuildRef.current = null;
     resetSubViews();
     setActiveTab('results');
 
@@ -251,6 +287,7 @@ export default function SearchTab() {
     if (!trimmed || !canSearch(cur) || !cur.index) return;
 
     const startFileRev = cur.fileRevision;
+    const attemptedIndexId = cur.index.indexId;
     const mySeq = ++searchSeq.current;
     let settled = false;
     searchController.current?.abort();
@@ -277,7 +314,11 @@ export default function SearchTab() {
         },
         { signal: controller.signal },
       );
-      if (mySeq !== searchSeq.current || stateRef.current.fileRevision !== startFileRev) {
+      if (mySeq !== searchSeq.current) {
+        settled = true;
+        return;
+      }
+      if (stateRef.current.fileRevision !== startFileRev) {
         settled = true;
         dispatch({ type: 'cancelSearch', now: Date.now() });
         return;
@@ -293,12 +334,15 @@ export default function SearchTab() {
     };
 
     try {
-      await runWithIndexId(cur.index.indexId);
+      await runWithIndexId(attemptedIndexId);
     } catch (error) {
       if (controller.signal.aborted || (isAppError(error) && error.kind === 'aborted')) return;
       if (isAppError(error) && error.kind === 'expired') {
-        const rebuilt = await rebuildAfterExpired(startFileRev);
-        if (controller.signal.aborted || mySeq !== searchSeq.current) return;
+        const rebuilt = await rebuildAfterExpired(startFileRev, attemptedIndexId);
+        if (controller.signal.aborted || mySeq !== searchSeq.current) {
+          settled = true;
+          return;
+        }
         if (!rebuilt) {
           settled = true;
           dispatch({ type: 'cancelSearch', now: Date.now() });
@@ -340,11 +384,13 @@ export default function SearchTab() {
     if (!cur.index || isIndexStale(cur)) return;
 
     const startFileRev = cur.fileRevision;
+    const attemptedIndexId = cur.index.indexId;
     const mySeq = ++sectionSeq.current;
     sectionController.current?.abort();
     const controller = new AbortController();
     sectionController.current = controller;
     setSelectedSectionId(sectionId);
+    setSectionContent((prev) => (prev?.section.sectionId === sectionId ? prev : null));
     setLoadingSection(true);
 
     const runRead = async (indexId: string) => {
@@ -357,11 +403,11 @@ export default function SearchTab() {
     };
 
     try {
-      await runRead(cur.index.indexId);
+      await runRead(attemptedIndexId);
     } catch (error) {
       if (controller.signal.aborted || (isAppError(error) && error.kind === 'aborted')) return;
       if (isAppError(error) && error.kind === 'expired') {
-        const rebuilt = await rebuildAfterExpired(startFileRev);
+        const rebuilt = await rebuildAfterExpired(startFileRev, attemptedIndexId);
         if (controller.signal.aborted || mySeq !== sectionSeq.current || !rebuilt) return;
         try {
           await runRead(rebuilt.indexId);
@@ -371,7 +417,7 @@ export default function SearchTab() {
             return;
           }
           dispatch({
-            type: 'searchFailed',
+            type: 'setNoticeError',
             error: toAppError(retryErr),
             fileRevision: startFileRev,
             now: Date.now(),
@@ -380,7 +426,7 @@ export default function SearchTab() {
         }
       }
       dispatch({
-        type: 'searchFailed',
+        type: 'setNoticeError',
         error: toAppError(error),
         fileRevision: startFileRev,
         now: Date.now(),
@@ -395,11 +441,13 @@ export default function SearchTab() {
     if (!cur.index || isIndexStale(cur)) return;
 
     const startFileRev = cur.fileRevision;
+    const attemptedIndexId = cur.index.indexId;
     const mySeq = ++tableSeq.current;
     tableController.current?.abort();
     const controller = new AbortController();
     tableController.current = controller;
     setSelectedTableUid(tableUid);
+    setTableResult((prev) => (prev?.tableUid === tableUid ? prev : null));
     setLoadingTable(true);
 
     const runQuery = async (indexId: string) => {
@@ -412,11 +460,11 @@ export default function SearchTab() {
     };
 
     try {
-      await runQuery(cur.index.indexId);
+      await runQuery(attemptedIndexId);
     } catch (error) {
       if (controller.signal.aborted || (isAppError(error) && error.kind === 'aborted')) return;
       if (isAppError(error) && error.kind === 'expired') {
-        const rebuilt = await rebuildAfterExpired(startFileRev);
+        const rebuilt = await rebuildAfterExpired(startFileRev, attemptedIndexId);
         if (controller.signal.aborted || mySeq !== tableSeq.current || !rebuilt) return;
         try {
           await runQuery(rebuilt.indexId);
@@ -426,7 +474,7 @@ export default function SearchTab() {
             return;
           }
           dispatch({
-            type: 'searchFailed',
+            type: 'setNoticeError',
             error: toAppError(retryErr),
             fileRevision: startFileRev,
             now: Date.now(),
@@ -435,7 +483,7 @@ export default function SearchTab() {
         }
       }
       dispatch({
-        type: 'searchFailed',
+        type: 'setNoticeError',
         error: toAppError(error),
         fileRevision: startFileRev,
         now: Date.now(),
@@ -481,12 +529,21 @@ export default function SearchTab() {
   };
 
   const handleDocFilterChange = (docId: string) => {
+    const cur = stateRef.current;
+    if (docId === cur.docFilterId) return;
+    const shouldRerun =
+      (cur.searchResult !== null || cur.searching) &&
+      cur.query.trim() !== '' &&
+      canSearch(cur);
+    const rerunQuery = cur.query;
+
+    searchSeq.current += 1;
+    searchController.current?.abort();
     dispatch({ type: 'setDocFilter', docId });
     resetSubViews();
     syncActiveSubView(activeTab, docId, true);
-    const cur = stateRef.current;
-    if (cur.searchResult && cur.query.trim() && canSearch(cur)) {
-      void executeSearch(cur.query, docId, { preserveTab: true });
+    if (shouldRerun) {
+      void executeSearch(rerunQuery, docId, { preserveTab: true });
     }
   };
 
@@ -502,6 +559,7 @@ export default function SearchTab() {
 
   const stale = isIndexStale(state);
   const status = statusFor(state);
+  const renderFileRevision = state.fileRevision;
   const showWorkspace = state.files.length > 0 || state.index !== null || state.error !== null;
 
   const selectedHit =
@@ -517,9 +575,18 @@ export default function SearchTab() {
   const selectedTable =
     visibleTables.find((t) => t.tableUid === selectedTableUid) ?? visibleTables[0] ?? null;
 
+  const matchedSectionContent =
+    sectionContent && (!selectedSectionId || sectionContent.section.sectionId === selectedSectionId)
+      ? sectionContent
+      : null;
+  const matchedTableResult =
+    selectedTable && tableResult && tableResult.tableUid === selectedTable.tableUid
+      ? tableResult
+      : null;
+
   const hasEvidencePrimaryAction =
     (activeTab === 'results' && selectedHit !== null) ||
-    (activeTab === 'outline' && sectionContent !== null);
+    (activeTab === 'outline' && matchedSectionContent !== null);
 
   return (
     <div
@@ -529,7 +596,7 @@ export default function SearchTab() {
         lastFocused.current = event.target;
       }}
     >
-      <StepIndicator current={stepFor(state)} />
+      <StepIndicator current={stepFor(state, activeTab)} />
 
       {showWorkspace ? (
         <Workspace
@@ -568,19 +635,30 @@ export default function SearchTab() {
               activeTab={activeTab}
               onTabChange={handleTabChange}
               selectedSectionId={selectedSectionId}
-              sectionContent={sectionContent}
+              sectionContent={matchedSectionContent}
               loadingSection={loadingSection}
               onSelectSection={(sectionId) => void loadSection(sectionId)}
               selectedTableUid={selectedTable?.tableUid ?? null}
               tableSql={tableSql}
               onTableSqlChange={setTableSql}
-              tableResult={tableResult}
+              tableResult={matchedTableResult}
               loadingTable={loadingTable}
               onSelectTable={(tableUid) => {
                 setTableSql(DEFAULT_TABLE_SQL);
                 void runTableSql(tableUid, DEFAULT_TABLE_SQL);
               }}
               onOpenTable={(tableUid) => {
+                const target = stateRef.current.index?.tables.find((t) => t.tableUid === tableUid);
+                if (
+                  stateRef.current.docFilterId &&
+                  target &&
+                  target.docId !== stateRef.current.docFilterId
+                ) {
+                  searchSeq.current += 1;
+                  searchController.current?.abort();
+                  dispatch({ type: 'setDocFilter', docId: target.docId });
+                  resetSubViews();
+                }
                 setActiveTab('tables');
                 setTableSql(DEFAULT_TABLE_SQL);
                 void runTableSql(tableUid, DEFAULT_TABLE_SQL);
@@ -590,7 +668,7 @@ export default function SearchTab() {
                 if (targetUid) void runTableSql(targetUid, sql ?? tableSql);
               }}
               onCopied={() =>
-                dispatch({ type: 'markCopied', fileRevision: stateRef.current.fileRevision })
+                dispatch({ type: 'markCopied', fileRevision: renderFileRevision })
               }
               hasEvidencePrimaryAction={hasEvidencePrimaryAction}
             />
@@ -600,13 +678,14 @@ export default function SearchTab() {
               <EvidencePanel
                 index={state.index}
                 error={state.error}
+                fileRevision={renderFileRevision}
                 activeTab={activeTab}
                 searchResult={state.searchResult}
                 selectedHit={selectedHit}
-                sectionContent={sectionContent}
+                sectionContent={matchedSectionContent}
                 selectedTable={selectedTable}
-                onCopied={() =>
-                  dispatch({ type: 'markCopied', fileRevision: stateRef.current.fileRevision })
+                onCopied={(copiedFileRev) =>
+                  dispatch({ type: 'markCopied', fileRevision: copiedFileRev })
                 }
               />
             ) : null

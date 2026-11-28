@@ -1,5 +1,5 @@
 import { postJson, type RequestOptions } from '../../api/http.ts';
-import { AppError } from '../../lib/errors.ts';
+import { AppError, isAppError } from '../../lib/errors.ts';
 import { searchErrorCopy } from './copy.ts';
 
 export type RerankerKind = 'none' | 'onnx';
@@ -351,6 +351,18 @@ export async function queryDocTableSql(
   payload: DocIndexTableSqlRequest,
   options: RequestOptions = {},
 ): Promise<DocTableQueryResult> {
-  const raw = await postJson<unknown>('/api/docindex/table-sql', payload, options);
-  return normalizeTableSqlResponse(raw);
+  try {
+    const raw = await postJson<unknown>('/api/docindex/table-sql', payload, options);
+    return normalizeTableSqlResponse(raw);
+  } catch (error) {
+    if (isAppError(error) && error.kind === 'request' && error.status === 400) {
+      throw new AppError({
+        kind: 'request',
+        ...searchErrorCopy.sqlFailed,
+        detail: error.detail,
+        status: error.status,
+      });
+    }
+    throw error;
+  }
 }

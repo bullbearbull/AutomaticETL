@@ -1,4 +1,4 @@
-import { useId } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { Details } from '../../components/index.ts';
 import type { RerankerKind } from './api.ts';
 import { settingsCopy } from './copy.ts';
@@ -24,6 +24,7 @@ export function SettingsPanel({
   onExpandedChange,
   disabled = false,
 }: SettingsPanelProps) {
+  const [topKDraft, setTopKDraft] = useState(String(settings.topK));
   const topKId = useId();
   const topKDescId = useId();
   const synonymsId = useId();
@@ -31,6 +32,24 @@ export function SettingsPanel({
   const rerankerId = useId();
   const modelId = useId();
   const modelDescId = useId();
+
+  useEffect(() => {
+    setTopKDraft(String(settings.topK));
+  }, [settings.topK]);
+
+  const commitTopK = () => {
+    const trimmed = topKDraft.trim();
+    if (!trimmed) {
+      setTopKDraft(String(settings.topK));
+      return;
+    }
+    const raw = Number(trimmed);
+    const clamped = Number.isFinite(raw) ? Math.max(1, Math.min(20, Math.trunc(raw))) : settings.topK;
+    setTopKDraft(String(clamped));
+    if (clamped !== settings.topK) {
+      onChange({ topK: clamped });
+    }
+  };
 
   return (
     <Details
@@ -49,14 +68,21 @@ export function SettingsPanel({
             type="number"
             min={1}
             max={20}
-            value={settings.topK}
+            value={topKDraft}
             disabled={disabled}
             aria-describedby={topKDescId}
             onChange={(e) => {
-              const raw = Number(e.target.value);
-              const clamped = Number.isFinite(raw) ? Math.max(1, Math.min(20, Math.trunc(raw))) : 5;
-              onChange({ topK: clamped });
+              const next = e.target.value;
+              setTopKDraft(next);
+              const trimmed = next.trim();
+              if (/^\d+$/.test(trimmed)) {
+                const parsed = Number(trimmed);
+                if (parsed >= 1 && parsed <= 20) {
+                  onChange({ topK: parsed });
+                }
+              }
             }}
+            onBlur={commitTopK}
             className={styles.input}
           />
           <span id={topKDescId} className={styles.description}>

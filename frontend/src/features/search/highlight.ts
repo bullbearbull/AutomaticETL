@@ -1,7 +1,18 @@
 import type { EvidenceHitInfo } from './api.ts';
 
-/** Hits below this final score are folded under "관련도가 낮은 결과 N개 더 보기". */
-export const LOW_RELEVANCE_THRESHOLD = 0.30;
+/** Score ratio vs. the top hit below which partial matches are folded behind `<Details>`. */
+export const RELATIVE_SCORE_RATIO = 0.55;
+
+const QUERY_WORD_RE = /[0-9A-Za-z가-힣]+(?:[-_./][0-9A-Za-z가-힣]+)*/g;
+
+export type HitMatchKind = 'all_words' | 'partial_words' | 'synonym' | 'fragment' | 'semantic';
+
+export interface HitMatchInfo {
+  kind: HitMatchKind;
+  matchedWordCount: number;
+  queryWordCount: number;
+  displayTerms: string[];
+}
 
 export interface HighlightSegment {
   text: string;
@@ -136,15 +147,19 @@ export function extractSurroundingPassage(
   if (matchedUnit.length > maxChars) {
     const lowerUnit = matchedUnit.toLowerCase();
     let hitOffset = matchedUnit.length;
+    let hitEnd = matchedUnit.length;
     for (const term of lowerTerms) {
       const idx = lowerUnit.indexOf(term);
-      if (idx >= 0 && idx < hitOffset) hitOffset = idx;
+      if (idx >= 0 && (idx < hitOffset || (idx === hitOffset && idx + term.length > hitEnd))) {
+        hitOffset = idx;
+        hitEnd = idx + term.length;
+      }
     }
     const half = Math.floor(maxChars / 2);
     let start = Math.max(0, hitOffset - half);
-    let end = Math.min(matchedUnit.length, start + maxChars);
+    let end = Math.min(matchedUnit.length, Math.max(start + maxChars, hitEnd));
     if (end - start < maxChars && start > 0) {
-      start = Math.max(0, end - maxChars);
+      start = Math.min(hitOffset, Math.max(0, end - maxChars));
     }
     if (start > 0) {
       const nextSpace = matchedUnit.indexOf(' ', start);
@@ -154,7 +169,7 @@ export function extractSurroundingPassage(
     }
     if (end < matchedUnit.length) {
       const prevSpace = matchedUnit.lastIndexOf(' ', end);
-      if (prevSpace > hitOffset) {
+      if (prevSpace >= hitEnd) {
         end = prevSpace;
       }
     }
@@ -190,35 +205,140 @@ export function extractSurroundingPassage(
   };
 }
 
+/** Extracts unique lowercase query words matching the backend FTS5 tokenizer boundaries. */
+export function extractQueryWords(query: string): string[] {
+  const matches = query.toLowerCase().match(QUERY_WORD_RE);
+  if (!matches) return [];
+  const seen = new Set<string>();
+  const words: string[] = [];
+  for (const w of matches) {
+    if (!seen.has(w)) {
+      seen.add(w);
+      words.push(w);
+    }
+  }
+  return words;
+}
+
+/**
+ * Drops redundant internal 2-gram fragments from backend `matchedTerms` when
+ * a longer containing matched term (e.g. `비밀번호` vs `비밀`, `밀번`, `번호`) is present.
+ */
+export function filterDisplayMatchedTerms(_query: string, matchedTerms: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const raw of matchedTerms) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const lower = trimmed.toLowerCase();
+    if (!seen.has(lower)) {
+      seen.add(lower);
+      unique.push(trimmed);
+    }
+  }
+  return unique.filter((term, idx) => {
+    const low = term.toLowerCase();
+    return !unique.some(
+      (other, otherIdx) =>
+        otherIdx !== idx && other.length > term.length && other.toLowerCase().includes(low),
+    );
+  });
+}
+
+/**
+ * Classifies how well a hit matches the user's query using actual word coverage
+ * and cleaned matched terms instead of mapping raw BM25 blends to percentages.
+ */
+export function analyzeHitMatch(
+  hit: Pick<EvidenceHitInfo, 'title' | 'sectionPath' | 'fullText' | 'matchedTerms' | 'rerankScore'>,
+  query: string,
+): HitMatchInfo {
+  const queryWords = extractQueryWords(query);
+  const haystack = `${hit.title} ${hit.sectionPath.join(' ')} ${hit.fullText}`.toLowerCase();
+  const matchedWordCount = queryWords.filter((w) => haystack.includes(w)).length;
+  const displayTerms = filterDisplayMatchedTerms(query, hit.matchedTerms);
+
+  const isSubFragment = (term: string): boolean => {
+    const low = term.toLowerCase();
+    return queryWords.some((w) => w.length > low.length && w.includes(low));
+  };
+  const queryWordSet = new Set(queryWords);
+  const synonymCount = displayTerms.filter(
+    (term) => !queryWordSet.has(term.toLowerCase()) && !isSubFragment(term),
+  ).length;
+
+  let kind: HitMatchKind;
+  if (queryWords.length > 0 && matchedWordCount === queryWords.length) {
+    kind = 'all_words';
+  } else if (matchedWordCount > 0) {
+    kind = 'partial_words';
+  } else if (synonymCount > 0) {
+    kind = 'synonym';
+  } else if (hit.rerankScore !== null) {
+    kind = 'semantic';
+  } else if (displayTerms.length > 0) {
+    kind = 'fragment';
+  } else {
+    kind = 'semantic';
+  }
+
+  return {
+    kind,
+    matchedWordCount,
+    queryWordCount: queryWords.length,
+    displayTerms,
+  };
+}
+
 /**
  * Splits hits into high-relevance results shown right away and low-relevance
- * results folded behind `<Details>`. Guarantees at least the top hit stays visible.
+ * results folded behind `<Details>`. Uses full query-word coverage and score
+ * ratio against the top hit rather than an absolute BM25 percentage cutoff.
  */
-export function partitionHitsByRelevance<T extends Pick<EvidenceHitInfo, 'finalScore'>>(
-  hits: readonly T[],
-): { primary: T[]; lowRelevance: T[] } {
+export function partitionHitsByRelevance<
+  T extends Pick<EvidenceHitInfo, 'finalScore'> &
+    Partial<Pick<EvidenceHitInfo, 'title' | 'sectionPath' | 'fullText' | 'matchedTerms' | 'rerankScore'>>,
+>(hits: readonly T[], query = ''): { primary: T[]; lowRelevance: T[] } {
   if (hits.length <= 1) {
     return { primary: [...hits], lowRelevance: [] };
   }
   const topScore = hits[0]!.finalScore;
-  const cutoff = topScore >= LOW_RELEVANCE_THRESHOLD ? LOW_RELEVANCE_THRESHOLD : topScore * 0.85;
+  const queryWords = extractQueryWords(query);
 
   const primary: T[] = [];
   const lowRelevance: T[] = [];
   hits.forEach((hit, index) => {
-    if (index === 0 || hit.finalScore >= cutoff) {
+    if (index === 0) {
+      primary.push(hit);
+      return;
+    }
+    if (queryWords.length > 0 && typeof hit.fullText === 'string') {
+      const info = analyzeHitMatch(
+        {
+          title: hit.title ?? '',
+          sectionPath: hit.sectionPath ?? [],
+          fullText: hit.fullText,
+          matchedTerms: hit.matchedTerms ?? [],
+          rerankScore: hit.rerankScore ?? null,
+        },
+        query,
+      );
+      if (info.kind === 'fragment' && (hit.rerankScore ?? null) === null) {
+        lowRelevance.push(hit);
+        return;
+      }
+      if (info.kind === 'all_words') {
+        primary.push(hit);
+        return;
+      }
+    }
+    if (topScore <= 0 || hit.finalScore >= topScore * RELATIVE_SCORE_RATIO) {
       primary.push(hit);
     } else {
       lowRelevance.push(hit);
     }
   });
   return { primary, lowRelevance };
-}
-
-/** Clamps final score into a readable 1–100 integer percentage. */
-export function relevancePercent(finalScore: number): number {
-  if (!Number.isFinite(finalScore)) return 1;
-  return Math.max(1, Math.min(100, Math.round(finalScore * 100)));
 }
 
 /** Formats copied evidence text with document name, page location, section heading, and passage. */

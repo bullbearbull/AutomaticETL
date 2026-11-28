@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  analyzeHitMatch,
   collectHighlightTerms,
   extractSurroundingPassage,
+  filterDisplayMatchedTerms,
   formatCitationCopyText,
-  LOW_RELEVANCE_THRESHOLD,
   partitionHitsByRelevance,
-  relevancePercent,
+  RELATIVE_SCORE_RATIO,
   splitTextWithHighlights,
 } from '../../src/features/search/highlight.ts';
 
@@ -46,37 +47,134 @@ test('extractSurroundingPassage keeps surrounding sentences before and after the
   assert.match(res.passage, /기한이 지난 문서는/);
   assert.equal(res.truncatedBefore, true);
   assert.equal(res.truncatedAfter, true);
+
+  // Never slices inside a multi-word matched phrase at the end word boundary.
+  const longSingle = `${'가'.repeat(200)}보관 기간 연장${'나'.repeat(200)}`;
+  const longWindow = extractSurroundingPassage(longSingle, ['보관 기간 연장', '보관 기간'], {
+    maxChars: 280,
+    contextSentences: 1,
+  });
+  assert.match(longWindow.passage, /보관 기간 연장/);
 });
 
-test('partitionHitsByRelevance folds low-relevance hits while always keeping the top hit visible', () => {
-  const { primary, lowRelevance } = partitionHitsByRelevance([
-    { id: '1', finalScore: 0.82 },
-    { id: '2', finalScore: 0.45 },
-    { id: '3', finalScore: LOW_RELEVANCE_THRESHOLD - 0.08 },
-    { id: '4', finalScore: 0.12 },
-  ]);
+test('partitionHitsByRelevance handles real-engine score distributions and filters 2-gram fragments', () => {
+  // Real 6-doc corpus distribution for "보관 기간": exact body match (0.2333) stays primary, partial (0.0) folds.
+  const storageHits = [
+    {
+      id: 'edu',
+      title: '제4조 교육 이수 기록의 보관 기간',
+      sectionPath: ['제4조 교육 이수 기록의 보관 기간'],
+      fullText: '보관 기간은 5년이다.',
+      matchedTerms: ['보관', '기간'],
+      rerankScore: null,
+      finalScore: 0.6065,
+    },
+    {
+      id: 'sec',
+      title: '제9조 접속 기록의 보관 기간',
+      sectionPath: ['제9조 접속 기록의 보관 기간'],
+      fullText: '보관 기간은 최소 3년으로 정한다.',
+      matchedTerms: ['보관', '기간'],
+      rerankScore: null,
+      finalScore: 0.6065,
+    },
+    {
+      id: 'receipt',
+      title: '제3조 지출 증빙 관리',
+      sectionPath: ['제3조 지출 증빙 관리'],
+      fullText: '영수증 보관 기간은 3년으로 정한다.',
+      matchedTerms: ['보관', '기간'],
+      rerankScore: null,
+      finalScore: 0.2333,
+    },
+    {
+      id: 'club',
+      title: '제5조 사내 동호회 활동비 지원',
+      sectionPath: ['제5조 사내 동호회 활동비 지원'],
+      fullText: '영수증 증빙은 참고용으로 잠깐 보관한다.',
+      matchedTerms: ['보관'],
+      rerankScore: null,
+      finalScore: 0.0,
+    },
+  ];
+  const partitionedStorage = partitionHitsByRelevance(storageHits, '보관 기간');
   assert.deepEqual(
-    primary.map((h) => h.id),
-    ['1', '2'],
+    partitionedStorage.primary.map((h) => h.id),
+    ['edu', 'sec', 'receipt'],
   );
   assert.deepEqual(
-    lowRelevance.map((h) => h.id),
-    ['3', '4'],
+    partitionedStorage.lowRelevance.map((h) => h.id),
+    ['club'],
   );
 
-  // Even when all scores are below 0.30, the top hit stays primary and weaker tail folds.
-  const lowTop = partitionHitsByRelevance([
-    { id: 'a', finalScore: 0.2 },
-    { id: 'b', finalScore: 0.19 },
-    { id: 'c', finalScore: 0.1 },
-  ]);
+  // Real 6-doc corpus distribution for "비밀번호 승인": 2-gram-only "번호" (0.5469) folds.
+  const pwHits = [
+    {
+      id: 'pw',
+      title: '제12조 비밀번호 관리',
+      sectionPath: ['제12조 비밀번호 관리'],
+      fullText: '사용자 비밀번호는 90일마다 변경해야 한다.',
+      matchedTerms: ['비밀번호', '비밀', '밀번', '번호'],
+      rerankScore: null,
+      finalScore: 0.8887,
+    },
+    {
+      id: 'approval',
+      title: '제6조 결재 승인 절차',
+      sectionPath: ['제6조 결재 승인 절차'],
+      fullText: '예산 집행 전 팀장 승인을 받아야 한다.',
+      matchedTerms: ['승인'],
+      rerankScore: null,
+      finalScore: 0.6262,
+    },
+    {
+      id: 'tel',
+      title: '제2조 내선 번호 안내',
+      sectionPath: ['제2조 내선 번호 안내'],
+      fullText: '부서별 대표 내선 번호는 사내 포털에서 확인한다.',
+      matchedTerms: ['번호'],
+      rerankScore: null,
+      finalScore: 0.5469,
+    },
+  ];
+  const partitionedPw = partitionHitsByRelevance(pwHits, '비밀번호 승인');
   assert.deepEqual(
-    lowTop.primary.map((h) => h.id),
-    ['a', 'b'],
+    partitionedPw.primary.map((h) => h.id),
+    ['pw', 'approval'],
   );
   assert.deepEqual(
-    lowTop.lowRelevance.map((h) => h.id),
-    ['c'],
+    partitionedPw.lowRelevance.map((h) => h.id),
+    ['tel'],
+  );
+  assert.equal(analyzeHitMatch(pwHits[2]!, '비밀번호 승인').kind, 'fragment');
+  assert.deepEqual(filterDisplayMatchedTerms('비밀번호 승인', pwHits[0]!.matchedTerms), ['비밀번호']);
+
+  // Synonym hit stays primary when score meets ratio threshold and classifies as 'synonym'.
+  const synHit = {
+    id: 'syn',
+    title: '제9조 접속 기록의 보관 기간',
+    sectionPath: ['제9조 접속 기록의 보관 기간'],
+    fullText: '보관 기간은 최소 3년으로 정한다.',
+    matchedTerms: ['보관'],
+    rerankScore: null,
+    finalScore: 0.6,
+  };
+  assert.equal(analyzeHitMatch(synHit, '보존').kind, 'synonym');
+  assert.deepEqual(partitionHitsByRelevance([synHit], '보존').primary.map((h) => h.id), ['syn']);
+
+  // Score-ratio fallback when query is omitted.
+  const ratioOnly = partitionHitsByRelevance([
+    { id: 'top', finalScore: 0.8 },
+    { id: 'mid', finalScore: 0.8 * RELATIVE_SCORE_RATIO },
+    { id: 'low', finalScore: 0.2 },
+  ]);
+  assert.deepEqual(
+    ratioOnly.primary.map((h) => h.id),
+    ['top', 'mid'],
+  );
+  assert.deepEqual(
+    ratioOnly.lowRelevance.map((h) => h.id),
+    ['low'],
   );
 });
 
@@ -90,6 +188,4 @@ test('formatCitationCopyText includes document name, page location, section titl
     }),
     '[인사규정.pdf · 4쪽 · 제2장 › 보관 기간]\n보관 기간은 5년이다.',
   );
-  assert.equal(relevancePercent(0.754), 75);
-  assert.equal(relevancePercent(0), 1);
 });

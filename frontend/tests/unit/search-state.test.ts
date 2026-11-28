@@ -91,12 +91,14 @@ test('search step transitions and status messages follow copy rules (never menti
     fileRevision: state.fileRevision,
     now: 200,
   });
-  assert.equal(stepFor(state), 2);
+  assert.equal(stepFor(state), 1);
+  assert.equal(stepFor(state, 'outline'), 2);
   assert.equal(canSearch(state), true);
   assert.equal(isIndexStale(state), false);
   assert.equal(statusFor(state).tone, 'done');
 
   state = searchReducer(state, { type: 'startSearch', query: '보관 기간', now: 300 });
+  assert.equal(stepFor(state), 2);
   assert.equal(statusFor(state).tone, 'busy');
 
   state = searchReducer(state, {
@@ -216,4 +218,45 @@ test('cancelSearch and searchFailed always reset searching flag', () => {
   });
   assert.equal(state.searching, false);
   assert.equal(state.noticeError, err);
+});
+
+test('setDocFilter clears prior search results and setNoticeError preserves in-flight searching', () => {
+  let state = searchReducer(initialSearchState, {
+    type: 'mergeFiles',
+    items: [{ id: 'f1', file: fakeFile('a.docx'), name: 'a.docx', size: 100 }],
+  });
+  state = searchReducer(state, {
+    type: 'buildSucceeded',
+    result: sampleBuild(),
+    fileRevision: state.fileRevision,
+    now: 10,
+  });
+  state = searchReducer(state, { type: 'startSearch', query: '보관 기간', now: 20 });
+  const subErr = new AppError({ kind: 'request', what: '조회 실패', why: '원인', how: '방법' });
+  state = searchReducer(state, {
+    type: 'setNoticeError',
+    error: subErr,
+    fileRevision: state.fileRevision,
+    now: 25,
+  });
+  assert.equal(state.searching, true);
+  assert.equal(state.noticeError, subErr);
+
+  state = searchReducer(state, {
+    type: 'searchSucceeded',
+    result: samplePack(),
+    fileRevision: state.fileRevision,
+    now: 30,
+  });
+  state = searchReducer(state, { type: 'markCopied', fileRevision: state.fileRevision });
+  assert.equal(stepFor(state), 3);
+
+  // Switching scope resets prior hits, notice, and copy state cleanly.
+  state = searchReducer(state, { type: 'setDocFilter', docId: 'd2' });
+  assert.equal(state.docFilterId, 'd2');
+  assert.equal(state.searchResult, null);
+  assert.equal(state.selectedHitId, null);
+  assert.equal(state.noticeError, null);
+  assert.equal(state.copied, false);
+  assert.equal(state.searching, false);
 });

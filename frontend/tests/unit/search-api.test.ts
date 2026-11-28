@@ -7,7 +7,9 @@ import {
   normalizeSectionResponse,
   normalizeTableSqlResponse,
   queryDocIndex,
+  queryDocTableSql,
 } from '../../src/features/search/api.ts';
+import { searchErrorCopy } from '../../src/features/search/copy.ts';
 import { AppError } from '../../src/lib/errors.ts';
 
 test('normalizeBuildResponse parses valid /api/docindex/build payload', () => {
@@ -154,4 +156,40 @@ test('buildDocIndex and queryDocIndex post JSON and map expired 404 responses', 
     { fetchImpl: okFetch },
   );
   assert.equal(built.indexId, 'idx-ok');
+});
+
+test('queryDocTableSql maps SQL 400 errors to sqlFailed copy while keeping 404 expired errors', async () => {
+  const sqlErrFetch: typeof fetch = async () =>
+    new Response(JSON.stringify({ error: 'SQL 파싱 실패: 없는 열' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+  await assert.rejects(
+    () =>
+      queryDocTableSql(
+        { index_id: 'idx-1', table_uid: 't1', sql: 'SELECT nope FROM tbl' },
+        { fetchImpl: sqlErrFetch },
+      ),
+    (err: unknown) =>
+      err instanceof AppError &&
+      err.kind === 'request' &&
+      err.what === searchErrorCopy.sqlFailed.what &&
+      Boolean(err.detail?.includes('SQL 파싱 실패')),
+  );
+
+  const expiredFetch: typeof fetch = async () =>
+    new Response(
+      JSON.stringify({ error: '문서 인덱스를 찾을 수 없다(만료되었거나 잘못된 index_id).' }),
+      { status: 404, headers: { 'Content-Type': 'application/json' } },
+    );
+
+  await assert.rejects(
+    () =>
+      queryDocTableSql(
+        { index_id: 'gone', table_uid: 't1', sql: 'SELECT * FROM tbl' },
+        { fetchImpl: expiredFetch },
+      ),
+    (err: unknown) => err instanceof AppError && err.kind === 'expired',
+  );
 });

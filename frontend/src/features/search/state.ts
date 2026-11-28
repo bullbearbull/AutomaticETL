@@ -85,6 +85,7 @@ export type SearchAction =
   | { type: 'setSettings'; patch: Partial<SearchSettings> }
   | { type: 'setDocFilter'; docId: string }
   | { type: 'setQuery'; query: string }
+  | { type: 'setNoticeError'; error: AppError; fileRevision: number; now: number }
   | { type: 'startBuild'; now: number }
   | { type: 'buildSucceeded'; result: DocIndexBuildResult; fileRevision: number; now: number }
   | { type: 'buildFailed'; error: AppError; fileRevision: number; now: number }
@@ -174,9 +175,25 @@ export function searchReducer(state: SearchState, action: SearchAction): SearchS
         settings: { ...state.settings, ...action.patch },
       };
     case 'setDocFilter':
-      return { ...state, docFilterId: action.docId };
+      if (action.docId === state.docFilterId) return state;
+      return {
+        ...state,
+        docFilterId: action.docId,
+        searching: false,
+        searchResult: null,
+        selectedHitId: null,
+        noticeError: null,
+        copied: false,
+      };
     case 'setQuery':
       return { ...state, query: action.query };
+    case 'setNoticeError':
+      if (action.fileRevision !== state.fileRevision) return state;
+      return {
+        ...state,
+        noticeError: action.error,
+        endedAt: state.searching ? state.endedAt : action.now,
+      };
     case 'startBuild':
       return {
         ...state,
@@ -264,11 +281,17 @@ export function searchReducer(state: SearchState, action: SearchAction): SearchS
   }
 }
 
-/** Step 1 until ready, Step 2 while searching/refining, Step 3 after copying an excerpt/table. */
-export function stepFor(state: SearchState): StepNumber {
-  if (!state.index) return 1;
-  if (state.copied && !isIndexStale(state)) return 3;
-  return 2;
+/** Step 1 until search/browsing starts, Step 2 while searching/refining, Step 3 after copying an excerpt/table. */
+export function stepFor(
+  state: SearchState,
+  activeTab: 'results' | 'outline' | 'tables' = 'results',
+): StepNumber {
+  if (!state.index || isIndexStale(state)) return 1;
+  if (state.copied) return 3;
+  if (state.searching || state.searchResult !== null || activeTab === 'outline' || activeTab === 'tables') {
+    return 2;
+  }
+  return 1;
 }
 
 export interface SearchStatusSummary {

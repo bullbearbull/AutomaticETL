@@ -12,10 +12,10 @@ import type {
 import { resultCopy } from './copy.ts';
 import { baseFileName, formatPageRange, pageUnitFor } from './formats.ts';
 import {
+  analyzeHitMatch,
   collectHighlightTerms,
   extractSurroundingPassage,
   partitionHitsByRelevance,
-  relevancePercent,
 } from './highlight.ts';
 import { HighlightedText } from './HighlightedText.tsx';
 import type { BuildPhase } from './state.ts';
@@ -174,7 +174,7 @@ export function ResultPanel({
     : index.tables;
 
   const { primary: primaryHits, lowRelevance: lowHits } = searchResult
-    ? partitionHitsByRelevance(searchResult.hits)
+    ? partitionHitsByRelevance(searchResult.hits, searchResult.query)
     : { primary: [] as EvidenceHitInfo[], lowRelevance: [] as EvidenceHitInfo[] };
 
   const highlightTerms = searchResult
@@ -187,13 +187,21 @@ export function ResultPanel({
   const selectedTable =
     visibleTables.find((t) => t.tableUid === selectedTableUid) ?? visibleTables[0] ?? null;
   const selectedTableFile = selectedTable ? baseFileName(selectedTable.sourcePath) : '';
+  const matchedSectionContent =
+    sectionContent && (!selectedSectionId || sectionContent.section.sectionId === selectedSectionId)
+      ? sectionContent
+      : null;
+  const matchedTableResult =
+    selectedTable && tableResult && tableResult.tableUid === selectedTable.tableUid
+      ? tableResult
+      : null;
 
   const renderHitCard = (hit: EvidenceHitInfo) => {
     const fileName = baseFileName(hit.sourcePath);
     const unit = pageUnitFor(docFormatById.get(hit.docId) ?? fileName);
     const pageLabel = formatPageRange(hit.pageStart, hit.pageEnd, unit);
     const sectionHeading = hit.sectionPath.length > 0 ? hit.sectionPath.join(' › ') : hit.title;
-    const pct = relevancePercent(hit.finalScore);
+    const matchInfo = analyzeHitMatch(hit, searchResult?.query ?? '');
     const hitTerms = collectHighlightTerms(searchResult?.query ?? '', hit.matchedTerms);
     const { passage } = extractSurroundingPassage(hit.fullText, hitTerms, {
       maxChars: 280,
@@ -217,7 +225,7 @@ export function ResultPanel({
             <span>·</span>
             <span>{pageLabel}</span>
             <span>·</span>
-            <span>{resultCopy.results.relevance(pct)}</span>
+            <span>{resultCopy.results.matchLabel(matchInfo, hit.outlineBoost)}</span>
             {hit.tableIds.length > 0 ? (
               <>
                 <span>·</span>
@@ -264,13 +272,11 @@ export function ResultPanel({
           <Icon name="warning" className={styles.staleIcon} />
           <div className={styles.warningsContent}>
             <p className={styles.warningsTitle}>
-              {resultCopy.partialWarningsTitle(
-                index.summary.documentsSkipped || index.summary.warnings.length,
-              )}
+              {resultCopy.partialWarningsTitle(index.summary.warnings.length)}
             </p>
             <ul className={styles.warningsList}>
               {index.summary.warnings.map((w, i) => (
-                <li key={i}>{w}</li>
+                <li key={i}>{resultCopy.formatBuildWarning(w)}</li>
               ))}
             </ul>
           </div>
@@ -449,31 +455,31 @@ export function ResultPanel({
                   <Icon name="spinner" />
                   <span>{resultCopy.outline.loading}</span>
                 </p>
-              ) : sectionContent ? (
+              ) : matchedSectionContent ? (
                 <>
                   <h3 className={styles.outlineHeading}>
-                    {sectionContent.section.sectionPath.length > 0
-                      ? sectionContent.section.sectionPath.join(' › ')
-                      : sectionContent.section.title}
+                    {matchedSectionContent.section.sectionPath.length > 0
+                      ? matchedSectionContent.section.sectionPath.join(' › ')
+                      : matchedSectionContent.section.title}
                   </h3>
                   <p className={`${styles.meta} tabular-nums`}>
-                    {`${baseFileName(sectionContent.section.sourcePath)} · ${formatPageRange(
-                      sectionContent.section.pageStart,
-                      sectionContent.section.pageEnd,
+                    {`${baseFileName(matchedSectionContent.section.sourcePath)} · ${formatPageRange(
+                      matchedSectionContent.section.pageStart,
+                      matchedSectionContent.section.pageEnd,
                       pageUnitFor(
-                        docFormatById.get(sectionContent.section.docId) ??
-                          sectionContent.section.sourcePath,
+                        docFormatById.get(matchedSectionContent.section.docId) ??
+                          matchedSectionContent.section.sourcePath,
                       ),
-                    )} · ${resultCopy.outline.charCount(sectionContent.section.charCount)}`}
+                    )} · ${resultCopy.outline.charCount(matchedSectionContent.section.charCount)}`}
                   </p>
                   <pre className={styles.sectionBody}>
-                    <HighlightedText text={sectionContent.fullText} terms={highlightTerms} />
+                    <HighlightedText text={matchedSectionContent.fullText} terms={highlightTerms} />
                   </pre>
-                  {sectionContent.tables.length > 0 ? (
+                  {matchedSectionContent.tables.length > 0 ? (
                     <div className={styles.embeddedSection}>
                       <h4 className={styles.subHeading}>{resultCopy.outline.embeddedTablesHeading}</h4>
                       <ul className={styles.relatedList}>
-                        {sectionContent.tables.map((tbl) => (
+                        {matchedSectionContent.tables.map((tbl) => (
                           <li key={tbl.tableUid} className={styles.relatedRow}>
                             <span className={styles.relatedMeta}>
                               {`${tbl.caption || tbl.tableId} (${tbl.rowCount}×${tbl.colCount})`}
@@ -534,8 +540,12 @@ export function ResultPanel({
                       selectedTable.rowCount,
                       selectedTable.colCount,
                     )}
-                    {tableResult
-                      ? ` · ${resultCopy.tables.rowCount(tableResult.totalMatched, tableResult.truncated)}`
+                    {matchedTableResult
+                      ? ` · ${resultCopy.tables.rowCount(
+                          matchedTableResult.rows.length,
+                          matchedTableResult.totalMatched,
+                          matchedTableResult.truncated,
+                        )}`
                       : ''}
                   </p>
                 </div>
@@ -546,11 +556,11 @@ export function ResultPanel({
                   <Icon name="spinner" />
                   <span>{resultCopy.tables.runningSql}</span>
                 </p>
-              ) : tableResult ? (
+              ) : matchedTableResult ? (
                 <DataTable
                   name={selectedTable?.caption || `${selectedTableFile || '문서'} 표`}
-                  columns={tableResult.columns}
-                  rows={tableResult.rows}
+                  columns={matchedTableResult.columns}
+                  rows={matchedTableResult.rows}
                   onCopied={() => onCopied()}
                 />
               ) : null}

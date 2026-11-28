@@ -11,10 +11,10 @@ import type {
 import { evidenceCopy, listCopy } from './copy.ts';
 import { baseFileName, formatPageRange, pageUnitFor, SUPPORTED_DOCUMENTS_LABEL } from './formats.ts';
 import {
+  analyzeHitMatch,
   collectHighlightTerms,
   extractSurroundingPassage,
   formatCitationCopyText,
-  relevancePercent,
 } from './highlight.ts';
 import { HighlightedText } from './HighlightedText.tsx';
 import type { SearchSubTabId } from './ResultPanel.tsx';
@@ -23,12 +23,13 @@ import styles from './EvidencePanel.module.css';
 export interface EvidencePanelProps {
   index: DocIndexBuildResult | null;
   error: AppError | null;
+  fileRevision: number;
   activeTab: SearchSubTabId;
   searchResult: SearchEvidencePack | null;
   selectedHit: EvidenceHitInfo | null;
   sectionContent: DocSectionContent | null;
   selectedTable: IndexedTableInfo | null;
-  onCopied: () => void;
+  onCopied: (fileRevision: number) => void;
 }
 
 const FEEDBACK_MS = 6000;
@@ -43,6 +44,7 @@ const FEEDBACK_MS = 6000;
 export function EvidencePanel({
   index,
   error,
+  fileRevision,
   activeTab,
   searchResult,
   selectedHit,
@@ -77,6 +79,7 @@ export function EvidencePanel({
   const docFormatById = new Map(index.documents.map((d) => [d.docId, d.format]));
 
   const copyWithFeedback = async (payloadText: string, fileName: string, pageLabel: string) => {
+    const startedRevision = fileRevision;
     window.clearTimeout(timerRef.current);
     setCopyMessage(null);
     try {
@@ -86,7 +89,7 @@ export function EvidencePanel({
         text: evidenceCopy.copiedAnnouncement(fileName, pageLabel),
         ok: true,
       });
-      onCopied();
+      onCopied(startedRevision);
     } catch {
       setCopyMessage({ text: evidenceCopy.copyFailed, ok: false });
     }
@@ -99,7 +102,7 @@ export function EvidencePanel({
     const pageLabel = formatPageRange(selectedHit.pageStart, selectedHit.pageEnd, unit);
     const sectionTitle =
       selectedHit.sectionPath.length > 0 ? selectedHit.sectionPath.join(' › ') : selectedHit.title;
-    const pct = relevancePercent(selectedHit.finalScore);
+    const matchInfo = analyzeHitMatch(selectedHit, searchResult.query);
     const terms = collectHighlightTerms(searchResult.query, selectedHit.matchedTerms);
     const surrounding = extractSurroundingPassage(selectedHit.fullText, terms, {
       maxChars: 900,
@@ -135,8 +138,7 @@ export function EvidencePanel({
               <dt>{evidenceCopy.labels.reason}</dt>
               <dd>
                 {evidenceCopy.reasonText(
-                  pct,
-                  selectedHit.matchedTerms,
+                  matchInfo,
                   selectedHit.outlineBoost,
                   selectedHit.rerankScore,
                 )}
@@ -180,22 +182,22 @@ export function EvidencePanel({
         <Details summary={evidenceCopy.detailsSummary}>
           <dl className={`${styles.facts} ${styles.techFacts} tabular-nums`}>
             <div>
-              <dt>section_id</dt>
+              <dt>{evidenceCopy.techLabels.sectionId}</dt>
               <dd>{selectedHit.sectionId}</dd>
             </div>
             <div>
-              <dt>final_score / bm25_score</dt>
+              <dt>{evidenceCopy.techLabels.scores}</dt>
               <dd>{`${selectedHit.finalScore.toFixed(3)} / ${selectedHit.bm25Score.toFixed(4)}`}</dd>
             </div>
             {selectedHit.rerankScore !== null ? (
               <div>
-                <dt>rerank_score</dt>
+                <dt>{evidenceCopy.techLabels.rerankScore}</dt>
                 <dd>{selectedHit.rerankScore.toFixed(3)}</dd>
               </div>
             ) : null}
             <div>
-              <dt>mode</dt>
-              <dd>{searchResult.mode}</dd>
+              <dt>{evidenceCopy.techLabels.mode}</dt>
+              <dd>{evidenceCopy.techLabels.modeValue(searchResult.mode)}</dd>
             </div>
           </dl>
         </Details>
