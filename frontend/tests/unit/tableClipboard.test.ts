@@ -107,10 +107,33 @@ test('rowsToTsv and rowsToHtml guard formula text cells but leave numbers alone'
     ['\t=1+1', -3],
   ];
   assert.equal(rowsToTsv(guarded), "'=구분\t금액\r\n'=1+1\t-1,234\r\n\"'\t=1+1\"\t-3");
+  assert.equal(rowsToTsv([[-1e-7, '\r=1']]), "-1e-7\t\"'\n=1\"");
+});
+
+test('rowsToHtml marks formula text cells as Excel text instead of adding an apostrophe', () => {
+  const text = ` style="mso-number-format:'\\@'"`;
+  const guarded = [
+    ['=구분', '금액'],
+    ['=1+1', '-1,234'],
+    ['\t=1+1', -3],
+    ['@<b>', '-'],
+    ['\r=1', '총무팀'],
+  ];
   assert.equal(
     rowsToHtml(guarded, { headerRows: 1 }),
-    '<table><thead><tr><th>&#39;=구분</th><th>금액</th></tr></thead>' +
-      '<tbody><tr><td>&#39;=1+1</td><td>-1,234</td></tr><tr><td>&#39;\t=1+1</td><td>-3</td></tr></tbody></table>',
+    `<table><thead><tr><th${text}>=구분</th><th>금액</th></tr></thead>` +
+      `<tbody><tr><td${text}>=1+1</td><td>-1,234</td></tr>` +
+      `<tr><td${text}>\t=1+1</td><td>-3</td></tr>` +
+      `<tr><td${text}>@&lt;b&gt;</td><td>-</td></tr>` +
+      `<tr><td${text}><br>=1</td><td>총무팀</td></tr></tbody></table>`,
   );
-  assert.equal(rowsToTsv([[-1e-7, '\r=1']]), "-1e-7\t\"'\n=1\"");
+  assert.equal(rowsToHtml([[-1e-7, '+5%', "'=1+1"]]), '<table><tbody><tr><td>-1e-7</td><td>+5%</td><td>&#39;=1+1</td></tr></tbody></table>');
+  for (const { input, expected } of formulaCases) {
+    const guardedCell = expected !== input;
+    assert.equal(
+      rowsToHtml([[input]]).includes('mso-number-format'),
+      guardedCell,
+      JSON.stringify(input),
+    );
+  }
 });
