@@ -28,6 +28,8 @@
   - `HttpLayoutDetector` — 로컬/사내 `POST /v1/layout/detect` 서비스 연동(`validate_vision_endpoint` TrustZone 보안 경계 적용)
 - `exporters.py` — 통합 Markdown(`document.md`), RAG 청크(`chunks.jsonl`), 구조·전략 리포트(`routing_report.md`/`.json`),
   표 CSV/JSON(`tables/`), 통합 IR JSON(`parsed.json`) 내보내기.
+  표 CSV는 `=`, `+`, `-`, `@`, 탭, CR로 시작하는 칸 앞에 `'`를 붙여 엑셀 같은 스프레드시트에서 수식으로 실행되지 않게 한다
+  (`-1,234`·`+5%` 같은 숫자와 `-` 하나는 그대로). 표 JSON·`parsed.json`·Markdown에는 원래 값이 그대로 남는다.
 - `vision.py` — 무의존성 OCR/VLM 어댑터 구현체:
   - `TesseractOcrAdapter` — 로컬 `tesseract` 바이너리(stdin→stdout TSV, 임시 파일 0건)
   - `OpenAICompatibleVlmAdapter` — Ollama(`/v1`)·llama-server·vLLM·LM Studio·OpenAI 호환 Vision API

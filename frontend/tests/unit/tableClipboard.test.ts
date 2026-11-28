@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { copyTable, escapeHtml, rowsToHtml, rowsToTsv } from '../../src/lib/tableClipboard.ts';
+import { copyTable, escapeHtml, rowsToHtml, rowsToTsv, spreadsheetSafe } from '../../src/lib/tableClipboard.ts';
 
 const rows = [
   ['구분', '담당 부서', '비고'],
@@ -83,4 +84,33 @@ test('copyTable falls back to writeText when rich copy fails or is missing', asy
 
 test('copyTable rejects when no clipboard method works', async () => {
   await assert.rejects(copyTable(rows, { clipboard: {}, ClipboardItemImpl: undefined }));
+});
+
+// The same cases the Python CSV writer is tested with.
+const formulaCases = (
+  JSON.parse(
+    readFileSync(new URL('../../../tests/fixtures/spreadsheet_formula_cells.json', import.meta.url), 'utf8'),
+  ) as { cases: { input: string; expected: string }[] }
+).cases;
+
+test('spreadsheetSafe follows the shared formula cell cases', () => {
+  assert.ok(formulaCases.length > 0);
+  for (const { input, expected } of formulaCases) {
+    assert.equal(spreadsheetSafe(input), expected, JSON.stringify(input));
+  }
+});
+
+test('rowsToTsv and rowsToHtml guard formula text cells but leave numbers alone', () => {
+  const guarded = [
+    ['=구분', '금액'],
+    ['=1+1', '-1,234'],
+    ['\t=1+1', -3],
+  ];
+  assert.equal(rowsToTsv(guarded), "'=구분\t금액\r\n'=1+1\t-1,234\r\n\"'\t=1+1\"\t-3");
+  assert.equal(
+    rowsToHtml(guarded, { headerRows: 1 }),
+    '<table><thead><tr><th>&#39;=구분</th><th>금액</th></tr></thead>' +
+      '<tbody><tr><td>&#39;=1+1</td><td>-1,234</td></tr><tr><td>&#39;\t=1+1</td><td>-3</td></tr></tbody></table>',
+  );
+  assert.equal(rowsToTsv([[-1e-7, '\r=1']]), "-1e-7\t\"'\n=1\"");
 });
