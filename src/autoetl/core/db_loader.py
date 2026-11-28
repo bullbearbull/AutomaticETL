@@ -720,9 +720,11 @@ def masking_key_id_for_database(db_path: str | Path) -> str | None:
 def _require_matching_masking_key(database_id: str, local_id: str | None) -> None:
     if database_id != local_id:
         local = local_id or "없음"
+        # 이 컴퓨터에 다른 키가 이미 있으면 --replace 없이는 가져오기가 거부된다.
+        command = "autoetl key import <파일>" + (" --replace" if local_id else "")
         raise InputError(
             f"DB의 가리기 키는 {database_id}이고 이 컴퓨터의 키는 {local}입니다. "
-            "백업한 키를 `autoetl key import <파일>`로 가져온 뒤 다시 시도해 주세요."
+            f"백업한 키를 `{command}`로 가져온 뒤 다시 시도해 주세요."
         )
 
 

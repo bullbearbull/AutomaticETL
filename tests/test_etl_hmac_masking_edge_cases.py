@@ -6,17 +6,21 @@ import errno
 import os
 import shutil
 import sqlite3
+import stat
 from contextlib import closing
 from pathlib import Path
 
 import duckdb
 import pytest
 
+from autoetl.cli import main
 from autoetl.contracts import ColumnOverride, MaskingPolicy, OrphanPolicy, SchemaOverrideSpec
 from autoetl.core.db_loader import load_tables
 from autoetl.core.errors import InputError
 from autoetl.core.multi_context import NamedTableInput
+from autoetl.security import masking_key as masking_key_module
 from autoetl.security.masking_key import (
+    MaskingKey,
     export_masking_key,
     get_or_create_masking_key,
     import_masking_key,
@@ -131,16 +135,23 @@ def test_hash_load_works_while_caller_keeps_duckdb_connection_open(tmp_path: Pat
         assert held.execute("SELECT count(*) FROM _etl_masking_keys").fetchone() == (1,)
 
 
-def test_wrong_key_still_stops_load_when_read_only_check_is_unavailable(tmp_path: Path) -> None:
-    """읽기 전용 확인을 못 하는 상태에서도 키가 다르면 쓰기 전에 멈춘다."""
+@pytest.mark.parametrize("local_key", ["missing", "different"])
+def test_wrong_key_still_stops_load_when_read_only_check_is_unavailable(
+    tmp_path: Path, local_key: str
+) -> None:
+    """읽기 전용 확인을 못 하는 상태에서도 키가 없거나 다르면 쓰기 전에 멈춘다."""
     database = tmp_path / "warehouse.duckdb"
+    key_path = tmp_path / "masking_key.json"
     load_tables(
         extra_tables=[_members(900001)], db_path=database, engine="duckdb", overrides=_HASH_OVERRIDE
     )
-    (tmp_path / "masking_key.json").unlink()
+    registered = read_masking_key()
+    assert registered is not None
+    key_path.unlink()
+    other = get_or_create_masking_key()[0] if local_key == "different" else None
 
     with duckdb.connect(str(database)) as held:
-        with pytest.raises(InputError, match="autoetl key import"):
+        with pytest.raises(InputError, match="autoetl key import") as stopped:
             load_tables(
                 extra_tables=[_members(900004)],
                 db_path=database,
@@ -148,7 +159,12 @@ def test_wrong_key_still_stops_load_when_read_only_check_is_unavailable(tmp_path
                 overrides=_HASH_OVERRIDE,
             )
         assert held.execute("SELECT count(*) FROM members").fetchone() == (3,)
-    assert not (tmp_path / "masking_key.json").exists()
+        assert held.execute("SELECT key_id FROM _etl_masking_keys").fetchall() == [
+            (registered.key_id,)
+        ]
+    # 이 컴퓨터에 다른 키가 있을 때만 교체 옵션을 안내한다.
+    assert ("--replace" in str(stopped.value)) is (other is not None)
+    assert read_masking_key() == other
 
 
 @pytest.mark.parametrize("engine", ["sqlite", "duckdb"])
@@ -204,3 +220,71 @@ def test_hash_requested_only_on_numeric_key_prepares_key_under_either_error_poli
         recorded = connection.execute("SELECT key_id FROM _etl_masking_keys").fetchall()
     assert stored == [(900001,), (900002,), (900003,)]
     assert recorded == [(key.key_id,)]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX 파일 권한만 확인한다")
+def test_export_warns_when_backup_is_readable_by_other_users(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """권한이 마운트 설정으로 정해지는 저장 장치에 내보내면 다른 사용자가 읽을 수 있다고 알린다."""
+    get_or_create_masking_key()
+    usb = tmp_path / "usb"
+    assert export_masking_key(tmp_path / "private" / "backup.json").permission_warning is None
+
+    real_publish = masking_key_module._publish_key
+
+    def publish_under_mount_mask(path: Path, key: MaskingKey, *, overwrite: bool = False) -> bool:
+        published = real_publish(path, key, overwrite=overwrite)
+        if published and path.parent == usb:
+            path.chmod(0o644)
+        return published
+
+    monkeypatch.setattr(masking_key_module, "_publish_key", publish_under_mount_mask)
+
+    exported = export_masking_key(usb / "backup.json")
+    assert exported.permission_warning is not None
+    assert "다른 사용자" in exported.permission_warning
+
+    capsys.readouterr()
+    assert main(["key", "export", str(usb / "second.json")]) == 0
+    assert "다른 사용자" in capsys.readouterr().err
+
+
+def test_replacement_refuses_when_backup_name_is_the_active_key_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """활성 키 파일이 곧 백업 이름이면 교체로 하나뿐인 사본을 덮어쓰지 않는다."""
+    current, _ = get_or_create_masking_key()
+    incoming, _ = get_or_create_masking_key(tmp_path / "incoming.json")
+    active = tmp_path / f"masking_key.{current.key_id}.bak.json"
+    (tmp_path / "masking_key.json").rename(active)
+    monkeypatch.setenv("AUTOETL_MASKING_KEY_FILE", str(active))
+
+    with pytest.raises(InputError, match="백업"):
+        import_masking_key(incoming.path, replace=True)
+
+    kept = read_masking_key()
+    assert kept is not None
+    assert kept.key_id == current.key_id
+
+
+@pytest.mark.skipif(os.name != "posix", reason="디렉터리 동기화는 POSIX에서만 한다")
+def test_new_key_file_name_is_synced_to_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """키 파일을 만든 뒤 그 폴더까지 동기화해 파일 이름이 디스크에 남게 한다."""
+    synced_directories: list[int] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        status = os.fstat(fd)
+        if stat.S_ISDIR(status.st_mode):
+            synced_directories.append(status.st_ino)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+
+    _key, created = get_or_create_masking_key()
+
+    assert created
+    assert tmp_path.stat().st_ino in synced_directories

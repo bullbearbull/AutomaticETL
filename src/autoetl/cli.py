@@ -234,6 +234,8 @@ def _run_key(args: argparse.Namespace) -> int:
                 "키 파일을 안전한 장소에 보관하세요.",
                 file=sys.stderr,
             )
+            if exported.permission_warning:
+                print(f"주의 {exported.permission_warning}", file=sys.stderr)
             return 0
 
         previous_key = read_masking_key() if args.replace else None

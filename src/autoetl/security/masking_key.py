@@ -10,7 +10,7 @@ import secrets
 import sys
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -136,6 +136,31 @@ def _write_new_file(path: Path, data: bytes) -> bool:
     return True
 
 
+def _sync_directory(directory: Path) -> None:
+    """Persist a new directory entry where the platform can open directories."""
+    if os.name != "posix":
+        return
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        # 디렉터리 fsync를 지원하지 않는 파일 시스템에서는 파일 내용 동기화까지만 보장된다.
+        with suppress(OSError):
+            os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _shared_file_warning(path: Path) -> str | None:
+    """Report a key file whose effective mode lets other users read it."""
+    try:
+        shared = os.name == "posix" and path.stat().st_mode & 0o044
+    except OSError:
+        return None
+    return _PERMISSION_WARNING if shared else None
+
+
 def _publish_key(path: Path, key: MaskingKey, *, overwrite: bool = False) -> bool:
     """Publish a complete file atomically, returning false for an existing destination."""
     document = {
@@ -164,9 +189,12 @@ def _publish_key(path: Path, key: MaskingKey, *, overwrite: bool = False) -> boo
                     return False
                 except OSError:
                     # FAT·exFAT 등 하드 링크가 없는 저장 장치에는 새 파일로만 직접 쓴다.
-                    return _write_new_file(path, staging.read_bytes())
+                    if not _write_new_file(path, staging.read_bytes()):
+                        return False
         finally:
             staging.unlink(missing_ok=True)
+        # 파일 이름까지 디스크에 남아야, 전원이 끊겨도 DB에 기록한 키가 사라지지 않는다.
+        _sync_directory(path.parent)
     except OSError:
         raise InputError("마스킹 키 파일을 저장할 수 없습니다.") from None
     return True
@@ -226,7 +254,8 @@ def export_masking_key(destination: Path) -> MaskingKey:
     active = _require_key(masking_key_path())
     if not _publish_key(destination, active):
         raise InputError("내보내기 위치에 파일이 이미 있습니다.")
-    return replace(active, path=destination, permission_warning=None)
+    # 권한이 마운트 설정으로 정해지는 저장 장치(FAT·exFAT 등)에서는 0600 요청이 적용되지 않는다.
+    return replace(active, path=destination, permission_warning=_shared_file_warning(destination))
 
 
 def import_masking_key(source: Path, *, replace: bool = False) -> tuple[MaskingKey, bool]:
@@ -237,6 +266,13 @@ def import_masking_key(source: Path, *, replace: bool = False) -> tuple[MaskingK
         with _replacement_lock(path):
             return _install_key(path, incoming, allow_replace=True)
     return _install_key(path, incoming, allow_replace=False)
+
+
+def _is_same_file(first: Path, second: Path) -> bool:
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
 
 
 def _install_key(
@@ -254,7 +290,11 @@ def _install_key(
         raise InputError("이미 다른 마스킹 키가 있습니다. 교체하려면 --replace를 지정하세요.")
 
     backup = path.with_name(f"masking_key.{active.key_id}.bak.json")
-    if not _publish_key(backup, active) and _require_key(backup).key != active.key:
-        raise InputError("기존 마스킹 키의 백업이 일치하지 않습니다.")
+    if not _publish_key(backup, active):
+        # 활성 키 파일 자신(같은 경로나 링크)은 교체하면 함께 사라지므로 백업으로 치지 않는다.
+        if _is_same_file(backup, path):
+            raise InputError("기존 마스킹 키를 따로 백업할 수 없어 교체하지 않았습니다.")
+        if _require_key(backup).key != active.key:
+            raise InputError("기존 마스킹 키의 백업이 일치하지 않습니다.")
     _publish_key(path, incoming, overwrite=True)
     return replace(incoming, path=path, permission_warning=None), True
