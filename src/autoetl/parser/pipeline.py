@@ -180,6 +180,7 @@ def parse_and_export(
         include_header_footer=effective_opts.include_header_footer_in_markdown,
         include_chunks=include_chunks,
         chunk_options=chunk_options,
+        source_file=path,
     )
     return doc, manifest
 

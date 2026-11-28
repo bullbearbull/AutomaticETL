@@ -151,7 +151,7 @@ export function listMeta(result: ParseResult): string {
 }
 
 /**
- * What the ZIP holds, for "ZIP 안: 본문 · 표(CSV) · AI용 문단 · 처리 기록".
+ * What the ZIP holds, for "ZIP 안: 본문 · 표(CSV·엑셀) · AI용 문단 · 처리 기록".
  * `extractCrops` and `includeChunks` are the settings the read used.
  */
 export function zipContents(result: ParseResult, options: { extractCrops: boolean; includeChunks: boolean }): string[] {

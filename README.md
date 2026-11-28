@@ -103,6 +103,7 @@ out/
 ├── routing_report.md   # 페이지·시트별 구조 판정과 파싱 전략 리포트
 ├── routing_report.json
 ├── tables/             # 추출된 표별 .csv / .json
+├── tables.xlsx         # 추출된 표를 표마다 시트 하나로 모은 엑셀 파일
 └── crops/              # 스캔·그림·도식 영역 이미지 크롭
 ```
 

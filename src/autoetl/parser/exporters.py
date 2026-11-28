@@ -1,11 +1,13 @@
-"""Auto Parser 결과물 내보내기 — 통합 Markdown, 구조·전략 리포트, 표 CSV/JSON, IR JSON."""
+"""Auto Parser 결과물 내보내기 — 통합 Markdown, 구조·전략 리포트, 표 CSV/JSON/XLSX, IR JSON."""
 
 from __future__ import annotations
 
 import csv
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
+from decimal import Context, Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -18,6 +20,18 @@ from autoetl.parser.contracts import (
     RoutingPlan,
     VisionStatus,
     VisualRegion,
+)
+from autoetl.parser.xlsx_writer import (
+    XLSX_MAX_CELL_CHARS,
+    XLSX_MAX_COLS,
+    XLSX_MAX_ROWS,
+    XlsxCell,
+    XlsxLimitError,
+    XlsxNumber,
+    XlsxSheet,
+    XlsxText,
+    check_xlsx_sheet_limits,
+    write_xlsx_workbook,
 )
 
 if TYPE_CHECKING:
@@ -65,6 +79,9 @@ class ExportManifest:
     crop_paths: tuple[Path, ...]
     chunks_jsonl: Path | None = None
     chunk_count: int = 0
+    tables_xlsx: Path | None = None
+    xlsx_skipped_table_ids: tuple[str, ...] = ()
+    xlsx_blocked_by_source: bool = False
 
 
 def _escape_md_cell(value: str) -> str:
@@ -434,6 +451,110 @@ def export_table_csv(table: ExtractedTable, out_path: Path) -> None:
             writer.writerow([spreadsheet_safe_cell(cell) for cell in row])
 
 
+# 번들 안에서 표를 시트별로 모은 엑셀 파일의 이름.
+TABLES_XLSX_NAME = "tables.xlsx"
+# 엑셀은 숫자를 15자리까지만 정확히 담는다. 더 긴 값은 글자로 둔다.
+_XLSX_MAX_NUMBER_DIGITS = 15
+# 엑셀의 셀 서식 화면이 받는 소수 자리는 30개까지다. 더 긴 소수는 글자로 둔다.
+# 이 한도 덕분에 숫자 칸의 값은 엑셀이 담는 크기 범위(약 1E-308~1E+308) 안에 든다.
+_XLSX_MAX_DECIMAL_PLACES = 30
+# 부르는 쪽의 Decimal 정밀도 설정에 값이 반올림되지 않도록 변환 전용 컨텍스트를 쓴다.
+_XLSX_NUMBER_CONTEXT = Context(prec=60)
+
+
+def is_bundle_tables_workbook(path: Path) -> bool:
+    """`path`가 `export_parse_bundle`이 만든 번들 안의 `tables.xlsx`인지 본다.
+
+    폴더를 훑어 입력 파일을 모으는 쪽이 자기가 내보낸 파일을 다시 읽지 않도록 쓴다.
+    """
+    return path.name == TABLES_XLSX_NAME and (path.parent / "parsed.json").is_file()
+
+
+def _is_same_file(a: Path, b: Path) -> bool:
+    """두 경로가 같은 파일을 가리키는지 본다(대소문자를 가리지 않는 파일 시스템, 링크 포함)."""
+    try:
+        return a.samefile(b)
+    except OSError:
+        return False
+
+
+def _xlsx_number_cell(value: str) -> XlsxNumber | None:
+    """`-1,234`·`5%` 같은 값을 숫자 칸으로 바꾼다. 숫자로 두면 값이 달라지면 `None`."""
+    if not _PLAIN_NUMBER_RE.fullmatch(value):
+        return None
+    negative = value.startswith("-")
+    body = value.lstrip("+-")
+    percent = body.endswith("%")
+    int_part, _, frac_part = body.rstrip("%").partition(".")
+    int_digits = int_part.replace(",", "")
+    # 00123 같은 값은 숫자로 바꾸면 앞의 0이 사라진다.
+    if len(int_digits) > 1 and int_digits.startswith("0"):
+        return None
+    if len((int_digits + frac_part).lstrip("0")) > _XLSX_MAX_NUMBER_DIGITS:
+        return None
+    if len(frac_part) > _XLSX_MAX_DECIMAL_PLACES:
+        return None
+    number = Decimal(f"{'-' if negative else ''}{int_digits or '0'}.{frac_part or '0'}")
+    if percent:
+        number = number.scaleb(-2, _XLSX_NUMBER_CONTEXT)
+    format_code = "#,##0" if "," in int_part else "0"
+    if frac_part:
+        format_code += "." + "0" * len(frac_part)
+    if percent:
+        format_code += "%"
+    plain = "0" if number == 0 else format(number.normalize(_XLSX_NUMBER_CONTEXT), "f")
+    return XlsxNumber(value=plain, format_code=format_code, display=value)
+
+
+def _xlsx_cell(value: str, *, header: bool = False) -> XlsxCell:
+    """표 칸 값 하나를 엑셀 칸으로 바꾼다.
+
+    숫자로 볼 값의 기준은 CSV(`spreadsheet_safe_cell`)와 같은 `_PLAIN_NUMBER_RE`다. 그 밖의
+    값은 모두 글자 칸이라 `=1+1`도 계산되지 않고, 앞에 `'`를 붙이지 않는다. 헤더는 늘 글자다.
+    """
+    if not header:
+        number = _xlsx_number_cell(value)
+        if number is not None:
+            return number
+    looks_like_formula = spreadsheet_safe_cell(value) != value
+    looks_like_number = _PLAIN_NUMBER_RE.fullmatch(value) is not None
+    return XlsxText(value, force_text=looks_like_formula or looks_like_number)
+
+
+def _table_xlsx_rows(table: ExtractedTable) -> list[list[XlsxCell]]:
+    rows: list[list[XlsxCell]] = []
+    if table.headers:
+        rows.append([_xlsx_cell(cell, header=True) for cell in table.headers])
+    rows.extend([_xlsx_cell(cell) for cell in row] for row in table.rows)
+    return rows
+
+
+def export_tables_xlsx(tables: Sequence[ExtractedTable], out_path: Path) -> tuple[str, ...]:
+    """추출된 표들을 표마다 시트 하나씩 담은 엑셀 파일(`.xlsx`)로 저장한다.
+
+    CSV와 같은 표를 담되, 수식처럼 보이는 칸은 `'` 없이 글자 칸으로 둔다(`_xlsx_cell`).
+    엑셀 시트 한도를 넘는 표는 CSV를 보라는 안내 시트로 대신하고, 그 `table_id`들을
+    돌려준다. `tables`가 비어 있으면 `ValueError`를 낸다.
+    """
+    sheets: list[XlsxSheet] = []
+    skipped: list[str] = []
+    for table in tables:
+        rows = _table_xlsx_rows(table)
+        try:
+            check_xlsx_sheet_limits(rows)
+        except XlsxLimitError:
+            skipped.append(table.table_id)
+            notice = (
+                f"이 표는 엑셀 시트 한도(행 {XLSX_MAX_ROWS:,}개, 열 {XLSX_MAX_COLS:,}개, "
+                f"한 칸 {XLSX_MAX_CELL_CHARS:,}자)를 넘어 여기에 담지 못했습니다. "
+                f"같은 폴더의 tables/table_{table.table_id}.csv 파일을 열어 주세요."
+            )
+            rows = [[XlsxText(notice)]]
+        sheets.append(XlsxSheet(name=table.table_id, rows=rows))
+    write_xlsx_workbook(out_path, sheets)
+    return tuple(skipped)
+
+
 def export_table_json(table: ExtractedTable, out_path: Path) -> None:
     """추출된 표 하나를 셀·병합·메타 정보 포함 JSON으로 저장한다."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -451,8 +572,14 @@ def export_parse_bundle(
     include_header_footer: bool = False,
     include_chunks: bool = True,
     chunk_options: ChunkOptions | None = None,
+    source_file: Path | None = None,
 ) -> ExportManifest:
-    """통합 IR JSON, Markdown, 청크(JSONL), 전략 리포트(JSON·MD), 표 CSV/JSON을 저장한다."""
+    """통합 IR JSON, Markdown, 청크(JSONL), 전략 리포트(JSON·MD), 표 CSV/JSON/XLSX를 저장한다.
+
+    `source_file`은 `doc`을 읽어 온 원본 파일이다. 원본이 `out_dir` 바로 아래의
+    `tables.xlsx`이면 그 파일을 덮어쓰거나 지우지 않고 `tables.xlsx` 내보내기를 건너뛴다
+    (`ExportManifest.xlsx_blocked_by_source`).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     parsed_json = out_dir / "parsed.json"
@@ -503,6 +630,19 @@ def export_parse_bundle(
         csv_paths.append(csv_p)
         json_paths.append(json_p)
 
+    tables_xlsx: Path | None = None
+    xlsx_skipped: tuple[str, ...] = ()
+    xlsx_path = out_dir / TABLES_XLSX_NAME
+    xlsx_blocked = source_file is not None and _is_same_file(xlsx_path, source_file)
+    if xlsx_blocked:
+        pass  # 내보낼 자리에 원본 파일이 있다. 덮어쓰지도 지우지도 않는다.
+    elif doc.tables:
+        tables_xlsx = xlsx_path
+        xlsx_skipped = export_tables_xlsx(doc.tables, xlsx_path)
+    else:
+        # 같은 폴더에 다시 내보낼 때, 이전 문서의 표 파일이 남아 이번 결과처럼 보이지 않게 한다.
+        xlsx_path.unlink(missing_ok=True)
+
     crop_paths = tuple(Path(v.crop_path) for v in doc.visual_regions if v.crop_path is not None)
 
     return ExportManifest(
@@ -516,4 +656,7 @@ def export_parse_bundle(
         crop_paths=crop_paths,
         chunks_jsonl=chunks_jsonl_path,
         chunk_count=chunk_count,
+        tables_xlsx=tables_xlsx,
+        xlsx_skipped_table_ids=xlsx_skipped,
+        xlsx_blocked_by_source=xlsx_blocked,
     )

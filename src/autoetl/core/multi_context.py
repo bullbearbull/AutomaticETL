@@ -99,6 +99,10 @@ def _is_ignored_file(path: Path) -> bool:
     name = path.name
     if name.startswith("."):
         return True
+    # Auto Parser 번들 속 tables.xlsx는 같은 번들의 tables/ CSV와 내용이 같다. 폴더를 훑을 때
+    # 같은 표를 두 번 읽지 않도록 건너뛴다(`autoetl.parser.exporters.is_bundle_tables_workbook`).
+    if name == "tables.xlsx" and (path.parent / "parsed.json").is_file():
+        return True
     return any(name.startswith(prefix) for prefix in _IGNORED_PREFIXES)
 
 

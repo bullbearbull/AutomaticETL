@@ -20,7 +20,7 @@ from autoetl.parser.adapters import (
     VisionParserAdapter,
 )
 from autoetl.parser.chunker import ChunkOptions
-from autoetl.parser.exporters import render_routing_report_markdown
+from autoetl.parser.exporters import is_bundle_tables_workbook, render_routing_report_markdown
 from autoetl.parser.pipeline import (
     inspect_document,
     parse_and_export,
@@ -112,6 +112,9 @@ def discover_batch_files(
         if not p.is_file():
             continue
         if _is_temp_office_file(p.name):
+            continue
+        # 이전 실행이 내보낸 번들 속 tables.xlsx는 입력 문서가 아니다.
+        if is_bundle_tables_workbook(p):
             continue
         # 숨김 디렉터리 내부 제외
         rel_parts = p.relative_to(root).parts
