@@ -12,7 +12,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from autoetl.contracts import ColumnOverride, MaskingPolicy, SchemaOverrideSpec
+from autoetl.contracts import ColumnOverride, MaskingPolicy, OrphanPolicy, SchemaOverrideSpec
 from autoetl.core.db_loader import load_tables
 from autoetl.core.errors import InputError
 from autoetl.core.multi_context import NamedTableInput
@@ -172,3 +172,35 @@ def test_new_key_warning_shows_path_but_stored_batch_note_does_not(
     assert "autoetl key export" in notes
     assert str(key_path) not in notes
     assert str(tmp_path) not in notes
+
+
+@pytest.mark.parametrize("orphan_policy", list(OrphanPolicy))
+@pytest.mark.parametrize("engine", ["sqlite", "duckdb"])
+def test_hash_requested_only_on_numeric_key_prepares_key_under_either_error_policy(
+    tmp_path: Path, engine: str, orphan_policy: OrphanPolicy
+) -> None:
+    """해시를 요청한 열이 숫자 키뿐이어도 오류 처리 정책과 관계없이 키를 준비해 둔다."""
+    source = NamedTableInput("members", ("member_no",), (("900001",), ("900002",), ("900003",)))
+    overrides = SchemaOverrideSpec(
+        columns=[
+            ColumnOverride(table="members", source_column="member_no", masking=MaskingPolicy.HASH)
+        ],
+        orphan_policy=orphan_policy,
+    )
+    database = tmp_path / f"warehouse.{engine}"
+
+    _bundle, result = load_tables(
+        extra_tables=[source], db_path=database, engine=engine, overrides=overrides
+    )
+
+    assert result.status == "succeeded"
+    key = read_masking_key()
+    assert key is not None
+    connection: sqlite3.Connection | duckdb.DuckDBPyConnection = (
+        sqlite3.connect(database) if engine == "sqlite" else duckdb.connect(str(database))
+    )
+    with closing(connection):
+        stored = connection.execute("SELECT member_no FROM members ORDER BY member_no").fetchall()
+        recorded = connection.execute("SELECT key_id FROM _etl_masking_keys").fetchall()
+    assert stored == [(900001,), (900002,), (900003,)]
+    assert recorded == [(key.key_id,)]

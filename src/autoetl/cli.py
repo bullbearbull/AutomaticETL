@@ -244,13 +244,13 @@ def _run_key(args: argparse.Namespace) -> int:
                 backup = previous_key.path.with_name(f"masking_key.{previous_key.key_id}.bak.json")
                 print(f"이전 키 백업 파일 {backup}")
         else:
-            print(f"동일한 마스킹 키가 이미 설치되어 있다 (key_id={imported.key_id}).")
+            print(f"동일한 마스킹 키가 이미 설치되어 있습니다 (key_id={imported.key_id}).")
         return 0
     except InputError as exc:
         print(f"마스킹 키 작업 실패. {exc}", file=sys.stderr)
         return 1
     except Exception:
-        print("마스킹 키 작업이 내부 오류로 끝났다.", file=sys.stderr)
+        print("마스킹 키 작업이 내부 오류로 끝났습니다.", file=sys.stderr)
         return 1
 
 

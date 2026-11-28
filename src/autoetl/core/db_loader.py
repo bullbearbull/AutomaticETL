@@ -2129,13 +2129,13 @@ def load_tables(
         }
 
         load_warnings = list(masking_warnings)
-        # 건너뛴 키의 요청 정책은 격리 행을 만들 때도 적용될 수 있다.
+        # 건너뛴 키의 요청 정책도 셀 변환과 격리 행에 그대로 전달되므로,
+        # 오류 처리 정책과 관계없이 해시 요청이 하나라도 있으면 키를 준비한다.
         needs_hash_key = any(
-            MaskingPolicy.HASH in tp.column_masking.values() for tp in load_plan.table_plans
-        ) or (
-            spec.orphan_policy is OrphanPolicy.QUARANTINE
-            and any(
-                MaskingPolicy.HASH in policies.values() for policies in skipped_key_masking.values()
+            MaskingPolicy.HASH in policies.values()
+            for policies in (
+                *(tp.column_masking for tp in load_plan.table_plans),
+                *skipped_key_masking.values(),
             )
         )
         masking_key = None
